@@ -1,0 +1,27 @@
+{
+  "strategy_name": "IREN trailing floor and DCA ladder",
+  "symbol": "IREN",
+  "entry_order_id": "2d660d18-06cd-4822-8c18-797be65a0528",
+  "entry_quantity": 50,
+  "entry_order_type": "limit",
+  "entry_limit_price": 60,
+  "entry_time_in_force": "day",
+  "initial_stop_loss_percent": 20,
+  "trail_trigger_step_percent": 5,
+  "trail_stop_below_current_percent": 2.5,
+  "ladder_buy_quantity": 50,
+  "ladder_drop_steps_percent": [
+    5,
+    10
+  ],
+  "poll_seconds": 30,
+  "market_closed_poll_seconds": 900,
+  "reentry_enabled": true,
+  "reentry_quantity": 50,
+  "reentry_max_per_day": 1,
+  "reentry_cooldown_seconds": 600,
+  "dynamic_reentry_enabled": true,
+  "dynamic_entry_enabled": false,
+  "dynamic_timeframe": "5Min",
+  "dynamic_lookback_days": 7
+}

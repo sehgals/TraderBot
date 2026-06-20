@@ -1,0 +1,9 @@
+.env
+config/credentials.yaml
+__pycache__/
+*.pyc
+*.pyo
+*.log
+runtime/
+watcher_supervisor.out.log
+watcher_supervisor.err.log
