@@ -102,6 +102,15 @@ C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\p
 
 `traderbot.monitoring.watchdog` is the watchdog used by `TraderBot_Watcher_Supervisor`. It checks for the Python watcher supervisor process and restarts it directly when needed.
 
+When a `new_watchers` candidate becomes an open position, the supervisor promotes it automatically:
+
+- Creates `traderbot/core_strategy_engine/strategies/configs/{symbol}_strategy_config.json`
+- Moves state to `runtime/state/{symbol}_strategy_state.json`
+- Moves logs to `runtime/logs/{symbol}_watcher.jsonl`
+- Removes the symbol from `new_watchers`
+- Adds the symbol to `managed_watchers`
+- Enables `dynamic_reentry_enabled` and disables `dynamic_entry_enabled`
+
 Task Scheduler should run the watchdog with `pythonw.exe` so no console window flashes:
 
 ```text

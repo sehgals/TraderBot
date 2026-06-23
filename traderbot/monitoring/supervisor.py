@@ -18,6 +18,9 @@ from traderbot.core_strategy_engine.engine import (
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
+STRATEGY_CONFIG_DIR = Path("traderbot/core_strategy_engine/strategies/configs")
+RUNTIME_STATE_DIR = Path("runtime/state")
+RUNTIME_LOG_DIR = Path("runtime/logs")
 
 
 def utc_now():
@@ -40,6 +43,24 @@ def append_jsonl(path, payload):
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(payload, sort_keys=True))
         file.write("\n")
+
+
+def relative_config_path(project_root, path):
+    try:
+        return path.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def move_file_if_needed(source, destination):
+    if source == destination:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not source.exists():
+        return
+    if destination.exists():
+        return
+    source.replace(destination)
 
 
 def load_supervisor_config(path):
@@ -133,6 +154,67 @@ def poll_seconds_for_result(result, strategy_config, supervisor_config, clock):
     )
 
 
+def result_has_open_position(result):
+    if result.get("position_qty", 0) > 0:
+        return True
+    reconciliation = result.get("reconciliation") or {}
+    if reconciliation.get("position_qty", 0) > 0:
+        return True
+    return result.get("status") in {
+        "managed",
+        "reentry_filled_waiting_for_management",
+    }
+
+
+def managed_strategy_config(symbol, config):
+    managed = dict(config)
+    managed["symbol"] = symbol
+    managed["strategy_name"] = f"Managed dynamic reentry for {symbol}"
+    managed["dynamic_entry_enabled"] = False
+    managed["dynamic_reentry_enabled"] = True
+    return managed
+
+
+def promote_new_watcher_if_bought(project_root, watchers_config_path, supervisor_config, watcher, strategy_config, result):
+    if watcher.get("group") != "new" or not result_has_open_position(result):
+        return None
+
+    symbol = watcher["symbol"]
+    lower_symbol = symbol.lower()
+    managed_watchers = supervisor_config.setdefault("managed_watchers", [])
+    if any(item.get("symbol") == symbol for item in managed_watchers):
+        return None
+
+    config_path = project_root / STRATEGY_CONFIG_DIR / f"{lower_symbol}_strategy_config.json"
+    state_path = project_root / RUNTIME_STATE_DIR / f"{lower_symbol}_strategy_state.json"
+    log_path = project_root / RUNTIME_LOG_DIR / f"{lower_symbol}_watcher.jsonl"
+
+    save_json(config_path, managed_strategy_config(symbol, strategy_config))
+    move_file_if_needed(watcher["state_path"], state_path)
+    move_file_if_needed(watcher["log_path"], log_path)
+
+    managed_entry = {
+        "symbol": symbol,
+        "config": relative_config_path(project_root, config_path),
+        "state": relative_config_path(project_root, state_path),
+        "log": relative_config_path(project_root, log_path),
+    }
+    managed_watchers.append(managed_entry)
+    supervisor_config["new_watchers"] = [
+        item for item in supervisor_config.get("new_watchers", [])
+        if item.get("symbol") != symbol
+    ]
+    save_json(watchers_config_path, supervisor_config)
+
+    watcher["group"] = "managed"
+    watcher["config_path"] = config_path
+    watcher["config_defaults"] = {}
+    watcher["state_path"] = state_path
+    watcher["log_path"] = log_path
+
+    return managed_entry
+
+
 def run_watcher(client, watcher, supervisor_config, clock):
     started = time.monotonic()
     strategy_config = dict(watcher.get("config_defaults", {}))
@@ -170,7 +252,7 @@ def run_watcher(client, watcher, supervisor_config, clock):
         "result": result,
     }
     append_jsonl(watcher["log_path"], log_record)
-    return log_record
+    return {**log_record, "strategy_config": strategy_config}
 
 
 def list_watchers(watchers):
@@ -204,6 +286,7 @@ def main():
     parser.add_argument("--list", action="store_true", help="List configured watchers.")
     args = parser.parse_args()
 
+    watchers_config_path = Path(args.config).resolve()
     project_root, supervisor_config, watchers = load_supervisor_config(args.config)
     os.chdir(project_root)
 
@@ -246,13 +329,22 @@ def main():
                     "next_open": None,
                 }
 
-            futures = [
-                executor.submit(run_watcher, client, watcher, supervisor_config, clock)
+            futures = {
+                executor.submit(run_watcher, client, watcher, supervisor_config, clock): watcher
                 for watcher in due
-            ]
+            }
             for future in concurrent.futures.as_completed(futures):
+                watcher = futures[future]
                 record = future.result()
                 result = record["result"]
+                promoted = promote_new_watcher_if_bought(
+                    project_root,
+                    watchers_config_path,
+                    supervisor_config,
+                    watcher,
+                    record["strategy_config"],
+                    result,
+                )
                 print(
                     json.dumps(
                         {
@@ -260,6 +352,7 @@ def main():
                             "symbol": record["symbol"],
                             "status": result.get("status"),
                             "next_run_seconds": record["next_run_seconds"],
+                            "promoted_to_managed": bool(promoted),
                         },
                         sort_keys=True,
                     ),

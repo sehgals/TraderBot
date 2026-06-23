@@ -433,6 +433,14 @@ def current_dynamic_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledg
     )
     pullback_limit = min(pullback_zone + 0.10 * atr, ledger_cap)
     breakout_limit = min(recent_high + 0.10 * atr, ledger_cap)
+    pullback_touch_trigger = pullback_zone * 1.005
+    pullback_reclaim_trigger = max(bar["ema9"], bar["vwap"], previous["c"])
+    signal_trigger_candidates = [
+        price
+        for price in (pullback_reclaim_trigger, recent_high)
+        if price >= bar["c"]
+    ]
+    next_signal_trigger = min(signal_trigger_candidates) if signal_trigger_candidates else None
     signal = dynamic_signal(
         bars,
         index,
@@ -470,9 +478,12 @@ def current_dynamic_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledg
         "last_trade_pl": exit_trade["realized_pl"] if exit_trade else None,
         "ledger_cap": ledger_cap,
         "pullback_zone": pullback_zone,
+        "pullback_touch_trigger": pullback_touch_trigger,
+        "pullback_reclaim_trigger": pullback_reclaim_trigger,
         "pullback_limit": pullback_limit,
         "breakout_trigger": recent_high,
         "breakout_limit": breakout_limit,
+        "next_signal_trigger": next_signal_trigger,
         "atr14": atr,
         "ema9": bar["ema9"],
         "ema21": bar["ema21"],
@@ -683,9 +694,9 @@ def print_current_scan(plans):
     print("")
     print(
         f"{'Symbol':<6} {'Last':>8} {'Exit':>8} {'Ledger cap':>10} "
-        f"{'Pullback':>10} {'Breakout':>10} {'9/21':>14} {'Status':>14}"
+        f"{'Trigger':>10} {'Pullback':>10} {'Breakout':>10} {'9/21':>14} {'Status':>14}"
     )
-    print("-" * 92)
+    print("-" * 103)
     for plan in plans:
         if plan["status"] == "not_enough_bars":
             print(f"{plan['symbol']:<6} not enough bars")
@@ -694,6 +705,7 @@ def print_current_scan(plans):
         print(
             f"{plan['symbol']:<6} {dollars(plan['last_price']):>8} "
             f"{dollars(plan['last_exit_price']) if plan['last_exit_price'] is not None else 'n/a':>8} {ledger_cap:>10} "
+            f"{dollars(plan['next_signal_trigger']) if plan['next_signal_trigger'] else 'none':>10} "
             f"{dollars(plan['pullback_limit']):>10} {dollars(plan['breakout_limit']):>10} "
             f"{plan['price_action']:>14} "
             f"{plan['status']:>14}"
@@ -719,8 +731,13 @@ def print_current_scan(plans):
             print(f"  active {plan['mode']} reentry limit: {dollars(limit)}")
         else:
             print(
-                f"  no active strict signal; watch pullback limit {dollars(plan['pullback_limit'])} "
-                f"near zone {dollars(plan['pullback_zone'])}"
+                f"  no active strict signal; next trigger "
+                f"{dollars(plan['next_signal_trigger']) if plan['next_signal_trigger'] else 'none'}"
+            )
+            print(
+                f"  watch pullback reclaim above {dollars(plan['pullback_reclaim_trigger'])} "
+                f"after touch near {dollars(plan['pullback_touch_trigger'])}; "
+                f"limit up to {dollars(plan['pullback_limit'])}"
             )
             print(
                 f"  watch breakout above {dollars(plan['breakout_trigger'])} "

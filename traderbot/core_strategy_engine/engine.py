@@ -330,6 +330,14 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     )
     pullback_limit = min(pullback_zone + 0.10 * atr, ledger_cap)
     breakout_limit = min(recent_high + 0.10 * atr, ledger_cap)
+    pullback_touch_trigger = pullback_zone * 1.005
+    pullback_reclaim_trigger = max(bar["ema9"], bar["vwap"], previous["c"])
+    signal_trigger_candidates = [
+        price
+        for price in (pullback_reclaim_trigger, recent_high)
+        if price >= bar["c"]
+    ]
+    next_signal_trigger = min(signal_trigger_candidates) if signal_trigger_candidates else None
 
     market_ok = market_ok_at(market_bars, bar["t"])
     same_day_exit = (
@@ -348,8 +356,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     no_chase = bar["c"] <= bar["ema21"] + 0.75 * atr
     trend_base = bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and bar["ema21"] >= bar["ema50"]
 
-    touched_pullback = previous["l"] <= pullback_zone * 1.005
-    reclaimed = bar["c"] > max(bar["ema9"], bar["vwap"]) and bar["c"] > previous["c"]
+    touched_pullback = previous["l"] <= pullback_touch_trigger
+    reclaimed = bar["c"] > pullback_reclaim_trigger
     reclaim_trend_ok = trend_base and ema21_slope >= 0.002 and no_chase
     vwap_stability = sum(1 for item in bars[index - 2 : index + 1] if item["c"] > item["vwap"]) >= 2
     pullback_signal = (
@@ -423,9 +431,12 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         "ledger_ignored": ignore_ledger or not exit_trade,
         "ledger_cap": ledger_cap,
         "pullback_zone": pullback_zone,
+        "pullback_touch_trigger": pullback_touch_trigger,
+        "pullback_reclaim_trigger": pullback_reclaim_trigger,
         "pullback_limit": pullback_limit,
         "breakout_trigger": recent_high,
         "breakout_limit": breakout_limit,
+        "next_signal_trigger": next_signal_trigger,
         "atr14": atr,
         "ema9": bar["ema9"],
         "ema21": bar["ema21"],

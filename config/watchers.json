@@ -1,446 +1,445 @@
-﻿{
-    "max_concurrency":  3,
-    "scheduler_sleep_seconds":  2,
-    "default_poll_seconds":  30,
-    "default_error_poll_seconds":  30,
-    "default_market_closed_poll_seconds":  900,
-    "managed_watchers":  [
-                             {
-                                 "symbol":  "MRVL",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/strategy_config.json",
-                                 "state":  "runtime/state/strategy_state.json",
-                                 "log":  "runtime/logs/mrvl_watcher.jsonl"
-                             },
-                             {
-                                 "symbol":  "AMKR",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/amkr_strategy_config.json",
-                                 "state":  "runtime/state/amkr_strategy_state.json",
-                                 "log":  "runtime/logs/amkr_watcher.jsonl"
-                             },
-                             {
-                                 "symbol":  "IREN",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/iren_strategy_config.json",
-                                 "state":  "runtime/state/iren_strategy_state.json",
-                                 "log":  "runtime/logs/iren_watcher.jsonl"
-                             },
-                             {
-                                 "symbol":  "CRWV",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/crwv_strategy_config.json",
-                                 "state":  "runtime/state/crwv_strategy_state.json",
-                                 "log":  "runtime/logs/crwv_watcher.jsonl"
-                             },
-                             {
-                                 "symbol":  "AMPX",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/ampx_strategy_config.json",
-                                 "state":  "runtime/state/ampx_strategy_state.json",
-                                 "log":  "runtime/logs/ampx_watcher.jsonl"
-                             },
-                             {
-                                 "symbol":  "CRDO",
-                                 "config":  "traderbot/core_strategy_engine/strategies/configs/crdo_strategy_config.json",
-                                 "state":  "runtime/state/crdo_strategy_state.json",
-                                 "log":  "runtime/logs/crdo_watcher.jsonl"
-                             }
-                         ],
-    "new_watcher_defaults":  {
-                                 "strategy_name":  "Dynamic new-candidate entry",
-                                 "entry_quantity":  1,
-                                 "reentry_quantity":  1,
-                                 "reentry_enabled":  false,
-                                 "reentry_max_per_day":  1,
-                                 "reentry_cooldown_seconds":  600,
-                                 "dynamic_reentry_enabled":  false,
-                                 "dynamic_entry_enabled":  true,
-                                 "dynamic_timeframe":  "5Min",
-                                 "dynamic_lookback_days":  7,
-                                 "dynamic_entry_time_in_force":  "day",
-                                 "dynamic_replace_open_orders":  true,
-                                 "dynamic_replace_min_change_percent":  0.25,
-                                 "initial_stop_loss_percent":  20,
-                                 "trail_trigger_step_percent":  5,
-                                 "trail_stop_below_current_percent":  2.5,
-                                 "ladder_buy_quantity":  0,
-                                 "ladder_drop_steps_percent":  [
-
-                                                               ],
-                                 "poll_seconds":  60,
-                                 "market_closed_poll_seconds":  900
-                             },
-    "new_watchers":  [
-                         {
-                             "symbol":  "AIRJ",
-                             "state":  "runtime/state/candidates/airj_strategy_state.json",
-                             "log":  "runtime/logs/candidates/airj_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ALGS",
-                             "state":  "runtime/state/candidates/algs_strategy_state.json",
-                             "log":  "runtime/logs/candidates/algs_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ALMU",
-                             "state":  "runtime/state/candidates/almu_strategy_state.json",
-                             "log":  "runtime/logs/candidates/almu_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ANET",
-                             "state":  "runtime/state/candidates/anet_strategy_state.json",
-                             "log":  "runtime/logs/candidates/anet_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "APLD",
-                             "state":  "runtime/state/candidates/apld_strategy_state.json",
-                             "log":  "runtime/logs/candidates/apld_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ARM",
-                             "state":  "runtime/state/candidates/arm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/arm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ASML",
-                             "state":  "runtime/state/candidates/asml_strategy_state.json",
-                             "log":  "runtime/logs/candidates/asml_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ASTS",
-                             "state":  "runtime/state/candidates/asts_strategy_state.json",
-                             "log":  "runtime/logs/candidates/asts_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "AZN",
-                             "state":  "runtime/state/candidates/azn_strategy_state.json",
-                             "log":  "runtime/logs/candidates/azn_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "BE",
-                             "state":  "runtime/state/candidates/be_strategy_state.json",
-                             "log":  "runtime/logs/candidates/be_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "BGR",
-                             "state":  "runtime/state/candidates/bgr_strategy_state.json",
-                             "log":  "runtime/logs/candidates/bgr_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "BLDP",
-                             "state":  "runtime/state/candidates/bldp_strategy_state.json",
-                             "log":  "runtime/logs/candidates/bldp_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "BWMX",
-                             "state":  "runtime/state/candidates/bwmx_strategy_state.json",
-                             "log":  "runtime/logs/candidates/bwmx_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "CEG",
-                             "state":  "runtime/state/candidates/ceg_strategy_state.json",
-                             "log":  "runtime/logs/candidates/ceg_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "CIBR",
-                             "state":  "runtime/state/candidates/cibr_strategy_state.json",
-                             "log":  "runtime/logs/candidates/cibr_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "COHR",
-                             "state":  "runtime/state/candidates/cohr_strategy_state.json",
-                             "log":  "runtime/logs/candidates/cohr_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "CRM",
-                             "state":  "runtime/state/candidates/crm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/crm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "CRS",
-                             "state":  "runtime/state/candidates/crs_strategy_state.json",
-                             "log":  "runtime/logs/candidates/crs_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "CRWD",
-                             "state":  "runtime/state/candidates/crwd_strategy_state.json",
-                             "log":  "runtime/logs/candidates/crwd_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "DDOG",
-                             "state":  "runtime/state/candidates/ddog_strategy_state.json",
-                             "log":  "runtime/logs/candidates/ddog_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "DPRO",
-                             "state":  "runtime/state/candidates/dpro_strategy_state.json",
-                             "log":  "runtime/logs/candidates/dpro_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "EMO",
-                             "state":  "runtime/state/candidates/emo_strategy_state.json",
-                             "log":  "runtime/logs/candidates/emo_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ETN",
-                             "state":  "runtime/state/candidates/etn_strategy_state.json",
-                             "log":  "runtime/logs/candidates/etn_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ETO",
-                             "state":  "runtime/state/candidates/eto_strategy_state.json",
-                             "log":  "runtime/logs/candidates/eto_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "FCEL",
-                             "state":  "runtime/state/candidates/fcel_strategy_state.json",
-                             "log":  "runtime/logs/candidates/fcel_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "FLNC",
-                             "state":  "runtime/state/candidates/flnc_strategy_state.json",
-                             "log":  "runtime/logs/candidates/flnc_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "GD",
-                             "state":  "runtime/state/candidates/gd_strategy_state.json",
-                             "log":  "runtime/logs/candidates/gd_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "GEV",
-                             "state":  "runtime/state/candidates/gev_strategy_state.json",
-                             "log":  "runtime/logs/candidates/gev_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "GFS",
-                             "state":  "runtime/state/candidates/gfs_strategy_state.json",
-                             "log":  "runtime/logs/candidates/gfs_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "GOOG",
-                             "state":  "runtime/state/candidates/goog_strategy_state.json",
-                             "log":  "runtime/logs/candidates/goog_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "GRPN",
-                             "state":  "runtime/state/candidates/grpn_strategy_state.json",
-                             "log":  "runtime/logs/candidates/grpn_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "HSAI",
-                             "state":  "runtime/state/candidates/hsai_strategy_state.json",
-                             "log":  "runtime/logs/candidates/hsai_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "HUBB",
-                             "state":  "runtime/state/candidates/hubb_strategy_state.json",
-                             "log":  "runtime/logs/candidates/hubb_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "IBM",
-                             "state":  "runtime/state/candidates/ibm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/ibm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "IDVO",
-                             "state":  "runtime/state/candidates/idvo_strategy_state.json",
-                             "log":  "runtime/logs/candidates/idvo_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "IGV",
-                             "state":  "runtime/state/candidates/igv_strategy_state.json",
-                             "log":  "runtime/logs/candidates/igv_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "INTC",
-                             "state":  "runtime/state/candidates/intc_strategy_state.json",
-                             "log":  "runtime/logs/candidates/intc_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "IRDM",
-                             "state":  "runtime/state/candidates/irdm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/irdm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "IRWD",
-                             "state":  "runtime/state/candidates/irwd_strategy_state.json",
-                             "log":  "runtime/logs/candidates/irwd_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "JOBY",
-                             "state":  "runtime/state/candidates/joby_strategy_state.json",
-                             "log":  "runtime/logs/candidates/joby_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "KSLV",
-                             "state":  "runtime/state/candidates/kslv_strategy_state.json",
-                             "log":  "runtime/logs/candidates/kslv_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "LMND",
-                             "state":  "runtime/state/candidates/lmnd_strategy_state.json",
-                             "log":  "runtime/logs/candidates/lmnd_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "LOGI",
-                             "state":  "runtime/state/candidates/logi_strategy_state.json",
-                             "log":  "runtime/logs/candidates/logi_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "LRCX",
-                             "state":  "runtime/state/candidates/lrcx_strategy_state.json",
-                             "log":  "runtime/logs/candidates/lrcx_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "MDLN",
-                             "state":  "runtime/state/candidates/mdln_strategy_state.json",
-                             "log":  "runtime/logs/candidates/mdln_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "MIRM",
-                             "state":  "runtime/state/candidates/mirm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/mirm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "MRAM",
-                             "state":  "runtime/state/candidates/mram_strategy_state.json",
-                             "log":  "runtime/logs/candidates/mram_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "MU",
-                             "state":  "runtime/state/candidates/mu_strategy_state.json",
-                             "log":  "runtime/logs/candidates/mu_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "NFLX",
-                             "state":  "runtime/state/candidates/nflx_strategy_state.json",
-                             "log":  "runtime/logs/candidates/nflx_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ON",
-                             "state":  "runtime/state/candidates/on_strategy_state.json",
-                             "log":  "runtime/logs/candidates/on_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ORCL",
-                             "state":  "runtime/state/candidates/orcl_strategy_state.json",
-                             "log":  "runtime/logs/candidates/orcl_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "P",
-                             "state":  "runtime/state/candidates/p_strategy_state.json",
-                             "log":  "runtime/logs/candidates/p_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "PANW",
-                             "state":  "runtime/state/candidates/panw_strategy_state.json",
-                             "log":  "runtime/logs/candidates/panw_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "PLTR",
-                             "state":  "runtime/state/candidates/pltr_strategy_state.json",
-                             "log":  "runtime/logs/candidates/pltr_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "PLUG",
-                             "state":  "runtime/state/candidates/plug_strategy_state.json",
-                             "log":  "runtime/logs/candidates/plug_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "PODD",
-                             "state":  "runtime/state/candidates/podd_strategy_state.json",
-                             "log":  "runtime/logs/candidates/podd_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "POWW",
-                             "state":  "runtime/state/candidates/poww_strategy_state.json",
-                             "log":  "runtime/logs/candidates/poww_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "PUMP",
-                             "state":  "runtime/state/candidates/pump_strategy_state.json",
-                             "log":  "runtime/logs/candidates/pump_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "RBBN",
-                             "state":  "runtime/state/candidates/rbbn_strategy_state.json",
-                             "log":  "runtime/logs/candidates/rbbn_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "RDW",
-                             "state":  "runtime/state/candidates/rdw_strategy_state.json",
-                             "log":  "runtime/logs/candidates/rdw_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "RKLB",
-                             "state":  "runtime/state/candidates/rklb_strategy_state.json",
-                             "log":  "runtime/logs/candidates/rklb_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "SBUX",
-                             "state":  "runtime/state/candidates/sbux_strategy_state.json",
-                             "log":  "runtime/logs/candidates/sbux_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "SMCI",
-                             "state":  "runtime/state/candidates/smci_strategy_state.json",
-                             "log":  "runtime/logs/candidates/smci_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "SNOW",
-                             "state":  "runtime/state/candidates/snow_strategy_state.json",
-                             "log":  "runtime/logs/candidates/snow_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "STX",
-                             "state":  "runtime/state/candidates/stx_strategy_state.json",
-                             "log":  "runtime/logs/candidates/stx_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "TEM",
-                             "state":  "runtime/state/candidates/tem_strategy_state.json",
-                             "log":  "runtime/logs/candidates/tem_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "TGLS",
-                             "state":  "runtime/state/candidates/tgls_strategy_state.json",
-                             "log":  "runtime/logs/candidates/tgls_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "TM",
-                             "state":  "runtime/state/candidates/tm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/tm_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "USAR",
-                             "state":  "runtime/state/candidates/usar_strategy_state.json",
-                             "log":  "runtime/logs/candidates/usar_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "UUUU",
-                             "state":  "runtime/state/candidates/uuuu_strategy_state.json",
-                             "log":  "runtime/logs/candidates/uuuu_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "VRT",
-                             "state":  "runtime/state/candidates/vrt_strategy_state.json",
-                             "log":  "runtime/logs/candidates/vrt_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "WAT",
-                             "state":  "runtime/state/candidates/wat_strategy_state.json",
-                             "log":  "runtime/logs/candidates/wat_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "WDC",
-                             "state":  "runtime/state/candidates/wdc_strategy_state.json",
-                             "log":  "runtime/logs/candidates/wdc_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ZIM",
-                             "state":  "runtime/state/candidates/zim_strategy_state.json",
-                             "log":  "runtime/logs/candidates/zim_watcher.jsonl"
-                         },
-                         {
-                             "symbol":  "ZM",
-                             "state":  "runtime/state/candidates/zm_strategy_state.json",
-                             "log":  "runtime/logs/candidates/zm_watcher.jsonl"
-                         }
-                     ]
+{
+  "default_error_poll_seconds": 30,
+  "default_market_closed_poll_seconds": 900,
+  "default_poll_seconds": 30,
+  "managed_watchers": [
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/strategy_config.json",
+      "log": "runtime/logs/mrvl_watcher.jsonl",
+      "state": "runtime/state/strategy_state.json",
+      "symbol": "MRVL"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/amkr_strategy_config.json",
+      "log": "runtime/logs/amkr_watcher.jsonl",
+      "state": "runtime/state/amkr_strategy_state.json",
+      "symbol": "AMKR"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/iren_strategy_config.json",
+      "log": "runtime/logs/iren_watcher.jsonl",
+      "state": "runtime/state/iren_strategy_state.json",
+      "symbol": "IREN"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/crwv_strategy_config.json",
+      "log": "runtime/logs/crwv_watcher.jsonl",
+      "state": "runtime/state/crwv_strategy_state.json",
+      "symbol": "CRWV"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/ampx_strategy_config.json",
+      "log": "runtime/logs/ampx_watcher.jsonl",
+      "state": "runtime/state/ampx_strategy_state.json",
+      "symbol": "AMPX"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/crdo_strategy_config.json",
+      "log": "runtime/logs/crdo_watcher.jsonl",
+      "state": "runtime/state/crdo_strategy_state.json",
+      "symbol": "CRDO"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/goog_strategy_config.json",
+      "log": "runtime/logs/goog_watcher.jsonl",
+      "state": "runtime/state/goog_strategy_state.json",
+      "symbol": "GOOG"
+    }
+  ],
+  "max_concurrency": 3,
+  "new_watcher_defaults": {
+    "dynamic_entry_enabled": true,
+    "dynamic_entry_time_in_force": "day",
+    "dynamic_lookback_days": 7,
+    "dynamic_reentry_enabled": false,
+    "dynamic_replace_min_change_percent": 0.25,
+    "dynamic_replace_open_orders": true,
+    "dynamic_timeframe": "5Min",
+    "entry_quantity": 1,
+    "initial_stop_loss_percent": 20,
+    "ladder_buy_quantity": 0,
+    "ladder_drop_steps_percent": [],
+    "market_closed_poll_seconds": 900,
+    "poll_seconds": 60,
+    "reentry_cooldown_seconds": 600,
+    "reentry_enabled": false,
+    "reentry_max_per_day": 1,
+    "reentry_quantity": 1,
+    "strategy_name": "Dynamic new-candidate entry",
+    "trail_stop_below_current_percent": 2.5,
+    "trail_trigger_step_percent": 5
+  },
+  "new_watchers": [
+    {
+      "log": "runtime/logs/candidates/airj_watcher.jsonl",
+      "state": "runtime/state/candidates/airj_strategy_state.json",
+      "symbol": "AIRJ"
+    },
+    {
+      "log": "runtime/logs/candidates/algs_watcher.jsonl",
+      "state": "runtime/state/candidates/algs_strategy_state.json",
+      "symbol": "ALGS"
+    },
+    {
+      "log": "runtime/logs/candidates/almu_watcher.jsonl",
+      "state": "runtime/state/candidates/almu_strategy_state.json",
+      "symbol": "ALMU"
+    },
+    {
+      "log": "runtime/logs/candidates/anet_watcher.jsonl",
+      "state": "runtime/state/candidates/anet_strategy_state.json",
+      "symbol": "ANET"
+    },
+    {
+      "log": "runtime/logs/candidates/apld_watcher.jsonl",
+      "state": "runtime/state/candidates/apld_strategy_state.json",
+      "symbol": "APLD"
+    },
+    {
+      "log": "runtime/logs/candidates/arm_watcher.jsonl",
+      "state": "runtime/state/candidates/arm_strategy_state.json",
+      "symbol": "ARM"
+    },
+    {
+      "log": "runtime/logs/candidates/asml_watcher.jsonl",
+      "state": "runtime/state/candidates/asml_strategy_state.json",
+      "symbol": "ASML"
+    },
+    {
+      "log": "runtime/logs/candidates/asts_watcher.jsonl",
+      "state": "runtime/state/candidates/asts_strategy_state.json",
+      "symbol": "ASTS"
+    },
+    {
+      "log": "runtime/logs/candidates/azn_watcher.jsonl",
+      "state": "runtime/state/candidates/azn_strategy_state.json",
+      "symbol": "AZN"
+    },
+    {
+      "log": "runtime/logs/candidates/be_watcher.jsonl",
+      "state": "runtime/state/candidates/be_strategy_state.json",
+      "symbol": "BE"
+    },
+    {
+      "log": "runtime/logs/candidates/bgr_watcher.jsonl",
+      "state": "runtime/state/candidates/bgr_strategy_state.json",
+      "symbol": "BGR"
+    },
+    {
+      "log": "runtime/logs/candidates/bldp_watcher.jsonl",
+      "state": "runtime/state/candidates/bldp_strategy_state.json",
+      "symbol": "BLDP"
+    },
+    {
+      "log": "runtime/logs/candidates/bwmx_watcher.jsonl",
+      "state": "runtime/state/candidates/bwmx_strategy_state.json",
+      "symbol": "BWMX"
+    },
+    {
+      "log": "runtime/logs/candidates/ceg_watcher.jsonl",
+      "state": "runtime/state/candidates/ceg_strategy_state.json",
+      "symbol": "CEG"
+    },
+    {
+      "log": "runtime/logs/candidates/cibr_watcher.jsonl",
+      "state": "runtime/state/candidates/cibr_strategy_state.json",
+      "symbol": "CIBR"
+    },
+    {
+      "log": "runtime/logs/candidates/cohr_watcher.jsonl",
+      "state": "runtime/state/candidates/cohr_strategy_state.json",
+      "symbol": "COHR"
+    },
+    {
+      "log": "runtime/logs/candidates/crm_watcher.jsonl",
+      "state": "runtime/state/candidates/crm_strategy_state.json",
+      "symbol": "CRM"
+    },
+    {
+      "log": "runtime/logs/candidates/crs_watcher.jsonl",
+      "state": "runtime/state/candidates/crs_strategy_state.json",
+      "symbol": "CRS"
+    },
+    {
+      "log": "runtime/logs/candidates/crwd_watcher.jsonl",
+      "state": "runtime/state/candidates/crwd_strategy_state.json",
+      "symbol": "CRWD"
+    },
+    {
+      "log": "runtime/logs/candidates/ddog_watcher.jsonl",
+      "state": "runtime/state/candidates/ddog_strategy_state.json",
+      "symbol": "DDOG"
+    },
+    {
+      "log": "runtime/logs/candidates/dpro_watcher.jsonl",
+      "state": "runtime/state/candidates/dpro_strategy_state.json",
+      "symbol": "DPRO"
+    },
+    {
+      "log": "runtime/logs/candidates/emo_watcher.jsonl",
+      "state": "runtime/state/candidates/emo_strategy_state.json",
+      "symbol": "EMO"
+    },
+    {
+      "log": "runtime/logs/candidates/etn_watcher.jsonl",
+      "state": "runtime/state/candidates/etn_strategy_state.json",
+      "symbol": "ETN"
+    },
+    {
+      "log": "runtime/logs/candidates/eto_watcher.jsonl",
+      "state": "runtime/state/candidates/eto_strategy_state.json",
+      "symbol": "ETO"
+    },
+    {
+      "log": "runtime/logs/candidates/fcel_watcher.jsonl",
+      "state": "runtime/state/candidates/fcel_strategy_state.json",
+      "symbol": "FCEL"
+    },
+    {
+      "log": "runtime/logs/candidates/flnc_watcher.jsonl",
+      "state": "runtime/state/candidates/flnc_strategy_state.json",
+      "symbol": "FLNC"
+    },
+    {
+      "log": "runtime/logs/candidates/gd_watcher.jsonl",
+      "state": "runtime/state/candidates/gd_strategy_state.json",
+      "symbol": "GD"
+    },
+    {
+      "log": "runtime/logs/candidates/gev_watcher.jsonl",
+      "state": "runtime/state/candidates/gev_strategy_state.json",
+      "symbol": "GEV"
+    },
+    {
+      "log": "runtime/logs/candidates/gfs_watcher.jsonl",
+      "state": "runtime/state/candidates/gfs_strategy_state.json",
+      "symbol": "GFS"
+    },
+    {
+      "log": "runtime/logs/candidates/grpn_watcher.jsonl",
+      "state": "runtime/state/candidates/grpn_strategy_state.json",
+      "symbol": "GRPN"
+    },
+    {
+      "log": "runtime/logs/candidates/hsai_watcher.jsonl",
+      "state": "runtime/state/candidates/hsai_strategy_state.json",
+      "symbol": "HSAI"
+    },
+    {
+      "log": "runtime/logs/candidates/hubb_watcher.jsonl",
+      "state": "runtime/state/candidates/hubb_strategy_state.json",
+      "symbol": "HUBB"
+    },
+    {
+      "log": "runtime/logs/candidates/ibm_watcher.jsonl",
+      "state": "runtime/state/candidates/ibm_strategy_state.json",
+      "symbol": "IBM"
+    },
+    {
+      "log": "runtime/logs/candidates/idvo_watcher.jsonl",
+      "state": "runtime/state/candidates/idvo_strategy_state.json",
+      "symbol": "IDVO"
+    },
+    {
+      "log": "runtime/logs/candidates/igv_watcher.jsonl",
+      "state": "runtime/state/candidates/igv_strategy_state.json",
+      "symbol": "IGV"
+    },
+    {
+      "log": "runtime/logs/candidates/intc_watcher.jsonl",
+      "state": "runtime/state/candidates/intc_strategy_state.json",
+      "symbol": "INTC"
+    },
+    {
+      "log": "runtime/logs/candidates/irdm_watcher.jsonl",
+      "state": "runtime/state/candidates/irdm_strategy_state.json",
+      "symbol": "IRDM"
+    },
+    {
+      "log": "runtime/logs/candidates/irwd_watcher.jsonl",
+      "state": "runtime/state/candidates/irwd_strategy_state.json",
+      "symbol": "IRWD"
+    },
+    {
+      "log": "runtime/logs/candidates/joby_watcher.jsonl",
+      "state": "runtime/state/candidates/joby_strategy_state.json",
+      "symbol": "JOBY"
+    },
+    {
+      "log": "runtime/logs/candidates/kslv_watcher.jsonl",
+      "state": "runtime/state/candidates/kslv_strategy_state.json",
+      "symbol": "KSLV"
+    },
+    {
+      "log": "runtime/logs/candidates/lmnd_watcher.jsonl",
+      "state": "runtime/state/candidates/lmnd_strategy_state.json",
+      "symbol": "LMND"
+    },
+    {
+      "log": "runtime/logs/candidates/logi_watcher.jsonl",
+      "state": "runtime/state/candidates/logi_strategy_state.json",
+      "symbol": "LOGI"
+    },
+    {
+      "log": "runtime/logs/candidates/lrcx_watcher.jsonl",
+      "state": "runtime/state/candidates/lrcx_strategy_state.json",
+      "symbol": "LRCX"
+    },
+    {
+      "log": "runtime/logs/candidates/mdln_watcher.jsonl",
+      "state": "runtime/state/candidates/mdln_strategy_state.json",
+      "symbol": "MDLN"
+    },
+    {
+      "log": "runtime/logs/candidates/mirm_watcher.jsonl",
+      "state": "runtime/state/candidates/mirm_strategy_state.json",
+      "symbol": "MIRM"
+    },
+    {
+      "log": "runtime/logs/candidates/mram_watcher.jsonl",
+      "state": "runtime/state/candidates/mram_strategy_state.json",
+      "symbol": "MRAM"
+    },
+    {
+      "log": "runtime/logs/candidates/mu_watcher.jsonl",
+      "state": "runtime/state/candidates/mu_strategy_state.json",
+      "symbol": "MU"
+    },
+    {
+      "log": "runtime/logs/candidates/nflx_watcher.jsonl",
+      "state": "runtime/state/candidates/nflx_strategy_state.json",
+      "symbol": "NFLX"
+    },
+    {
+      "log": "runtime/logs/candidates/on_watcher.jsonl",
+      "state": "runtime/state/candidates/on_strategy_state.json",
+      "symbol": "ON"
+    },
+    {
+      "log": "runtime/logs/candidates/orcl_watcher.jsonl",
+      "state": "runtime/state/candidates/orcl_strategy_state.json",
+      "symbol": "ORCL"
+    },
+    {
+      "log": "runtime/logs/candidates/p_watcher.jsonl",
+      "state": "runtime/state/candidates/p_strategy_state.json",
+      "symbol": "P"
+    },
+    {
+      "log": "runtime/logs/candidates/panw_watcher.jsonl",
+      "state": "runtime/state/candidates/panw_strategy_state.json",
+      "symbol": "PANW"
+    },
+    {
+      "log": "runtime/logs/candidates/pltr_watcher.jsonl",
+      "state": "runtime/state/candidates/pltr_strategy_state.json",
+      "symbol": "PLTR"
+    },
+    {
+      "log": "runtime/logs/candidates/plug_watcher.jsonl",
+      "state": "runtime/state/candidates/plug_strategy_state.json",
+      "symbol": "PLUG"
+    },
+    {
+      "log": "runtime/logs/candidates/podd_watcher.jsonl",
+      "state": "runtime/state/candidates/podd_strategy_state.json",
+      "symbol": "PODD"
+    },
+    {
+      "log": "runtime/logs/candidates/poww_watcher.jsonl",
+      "state": "runtime/state/candidates/poww_strategy_state.json",
+      "symbol": "POWW"
+    },
+    {
+      "log": "runtime/logs/candidates/pump_watcher.jsonl",
+      "state": "runtime/state/candidates/pump_strategy_state.json",
+      "symbol": "PUMP"
+    },
+    {
+      "log": "runtime/logs/candidates/rbbn_watcher.jsonl",
+      "state": "runtime/state/candidates/rbbn_strategy_state.json",
+      "symbol": "RBBN"
+    },
+    {
+      "log": "runtime/logs/candidates/rdw_watcher.jsonl",
+      "state": "runtime/state/candidates/rdw_strategy_state.json",
+      "symbol": "RDW"
+    },
+    {
+      "log": "runtime/logs/candidates/rklb_watcher.jsonl",
+      "state": "runtime/state/candidates/rklb_strategy_state.json",
+      "symbol": "RKLB"
+    },
+    {
+      "log": "runtime/logs/candidates/sbux_watcher.jsonl",
+      "state": "runtime/state/candidates/sbux_strategy_state.json",
+      "symbol": "SBUX"
+    },
+    {
+      "log": "runtime/logs/candidates/smci_watcher.jsonl",
+      "state": "runtime/state/candidates/smci_strategy_state.json",
+      "symbol": "SMCI"
+    },
+    {
+      "log": "runtime/logs/candidates/snow_watcher.jsonl",
+      "state": "runtime/state/candidates/snow_strategy_state.json",
+      "symbol": "SNOW"
+    },
+    {
+      "log": "runtime/logs/candidates/stx_watcher.jsonl",
+      "state": "runtime/state/candidates/stx_strategy_state.json",
+      "symbol": "STX"
+    },
+    {
+      "log": "runtime/logs/candidates/tem_watcher.jsonl",
+      "state": "runtime/state/candidates/tem_strategy_state.json",
+      "symbol": "TEM"
+    },
+    {
+      "log": "runtime/logs/candidates/tgls_watcher.jsonl",
+      "state": "runtime/state/candidates/tgls_strategy_state.json",
+      "symbol": "TGLS"
+    },
+    {
+      "log": "runtime/logs/candidates/tm_watcher.jsonl",
+      "state": "runtime/state/candidates/tm_strategy_state.json",
+      "symbol": "TM"
+    },
+    {
+      "log": "runtime/logs/candidates/usar_watcher.jsonl",
+      "state": "runtime/state/candidates/usar_strategy_state.json",
+      "symbol": "USAR"
+    },
+    {
+      "log": "runtime/logs/candidates/uuuu_watcher.jsonl",
+      "state": "runtime/state/candidates/uuuu_strategy_state.json",
+      "symbol": "UUUU"
+    },
+    {
+      "log": "runtime/logs/candidates/vrt_watcher.jsonl",
+      "state": "runtime/state/candidates/vrt_strategy_state.json",
+      "symbol": "VRT"
+    },
+    {
+      "log": "runtime/logs/candidates/wat_watcher.jsonl",
+      "state": "runtime/state/candidates/wat_strategy_state.json",
+      "symbol": "WAT"
+    },
+    {
+      "log": "runtime/logs/candidates/wdc_watcher.jsonl",
+      "state": "runtime/state/candidates/wdc_strategy_state.json",
+      "symbol": "WDC"
+    },
+    {
+      "log": "runtime/logs/candidates/zim_watcher.jsonl",
+      "state": "runtime/state/candidates/zim_strategy_state.json",
+      "symbol": "ZIM"
+    },
+    {
+      "log": "runtime/logs/candidates/zm_watcher.jsonl",
+      "state": "runtime/state/candidates/zm_strategy_state.json",
+      "symbol": "ZM"
+    }
+  ],
+  "scheduler_sleep_seconds": 2
 }
