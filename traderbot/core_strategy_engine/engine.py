@@ -14,6 +14,7 @@ import urllib.request
 DEFAULT_CONFIG_PATH = "traderbot/core_strategy_engine/strategies/configs/strategy_config.json"
 DEFAULT_STATE_PATH = "runtime/state/strategy_state.json"
 MARKET_SYMBOL = "QQQ"
+DEFAULT_MIN_CASH_BALANCE_PERCENT = 20
 
 
 def load_env(path=".env"):
@@ -102,6 +103,41 @@ class AlpacaClient:
     def clock(self):
         return self.trading("GET", "/clock")
 
+    def account(self):
+        return self.trading("GET", "/account")
+
+    def portfolio_history(self, period="1A", timeframe="1D"):
+        query = urllib.parse.urlencode({"period": period, "timeframe": timeframe})
+        return self.trading("GET", f"/account/portfolio/history?{query}") or {}
+
+    def fills(self, after, until=None):
+        fills = []
+        page_token = None
+        while True:
+            params = {
+                "activity_types": "FILL",
+                "after": after,
+                "direction": "asc",
+                "page_size": "100",
+            }
+            if until:
+                params["until"] = until
+            if page_token:
+                params["page_token"] = page_token
+            query = urllib.parse.urlencode(params)
+            payload = self.trading("GET", f"/account/activities?{query}") or []
+            if isinstance(payload, dict):
+                fills.extend(payload.get("activities", []))
+                page_token = payload.get("next_page_token")
+            else:
+                fills.extend(payload)
+                page_token = None
+            if not page_token:
+                return fills
+
+    def positions(self):
+        return self.trading("GET", "/positions") or []
+
     def position(self, symbol):
         try:
             return self.trading("GET", f"/positions/{symbol}")
@@ -166,6 +202,55 @@ class AlpacaClient:
 
 def dollars(value):
     return f"{value:.2f}"
+
+
+def dynamic_entry_notional(config, plan):
+    if plan.get("market_filter_ignored"):
+        return float(config.get("dynamic_market_filter_ignored_notional", 2500))
+    return float(config.get("dynamic_entry_notional", 5000))
+
+
+def dynamic_entry_quantity(config, plan):
+    limit_price = float(plan["limit_price"])
+    notional = dynamic_entry_notional(config, plan)
+    return max(1, math.floor(notional / limit_price))
+
+
+def cash_reserve_percent(config):
+    return float(
+        config.get("min_cash_balance_percent", DEFAULT_MIN_CASH_BALANCE_PERCENT)
+    )
+
+
+def cash_protected_quantity(client, config, desired_qty, estimated_price):
+    reserve_percent = cash_reserve_percent(config)
+    if reserve_percent <= 0:
+        return desired_qty, {
+            "cash_reserve_enforced": False,
+            "requested_qty": desired_qty,
+        }
+
+    account = client.account()
+    cash = float(account.get("cash", 0))
+    equity = float(account.get("equity", 0))
+    min_cash_balance = equity * reserve_percent / 100
+    available_notional = max(0, cash - min_cash_balance)
+    max_qty = math.floor(available_notional / estimated_price)
+    qty = max(0, min(desired_qty, max_qty))
+    estimated_notional = qty * estimated_price
+    return qty, {
+        "cash_reserve_enforced": True,
+        "min_cash_balance_percent": reserve_percent,
+        "cash": cash,
+        "equity": equity,
+        "min_cash_balance": min_cash_balance,
+        "available_notional": available_notional,
+        "requested_qty": desired_qty,
+        "requested_notional": desired_qty * estimated_price,
+        "adjusted_qty": qty,
+        "estimated_order_notional": estimated_notional,
+        "estimated_cash_after_order": cash - estimated_notional,
+    }
 
 
 def parse_alpaca_time(value):
@@ -360,9 +445,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     reclaimed = bar["c"] > pullback_reclaim_trigger
     reclaim_trend_ok = trend_base and ema21_slope >= 0.002 and no_chase
     vwap_stability = sum(1 for item in bars[index - 2 : index + 1] if item["c"] > item["vwap"]) >= 2
-    pullback_signal = (
-        market_ok
-        and above_exit
+    pullback_stock_signal = (
+        above_exit
         and no_same_day_loss_reentry
         and touched_pullback
         and reclaimed
@@ -372,6 +456,7 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         and pullback_limit <= ledger_cap
         and reward_risk_ok(pullback_limit, recent_high, atr, minimum=1.5)
     )
+    pullback_signal = pullback_stock_signal
 
     breakout = bar["c"] > recent_high and bar["volume_ratio"] >= 1.3
     breakout_trend_ok = (
@@ -380,9 +465,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         and bar["ema21"] >= bar["ema50"]
         and ema21_slope >= 0.002
     )
-    breakout_signal = (
-        market_ok
-        and above_exit
+    breakout_stock_signal = (
+        above_exit
         and no_same_day_loss_reentry
         and breakout
         and breakout_trend_ok
@@ -390,6 +474,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         and breakout_limit <= ledger_cap
         and reward_risk_ok(breakout_limit, breakout_limit + 2 * atr, atr, minimum=1.5)
     )
+    breakout_signal = breakout_stock_signal
+    market_filter_ignored = not market_ok and (pullback_stock_signal or breakout_stock_signal)
 
     mode = None
     limit_price = None
@@ -401,7 +487,7 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         limit_price = breakout_limit
 
     checks = {
-        "market_ok": market_ok,
+        "market_ok": market_ok or market_filter_ignored,
         "above_exit": above_exit,
         "no_same_day_loss_reentry": no_same_day_loss_reentry,
         "above_ema9": bar["c"] > bar["ema9"],
@@ -429,6 +515,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         "last_bar_time": bar["t"].isoformat(),
         "last_price": bar["c"],
         "ledger_ignored": ignore_ledger or not exit_trade,
+        "market_ok": market_ok,
+        "market_filter_ignored": market_filter_ignored,
         "ledger_cap": ledger_cap,
         "pullback_zone": pullback_zone,
         "pullback_touch_trigger": pullback_touch_trigger,
@@ -614,13 +702,35 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
             and plan.get("status") == "active_signal"
             and desired_limit
         ):
+            desired_qty = dynamic_entry_quantity(config, plan)
+            adjusted_qty, sizing = cash_protected_quantity(
+                client, config, desired_qty, float(desired_limit)
+            )
+            if adjusted_qty <= 0:
+                client.cancel_order(order_id)
+                state.pop("reentry_order_id", None)
+                state.pop("current_entry_order_id", None)
+                return {
+                    "status": "dynamic_entry_order_canceled_cash_reserve",
+                    "old_order_id": order_id,
+                    "target_notional": dynamic_entry_notional(config, plan),
+                    "mode": plan.get("mode"),
+                    "sizing": sizing,
+                    "dynamic_plan": serializable_plan(plan),
+                }
+            desired_qty = adjusted_qty
             current_limit = float(order.get("limit_price") or 0)
+            current_qty = int(float(order.get("qty") or 0))
             min_change = config.get("dynamic_replace_min_change_percent", 0.25) / 100
-            if current_limit <= 0 or abs(desired_limit / current_limit - 1) >= min_change:
+            if (
+                current_qty != desired_qty
+                or current_limit <= 0
+                or abs(desired_limit / current_limit - 1) >= min_change
+            ):
                 replaced = client.replace_order(
                     order_id,
                     {
-                        "qty": order["qty"],
+                        "qty": str(desired_qty),
                         "limit_price": dollars(desired_limit),
                         "time_in_force": order.get("time_in_force", "day"),
                     },
@@ -632,7 +742,10 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                     "old_order_id": order_id,
                     "new_order_id": replaced["id"],
                     "limit_price": replaced.get("limit_price"),
+                    "qty": replaced.get("qty"),
+                    "target_notional": dynamic_entry_notional(config, plan),
                     "mode": plan.get("mode"),
+                    "sizing": sizing,
                 }
         return {
             "status": "waiting_for_reentry_fill",
@@ -664,7 +777,20 @@ def build_exit_trade_from_state(state):
 
 def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     symbol = config["symbol"]
-    qty = config.get("reentry_quantity", config["entry_quantity"])
+    requested_qty = dynamic_entry_quantity(config, plan)
+    qty, sizing = cash_protected_quantity(
+        client, config, requested_qty, float(plan["limit_price"])
+    )
+    target_notional = dynamic_entry_notional(config, plan)
+    if qty <= 0:
+        return {
+            "status": "dynamic_entry_cash_reserve_blocked",
+            "reason": f"{reason_prefix}_{plan['mode']}",
+            "target_notional": target_notional,
+            "sizing": sizing,
+            "dynamic_plan": serializable_plan(plan),
+        }
+
     order = client.submit_order(
         {
             "symbol": symbol,
@@ -684,7 +810,11 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
         "status": "dynamic_reentry_order_submitted",
         "reason": state["reentry_reason"],
         "limit_price": order.get("limit_price"),
+        "qty": order.get("qty"),
+        "target_notional": target_notional,
+        "market_filter_ignored": plan.get("market_filter_ignored", False),
         "reentry_order_id": order["id"],
+        "sizing": sizing,
         "dynamic_plan": serializable_plan(plan),
     }
 
@@ -853,10 +983,23 @@ def handle_reentry(client, config, state):
             "pullback_seen": state.get("reentry_pullback_seen", False),
         }
 
+    requested_qty = int(config.get("reentry_quantity", config["entry_quantity"]))
+    qty, sizing = cash_protected_quantity(
+        client, config, requested_qty, float(limit_price)
+    )
+    if qty <= 0:
+        return {
+            "status": "reentry_cash_reserve_blocked",
+            "reason": reason,
+            "current_price": current_price,
+            "limit_price": limit_price,
+            "sizing": sizing,
+        }
+
     order = client.submit_order(
         {
             "symbol": symbol,
-            "qty": str(config.get("reentry_quantity", config["entry_quantity"])),
+            "qty": str(qty),
             "side": "buy",
             "type": "limit",
             "limit_price": dollars(limit_price),
@@ -875,7 +1018,9 @@ def handle_reentry(client, config, state):
         "reason": reason,
         "current_price": current_price,
         "limit_price": order.get("limit_price"),
+        "qty": order.get("qty"),
         "reentry_order_id": order["id"],
+        "sizing": sizing,
     }
 
 
@@ -982,16 +1127,31 @@ def run_once(client, config, state, clock=None):
     stop_order = update_stop_order(client, symbol, qty, floor_price, state)
 
     ladder_orders = []
+    skipped_ladder_orders = []
     for drop_step in config["ladder_drop_steps_percent"]:
         if drop_step in state["filled_ladder_steps"]:
             continue
 
         trigger_price = fill_price * (1 - drop_step / 100)
         if current_price <= trigger_price:
+            requested_qty = int(config["ladder_buy_quantity"])
+            ladder_qty, sizing = cash_protected_quantity(
+                client, config, requested_qty, current_price
+            )
+            if ladder_qty <= 0:
+                skipped_ladder_orders.append(
+                    {
+                        "drop_step_percent": drop_step,
+                        "status": "cash_reserve_blocked",
+                        "sizing": sizing,
+                    }
+                )
+                continue
+
             order = client.submit_order(
                 {
                     "symbol": symbol,
-                    "qty": str(config["ladder_buy_quantity"]),
+                    "qty": str(ladder_qty),
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "day",
@@ -999,7 +1159,7 @@ def run_once(client, config, state, clock=None):
             )
             state["filled_ladder_steps"].append(drop_step)
             state["ladder_order_ids"][str(drop_step)] = order["id"]
-            ladder_orders.append(order)
+            ladder_orders.append({"order": order, "sizing": sizing})
 
     return {
         "status": "managed",
@@ -1009,7 +1169,9 @@ def run_once(client, config, state, clock=None):
         "floor_price": floor_price,
         "highest_trail_rung": state["highest_trail_rung"],
         "updated_stop_order": stop_order["id"] if stop_order else None,
-        "new_ladder_orders": [order["id"] for order in ladder_orders],
+        "new_ladder_orders": [item["order"]["id"] for item in ladder_orders],
+        "ladder_sizing": [item["sizing"] for item in ladder_orders],
+        "skipped_ladder_orders": skipped_ladder_orders,
     }
 
 

@@ -12,8 +12,11 @@ from traderbot.core_strategy_engine.engine import (
     AlpacaClient,
     load_env,
     load_json,
-    run_once,
     save_json,
+)
+from traderbot.core_strategy_engine.strategies import (
+    DEFAULT_STRATEGY_TYPE,
+    resolve_strategy,
 )
 
 
@@ -169,9 +172,13 @@ def result_has_open_position(result):
 def managed_strategy_config(symbol, config):
     managed = dict(config)
     managed["symbol"] = symbol
+    managed["strategy_type"] = "managed_dynamic_reentry"
     managed["strategy_name"] = f"Managed dynamic reentry for {symbol}"
     managed["dynamic_entry_enabled"] = False
     managed["dynamic_reentry_enabled"] = True
+    managed.setdefault("dynamic_entry_notional", 5000)
+    managed.setdefault("dynamic_market_filter_ignored_notional", 2500)
+    managed.setdefault("min_cash_balance_percent", 20)
     return managed
 
 
@@ -221,11 +228,19 @@ def run_watcher(client, watcher, supervisor_config, clock):
     if watcher.get("config_path"):
         strategy_config.update(load_json(watcher["config_path"], {}))
     strategy_config.setdefault("symbol", watcher["symbol"])
+    strategy_config.setdefault(
+        "strategy_type",
+        "new_candidate_dynamic_entry"
+        if watcher.get("group") == "new"
+        else DEFAULT_STRATEGY_TYPE,
+    )
     state = load_json(watcher["state_path"], {})
     symbol = strategy_config.get("symbol", watcher["symbol"])
 
     try:
-        result = run_once(client, strategy_config, state, clock=clock)
+        strategy_cls = resolve_strategy(strategy_config.get("strategy_type"))
+        strategy = strategy_cls(client, strategy_config, state, clock=clock)
+        result = strategy.run_once()
         save_json(watcher["state_path"], state)
         watcher["failures"] = 0
     except Exception as exc:
@@ -350,6 +365,7 @@ def main():
                         {
                             "timestamp": record["timestamp"],
                             "symbol": record["symbol"],
+                            "strategy_type": record["strategy_config"].get("strategy_type"),
                             "status": result.get("status"),
                             "next_run_seconds": record["next_run_seconds"],
                             "promoted_to_managed": bool(promoted),

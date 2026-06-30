@@ -336,8 +336,9 @@ def dynamic_signal(bars, index, exit_trade, market_bars, ignore_ledger=False):
     bar = bars[index]
     previous = bars[index - 1]
     window = prior_window(bars, index, 20)
-    if not window or not market_ok_at(market_bars, bar["t"]):
+    if not window:
         return None
+    market_ok = market_ok_at(market_bars, bar["t"])
 
     atr = max(bar["atr14"], 0.01)
     ema21_slope = (bar["ema21"] - bars[index - 5]["ema21"]) / bars[index - 5]["ema21"]
@@ -383,6 +384,8 @@ def dynamic_signal(bars, index, exit_trade, market_bars, ignore_ledger=False):
                 "trigger_time": bar["t"],
                 "limit_price": limit_price,
                 "ledger_cap": ledger_cap,
+                "market_ok": market_ok,
+                "market_filter_ignored": not market_ok,
             }
 
     breakout = bar["c"] > recent_high and bar["volume_ratio"] >= 1.3
@@ -401,6 +404,8 @@ def dynamic_signal(bars, index, exit_trade, market_bars, ignore_ledger=False):
                 "trigger_time": bar["t"],
                 "limit_price": limit_price,
                 "ledger_cap": ledger_cap,
+                "market_ok": market_ok,
+                "market_filter_ignored": not market_ok,
             }
 
     return None
@@ -441,6 +446,7 @@ def current_dynamic_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledg
         if price >= bar["c"]
     ]
     next_signal_trigger = min(signal_trigger_candidates) if signal_trigger_candidates else None
+    market_ok = market_ok_at(market_bars, bar["t"])
     signal = dynamic_signal(
         bars,
         index,
@@ -448,9 +454,10 @@ def current_dynamic_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledg
         market_bars,
         ignore_ledger=ignore_ledger or not exit_trade,
     )
+    market_filter_ignored = bool(signal and signal.get("market_filter_ignored"))
 
     checks = {
-        "market_ok": market_ok_at(market_bars, bar["t"]),
+        "market_ok": market_ok or market_filter_ignored,
         "above_exit": True
         if ignore_ledger or not exit_trade
         else exit_trade["realized_pl"] < 0 or bar["c"] >= exit_trade["exit_price"],
@@ -471,6 +478,8 @@ def current_dynamic_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledg
         "status": "active_signal" if signal else "watch",
         "mode": signal.get("mode") if signal else None,
         "ledger_ignored": ignore_ledger or not exit_trade,
+        "market_ok": market_ok,
+        "market_filter_ignored": market_filter_ignored,
         "last_bar_time": bar["t"],
         "last_price": bar["c"],
         "last_exit_time": exit_trade["exit_time"] if exit_trade else None,
@@ -729,6 +738,8 @@ def print_current_scan(plans):
         if plan["status"] == "active_signal":
             limit = plan["pullback_limit"] if "pullback" in plan["mode"] else plan["breakout_limit"]
             print(f"  active {plan['mode']} reentry limit: {dollars(limit)}")
+            if plan.get("market_filter_ignored"):
+                print("  market filter ignored because all stock-specific signal checks passed")
         else:
             print(
                 f"  no active strict signal; next trigger "
