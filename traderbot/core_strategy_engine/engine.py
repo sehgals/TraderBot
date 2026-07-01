@@ -103,6 +103,10 @@ class AlpacaClient:
     def clock(self):
         return self.trading("GET", "/clock")
 
+    def calendar(self, start, end):
+        query = urllib.parse.urlencode({"start": start, "end": end})
+        return self.trading("GET", f"/calendar?{query}") or []
+
     def account(self):
         return self.trading("GET", "/account")
 

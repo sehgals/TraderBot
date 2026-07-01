@@ -44,6 +44,13 @@ def last_closed_trading_day(now=None):
     return current
 
 
+def is_market_day(client, report_date):
+    if client is None:
+        return report_date.weekday() < 5
+    calendar = client.calendar(report_date.isoformat(), report_date.isoformat())
+    return bool(calendar)
+
+
 def day_window(report_date):
     start = datetime.datetime.combine(report_date, datetime.time(0, 0), tzinfo=LOCAL_TZ)
     end = start + datetime.timedelta(days=1)
@@ -150,12 +157,16 @@ def fill_side(fill):
     return "buy" if qty > 0 else "sell" if qty < 0 else ""
 
 
+def fill_timestamp(fill):
+    return fill.get("transaction_time") or fill.get("timestamp") or fill.get("date")
+
+
 def summarize_fills(fills):
     bought = []
     sold = []
     for fill in fills:
         item = {
-            "timestamp": fill.get("transaction_time") or fill.get("date"),
+            "timestamp": fill_timestamp(fill),
             "symbol": fill.get("symbol"),
             "qty": fill.get("qty"),
             "price": fill.get("price"),
@@ -167,6 +178,120 @@ def summarize_fills(fills):
         elif side == "sell":
             sold.append(item)
     return bought, sold
+
+
+def aggregate_order_fills(fills):
+    orders = {}
+    order_sequence = []
+    for fill in fills or []:
+        symbol = fill.get("symbol")
+        side = fill_side(fill)
+        order_id = fill.get("order_id")
+        timestamp = fill_timestamp(fill)
+        if not symbol or side not in ("buy", "sell") or not timestamp:
+            continue
+
+        key = (order_id, symbol, side)
+        if key not in orders:
+            orders[key] = {
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "side": side,
+                "qty": 0.0,
+                "notional": 0.0,
+                "order_id": order_id,
+            }
+            order_sequence.append(key)
+
+        qty = abs(as_float(fill.get("qty") or fill.get("net_qty")))
+        price = as_float(fill.get("price"))
+        orders[key]["qty"] += qty
+        orders[key]["notional"] += qty * price
+        if parse_time(timestamp) > parse_time(orders[key]["timestamp"]):
+            orders[key]["timestamp"] = timestamp
+
+    aggregated = []
+    for key in order_sequence:
+        order = orders[key]
+        if not order["qty"]:
+            continue
+        aggregated.append({**order, "price": order["notional"] / order["qty"]})
+    return sorted(aggregated, key=lambda item: parse_time(item["timestamp"]))
+
+
+def realized_pl_by_sell_order(fills, start_at, end_at):
+    lots = defaultdict(list)
+    realized = {}
+    for fill in aggregate_order_fills(fills):
+        timestamp = parse_time(fill["timestamp"]).astimezone(LOCAL_TZ)
+        symbol = fill["symbol"]
+        qty = as_float(fill["qty"])
+        price = as_float(fill["price"])
+        if fill["side"] == "buy":
+            lots[symbol].append({"qty": qty, "price": price})
+            continue
+
+        remaining = qty
+        cost_basis = 0.0
+        matched_qty = 0.0
+        while remaining > 0 and lots[symbol]:
+            lot = lots[symbol][0]
+            take = min(remaining, lot["qty"])
+            cost_basis += take * lot["price"]
+            matched_qty += take
+            lot["qty"] -= take
+            remaining -= take
+            if lot["qty"] <= 0:
+                lots[symbol].pop(0)
+
+        if not matched_qty or not (start_at <= timestamp < end_at):
+            continue
+
+        key = (symbol, fill.get("order_id"))
+        item = realized.setdefault(key, {"matched_qty": 0.0, "cost_basis": 0.0, "realized_pl": 0.0})
+        item["matched_qty"] += matched_qty
+        item["cost_basis"] += cost_basis
+        item["realized_pl"] += fill["notional"] * (matched_qty / qty) - cost_basis
+
+    for item in realized.values():
+        item["avg_entry_price"] = item["cost_basis"] / item["matched_qty"] if item["matched_qty"] else None
+    return realized
+
+
+def enrich_sold_fills_with_pl(sold, fills, start_at, end_at):
+    realized = realized_pl_by_sell_order(fills, start_at, end_at)
+    enriched = []
+    for item in sold:
+        pl = realized.get((item.get("symbol"), item.get("order_id")))
+        if not pl or not pl.get("matched_qty"):
+            enriched.append(item)
+            continue
+        ratio = as_float(item.get("qty")) / pl["matched_qty"]
+        enriched.append(
+            {
+                **item,
+                "cost_basis": pl["cost_basis"] * ratio,
+                "realized_pl": pl["realized_pl"] * ratio,
+                "avg_entry_price": pl["avg_entry_price"],
+            }
+        )
+    return enriched
+
+
+def merge_fills(*fill_groups):
+    merged = {}
+    for fills in fill_groups:
+        for fill in fills or []:
+            key = (
+                fill.get("id"),
+                fill.get("order_id"),
+                fill.get("symbol"),
+                fill_timestamp(fill),
+                fill.get("qty"),
+                fill.get("price"),
+            )
+            merged[key] = fill
+    return list(merged.values())
 
 
 def summarize_positions(positions):
@@ -241,8 +366,12 @@ def build_report(project_root, watchers_path, report_date, client=None):
         try:
             account = client.account()
             account_summary = portfolio_summary(client, account, reporting_config)
-            fills = client.fills(iso_utc(start_at), iso_utc(end_at))
-            bought, sold = summarize_fills(fills)
+            realized_pl_lookback_days = int(reporting_config.get("realized_pl_lookback_days", 365))
+            fill_start_at = start_at - datetime.timedelta(days=realized_pl_lookback_days)
+            day_fills = client.fills(iso_utc(start_at), iso_utc(end_at))
+            fills = merge_fills(client.fills(iso_utc(fill_start_at), iso_utc(end_at)), day_fills)
+            bought, sold = summarize_fills(day_fills)
+            sold = enrich_sold_fills_with_pl(sold, fills, start_at, end_at)
             positions = summarize_positions(client.positions())
         except Exception as exc:
             account_error = f"{type(exc).__name__}: {exc}"
@@ -304,6 +433,8 @@ def aggregate_fills(fills):
                 "order_id": fill.get("order_id"),
                 "qty": 0.0,
                 "notional": 0.0,
+                "cost_basis": 0.0,
+                "realized_pl": 0.0,
                 "first_time": fill.get("timestamp"),
                 "last_time": fill.get("timestamp"),
                 "fills": 0,
@@ -313,12 +444,15 @@ def aggregate_fills(fills):
         price = as_float(fill.get("price"))
         item["qty"] += qty
         item["notional"] += qty * price
+        item["cost_basis"] += as_float(fill.get("cost_basis"))
+        item["realized_pl"] += as_float(fill.get("realized_pl"))
         item["fills"] += 1
         item["last_time"] = fill.get("timestamp") or item["last_time"]
     summaries = []
     for item in grouped.values():
         avg_price = item["notional"] / item["qty"] if item["qty"] else None
-        summaries.append({**item, "avg_price": avg_price})
+        avg_entry_price = item["cost_basis"] / item["qty"] if item["qty"] and item["cost_basis"] else None
+        summaries.append({**item, "avg_price": avg_price, "avg_entry_price": avg_entry_price})
     return sorted(summaries, key=lambda item: (item.get("symbol") or "", item.get("last_time") or ""))
 
 
@@ -329,6 +463,9 @@ def aggregate_cash_blocks(blocks):
             "count": 0,
             "first_time": None,
             "last_time": None,
+            "last_cash": None,
+            "last_min_cash_balance": None,
+            "last_requested_notional": None,
             "max_requested_notional": 0.0,
             "max_requested_qty": 0.0,
             "best_available_notional": 0.0,
@@ -341,7 +478,11 @@ def aggregate_cash_blocks(blocks):
         item["symbol"] = symbol
         item["count"] += 1
         item["first_time"] = item["first_time"] or block.get("timestamp")
-        item["last_time"] = block.get("timestamp") or item["last_time"]
+        if block.get("timestamp"):
+            item["last_time"] = block.get("timestamp")
+            item["last_cash"] = as_float(block.get("cash"))
+            item["last_min_cash_balance"] = as_float(block.get("min_cash_balance"))
+            item["last_requested_notional"] = as_float(block.get("target_notional"))
         item["max_requested_notional"] = max(
             item["max_requested_notional"],
             as_float(block.get("target_notional")),
@@ -362,6 +503,11 @@ def aggregate_cash_blocks(blocks):
         summaries.append(
             {
                 **item,
+                "last_cash_shortfall": max(
+                    0.0,
+                    as_float(item["last_requested_notional"])
+                    - max(0.0, as_float(item["last_cash"]) - as_float(item["last_min_cash_balance"])),
+                ),
                 "modes": ", ".join(sorted(item["modes"])) or "n/a",
             }
         )
@@ -377,23 +523,27 @@ def markdown_table(headers, rows):
     return lines
 
 
-def render_fill_table(items, empty_text):
+def render_fill_table(items, empty_text, include_realized_pl=False):
     summaries = aggregate_fills(items)
     if not summaries:
         return [empty_text]
     rows = []
     for item in summaries:
-        rows.append(
-            [
-                item.get("symbol") or "n/a",
-                number(item.get("qty")),
-                money(item.get("avg_price")),
-                money(item.get("notional")),
-                item.get("fills"),
-                short_time(item.get("last_time")),
-            ]
-        )
-    return markdown_table(["Symbol", "Qty", "Avg Price", "Notional", "Fills", "Last Fill"], rows)
+        row = [
+            item.get("symbol") or "n/a",
+            number(item.get("qty")),
+            money(item.get("avg_price")),
+            money(item.get("notional")),
+        ]
+        if include_realized_pl:
+            row.extend([money(item.get("avg_entry_price")), signed_money(item.get("realized_pl"))])
+        row.extend([item.get("fills"), short_time(item.get("last_time"))])
+        rows.append(row)
+    headers = ["Symbol", "Qty", "Avg Price", "Notional"]
+    if include_realized_pl:
+        headers.extend(["Avg Entry", "Realized P/L"])
+    headers.extend(["Fills", "Last Fill"])
+    return markdown_table(headers, rows)
 
 
 def render_bot_order_table(items):
@@ -426,6 +576,9 @@ def render_cash_block_table(items):
                 money(item["max_requested_notional"]),
                 number(item["max_requested_qty"]),
                 money(item["best_available_notional"]),
+                money(item["last_cash"]),
+                money(item["last_min_cash_balance"]),
+                money(item["last_cash_shortfall"]),
                 short_time(item["first_time"]),
                 short_time(item["last_time"]),
             ]
@@ -437,6 +590,9 @@ def render_cash_block_table(items):
             "Largest Target",
             "Max Qty",
             "Best Cash Above Reserve",
+            "Cash At Last Block",
+            "Reserve At Last Block",
+            "Last Shortfall",
             "First",
             "Last",
         ],
@@ -543,7 +699,7 @@ def render_markdown(report):
     )
     lines.extend(render_fill_table(bought, "No Alpaca buy fills found."))
     lines.extend(["", "## Sold"])
-    lines.extend(render_fill_table(sold, "No Alpaca sell fills found."))
+    lines.extend(render_fill_table(sold, "No Alpaca sell fills found.", include_realized_pl=True))
     lines.extend(["", "## Bot Buy Orders Submitted"])
     lines.extend(render_bot_order_table(bot_buys))
     lines.extend(["", "## Buy Signals Blocked By Cash"])
@@ -584,6 +740,11 @@ def main():
     parser.add_argument("--date", help="Report date in YYYY-MM-DD. Defaults to last closed trading day.")
     parser.add_argument("--output-dir", default=DEFAULT_REPORT_DIR)
     parser.add_argument("--offline", action="store_true", help="Skip Alpaca account and fill lookups.")
+    parser.add_argument(
+        "--skip-non-trading-day",
+        action="store_true",
+        help="Exit without writing a report when the report date is not an Alpaca market day.",
+    )
     args = parser.parse_args()
 
     project_root = Path(args.config).resolve().parent.parent
@@ -596,6 +757,10 @@ def main():
     if not args.offline:
         load_env(project_root / ".env")
         client = AlpacaClient()
+
+    if args.skip_non_trading_day and not is_market_day(client, report_date):
+        print(f"Skipping daily report: {report_date.isoformat()} is not a market day.")
+        return 0
 
     report = build_report(
         project_root,
