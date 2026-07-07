@@ -15,6 +15,48 @@ DEFAULT_CONFIG_PATH = "traderbot/core_strategy_engine/strategies/configs/strateg
 DEFAULT_STATE_PATH = "runtime/state/strategy_state.json"
 MARKET_SYMBOL = "QQQ"
 DEFAULT_MIN_CASH_BALANCE_PERCENT = 20
+RISK_PROFILE_DEFAULTS = {
+    "index_etf": {
+        "initial_stop_mode": "atr_or_percent",
+        "initial_stop_atr_multiple": 2.5,
+        "initial_stop_min_percent": 4,
+        "initial_stop_max_percent": 20,
+        "ladder_mode": "percent",
+        "ladder_drop_steps_percent": [4],
+        "max_ladder_count": 1,
+        "ladder_requires_market_ok": True,
+        "trail_tiers": [
+            {"gain_percent": 5, "trail_stop_below_current_percent": 2.5},
+            {"gain_percent": 10, "trail_stop_below_current_percent": 2.0},
+            {"gain_percent": 15, "trail_stop_below_current_percent": 1.5},
+        ],
+    },
+    "large_cap": {
+        "initial_stop_mode": "percent",
+        "max_ladder_count": 1,
+    },
+    "high_vol_growth": {
+        "adaptive_ladder_enabled": True,
+        "initial_stop_mode": "percent",
+        "max_ladder_count": 2,
+        "ladder_size_fraction": 0.5,
+        "min_ladder_quantity": 1,
+        "volatility_ladder_scaling": True,
+        "market_ladder_scaling": True,
+        "max_ladder_notional_percent": 5,
+        "max_ladder_position_multiple": 1.5,
+    },
+    "speculative": {
+        "initial_stop_mode": "percent",
+        "ladder_drop_steps_percent": [],
+        "max_ladder_count": 0,
+    },
+}
+
+
+def risk_setting(config, key, default=None):
+    profile = RISK_PROFILE_DEFAULTS.get(config.get("risk_profile"), {})
+    return config.get(key, profile.get(key, default))
 
 
 def load_env(path=".env"):
@@ -236,9 +278,10 @@ def cash_protected_quantity(client, config, desired_qty, estimated_price):
 
     account = client.account()
     cash = float(account.get("cash", 0))
+    buying_power = float(account.get("buying_power", cash))
     equity = float(account.get("equity", 0))
     min_cash_balance = equity * reserve_percent / 100
-    available_notional = max(0, cash - min_cash_balance)
+    available_notional = max(0, max(cash, buying_power) - min_cash_balance)
     max_qty = math.floor(available_notional / estimated_price)
     qty = max(0, min(desired_qty, max_qty))
     estimated_notional = qty * estimated_price
@@ -246,6 +289,7 @@ def cash_protected_quantity(client, config, desired_qty, estimated_price):
         "cash_reserve_enforced": True,
         "min_cash_balance_percent": reserve_percent,
         "cash": cash,
+        "buying_power": buying_power,
         "equity": equity,
         "min_cash_balance": min_cash_balance,
         "available_notional": available_notional,
@@ -254,6 +298,270 @@ def cash_protected_quantity(client, config, desired_qty, estimated_price):
         "adjusted_qty": qty,
         "estimated_order_notional": estimated_notional,
         "estimated_cash_after_order": cash - estimated_notional,
+    }
+
+
+def cash_available_share_count(client, config, estimated_price):
+    account = client.account()
+    cash = float(account.get("cash", 0))
+    buying_power = float(account.get("buying_power", cash))
+    equity = float(account.get("equity", 0))
+    min_cash_balance = equity * cash_reserve_percent(config) / 100
+    available_notional = max(0, max(cash, buying_power) - min_cash_balance)
+    return math.floor(available_notional / estimated_price), {
+        "cash": cash,
+        "buying_power": buying_power,
+        "equity": equity,
+        "min_cash_balance": min_cash_balance,
+        "available_notional": available_notional,
+        "estimated_price": estimated_price,
+    }
+
+
+def max_symbol_quantity_from_caps(client, config, current_qty, estimated_price):
+    max_qty = None
+    max_total_qty = risk_setting(config, "max_total_position_qty")
+    if max_total_qty not in (None, ""):
+        max_qty = int(float(max_total_qty))
+
+    max_notional_percent = risk_setting(config, "max_symbol_notional_percent")
+    if max_notional_percent not in (None, "", 0):
+        account = client.account()
+        equity = float(account.get("equity", 0))
+        notional_cap = equity * float(max_notional_percent) / 100
+        cap_qty = math.floor(notional_cap / estimated_price)
+        max_qty = cap_qty if max_qty is None else min(max_qty, cap_qty)
+
+    if max_qty is None:
+        return None
+    return max(0, max_qty - max(0, int(float(current_qty or 0))))
+
+
+def apply_order_risk_caps(client, config, desired_qty, estimated_price, current_qty=0):
+    capped_qty = int(desired_qty)
+    cap_remaining_qty = max_symbol_quantity_from_caps(
+        client, config, current_qty, estimated_price
+    )
+    if cap_remaining_qty is not None:
+        capped_qty = min(capped_qty, cap_remaining_qty)
+    return max(0, capped_qty), {
+        "risk_caps_enforced": cap_remaining_qty is not None,
+        "cap_remaining_qty": cap_remaining_qty,
+        "requested_qty_before_caps": desired_qty,
+        "adjusted_qty_after_caps": max(0, capped_qty),
+        "current_position_qty": current_qty,
+    }
+
+
+def apply_ladder_risk_caps(client, config, state, desired_qty, estimated_price, current_qty=0):
+    capped_qty = int(desired_qty)
+    base_qty = int(float(state.get("base_position_qty") or config.get("entry_quantity", 0) or 0))
+    ladder_qty_so_far = int(float(state.get("ladder_filled_qty", 0) or 0))
+    ladder_notional_so_far = float(state.get("ladder_filled_notional", 0) or 0)
+
+    max_ladder_notional = None
+    max_ladder_notional_percent = risk_setting(config, "max_ladder_notional_percent")
+    if max_ladder_notional_percent not in (None, "", 0):
+        account = client.account()
+        equity = float(account.get("equity", 0))
+        max_ladder_notional = equity * float(max_ladder_notional_percent) / 100
+        remaining_notional = max(0, max_ladder_notional - ladder_notional_so_far)
+        capped_qty = min(capped_qty, math.floor(remaining_notional / estimated_price))
+
+    max_position_qty = None
+    max_ladder_position_multiple = risk_setting(config, "max_ladder_position_multiple")
+    if max_ladder_position_multiple not in (None, "", 0) and base_qty > 0:
+        max_position_qty = math.floor(base_qty * float(max_ladder_position_multiple))
+        capped_qty = min(capped_qty, max(0, max_position_qty - int(float(current_qty or 0))))
+
+    return max(0, capped_qty), {
+        "ladder_caps_enforced": max_ladder_notional is not None or max_position_qty is not None,
+        "base_position_qty": base_qty,
+        "current_position_qty": current_qty,
+        "ladder_qty_so_far": ladder_qty_so_far,
+        "ladder_notional_so_far": ladder_notional_so_far,
+        "max_ladder_notional": max_ladder_notional,
+        "max_ladder_position_qty": max_position_qty,
+        "requested_qty_before_ladder_caps": desired_qty,
+        "adjusted_qty_after_ladder_caps": max(0, capped_qty),
+    }
+
+
+def risk_context_needed(config):
+    return (
+        risk_setting(config, "initial_stop_mode", "percent") != "percent"
+        or risk_setting(config, "ladder_mode", "percent") == "atr"
+        or bool(risk_setting(config, "ladder_requires_market_ok", False))
+    )
+
+
+def risk_context(client, config):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    lookback_days = config.get("dynamic_lookback_days", 7)
+    start = iso_utc(now - datetime.timedelta(days=lookback_days))
+    end = iso_utc(now)
+    timeframe = config.get("dynamic_timeframe", "5Min")
+    bars = calculate_indicators(client.stock_bars(config["symbol"], start, end, timeframe))
+    market_bars = calculate_indicators(client.stock_bars(MARKET_SYMBOL, start, end, timeframe))
+    return {
+        "bars": bars,
+        "market_bars": market_bars,
+        "latest_bar": bars[-1] if bars else None,
+        "market_ok": market_ok_at(market_bars, bars[-1]["t"]) if bars else True,
+    }
+
+
+def initial_floor_price(config, fill_price, context=None):
+    percent_floor = fill_price * (1 - config["initial_stop_loss_percent"] / 100)
+    mode = risk_setting(config, "initial_stop_mode", "percent")
+    if mode == "percent":
+        return percent_floor
+
+    latest_bar = (context or {}).get("latest_bar")
+    atr = float((latest_bar or {}).get("atr14") or 0)
+    if atr <= 0:
+        return percent_floor
+
+    atr_floor = fill_price - atr * float(risk_setting(config, "initial_stop_atr_multiple", 2.5))
+    min_percent = float(risk_setting(config, "initial_stop_min_percent", 0) or 0)
+    max_percent = float(risk_setting(config, "initial_stop_max_percent", config["initial_stop_loss_percent"]) or 0)
+    floors = [atr_floor]
+    if min_percent > 0:
+        floors.append(fill_price * (1 - min_percent / 100))
+    floor_price = min(floors)
+    if max_percent > 0:
+        floor_price = max(floor_price, fill_price * (1 - max_percent / 100))
+    return floor_price
+
+
+def trail_below_current_percent(config, highest_trail_rung):
+    tiers = risk_setting(config, "trail_tiers", []) or []
+    if not tiers:
+        return config["trail_stop_below_current_percent"]
+
+    gain_percent = highest_trail_rung * config["trail_trigger_step_percent"]
+    selected = None
+    for tier in sorted(tiers, key=lambda item: float(item.get("gain_percent", 0))):
+        if gain_percent >= float(tier.get("gain_percent", 0)):
+            selected = tier
+    if not selected:
+        return config["trail_stop_below_current_percent"]
+    return float(
+        selected.get(
+            "trail_stop_below_current_percent",
+            selected.get("trail_below_current_percent", config["trail_stop_below_current_percent"]),
+        )
+    )
+
+
+def ladder_steps(config, fill_price, context=None):
+    mode = risk_setting(config, "ladder_mode", "percent")
+    if mode != "atr":
+        return [
+            {
+                "key": str(drop_step),
+                "drop_step_percent": drop_step,
+                "trigger_price": fill_price * (1 - float(drop_step) / 100),
+            }
+            for drop_step in risk_setting(config, "ladder_drop_steps_percent", []) or []
+        ]
+
+    latest_bar = (context or {}).get("latest_bar")
+    atr = float((latest_bar or {}).get("atr14") or 0)
+    if atr <= 0:
+        return []
+    return [
+        {
+            "key": f"atr:{atr_step}",
+            "atr_step": atr_step,
+            "trigger_price": fill_price - atr * float(atr_step),
+        }
+        for atr_step in risk_setting(config, "ladder_atr_steps", []) or []
+    ]
+
+
+def atr_percent_from_context(context):
+    latest_bar = (context or {}).get("latest_bar") or {}
+    close = float(latest_bar.get("c") or 0)
+    atr = float(latest_bar.get("atr14") or 0)
+    return atr / close if close > 0 and atr > 0 else 0.0
+
+
+def volatility_ladder_multiplier(atr_percent):
+    if atr_percent > 0.06:
+        return 0.25
+    if atr_percent > 0.04:
+        return 0.50
+    if atr_percent > 0.025:
+        return 0.75
+    return 1.0
+
+
+def adaptive_ladder_limit(config, context=None):
+    base_limit = int(float(risk_setting(config, "max_ladder_count", 999999) or 0))
+    if not risk_setting(config, "adaptive_ladder_enabled", False):
+        return base_limit, {
+            "adaptive_ladder_enabled": False,
+            "max_ladder_count": base_limit,
+        }
+
+    atr_percent = atr_percent_from_context(context)
+    adjusted_limit = base_limit
+    if risk_setting(config, "volatility_ladder_scaling", False):
+        if atr_percent > 0.06:
+            adjusted_limit = 0
+        elif atr_percent > 0.04:
+            adjusted_limit = min(adjusted_limit, 1)
+
+    if risk_setting(config, "market_ladder_scaling", False) and not (context or {}).get("market_ok", True):
+        adjusted_limit = 0
+
+    return adjusted_limit, {
+        "adaptive_ladder_enabled": True,
+        "base_max_ladder_count": base_limit,
+        "adjusted_max_ladder_count": adjusted_limit,
+        "atr_percent": atr_percent,
+        "market_ok": (context or {}).get("market_ok", True),
+    }
+
+
+def adaptive_ladder_quantity(config, requested_qty, base_qty, context=None):
+    requested_qty = int(requested_qty)
+    if not risk_setting(config, "adaptive_ladder_enabled", False):
+        return requested_qty, {
+            "adaptive_ladder_enabled": False,
+            "requested_qty": requested_qty,
+            "adjusted_qty": requested_qty,
+        }
+
+    fraction = float(risk_setting(config, "ladder_size_fraction", 0.5) or 0)
+    adjusted_qty = math.floor(max(0, int(float(base_qty or 0))) * fraction)
+    adjusted_qty = min(requested_qty, adjusted_qty)
+    atr_percent = atr_percent_from_context(context)
+    volatility_multiplier = 1.0
+    if risk_setting(config, "volatility_ladder_scaling", False):
+        volatility_multiplier = volatility_ladder_multiplier(atr_percent)
+        adjusted_qty = math.floor(adjusted_qty * volatility_multiplier)
+
+    market_multiplier = 1.0
+    if risk_setting(config, "market_ladder_scaling", False) and not (context or {}).get("market_ok", True):
+        market_multiplier = 0.0
+        adjusted_qty = 0
+
+    min_qty = int(float(risk_setting(config, "min_ladder_quantity", 1) or 0))
+    if 0 < adjusted_qty < min_qty:
+        adjusted_qty = 0
+
+    return max(0, adjusted_qty), {
+        "adaptive_ladder_enabled": True,
+        "requested_qty": requested_qty,
+        "base_position_qty": int(float(base_qty or 0)),
+        "ladder_size_fraction": fraction,
+        "volatility_multiplier": volatility_multiplier,
+        "market_multiplier": market_multiplier,
+        "atr_percent": atr_percent,
+        "market_ok": (context or {}).get("market_ok", True),
+        "adjusted_qty": max(0, adjusted_qty),
     }
 
 
@@ -557,6 +865,9 @@ def reset_managed_position_state(state):
         "filled_ladder_steps",
         "floor_price",
         "highest_trail_rung",
+        "base_position_qty",
+        "ladder_filled_qty",
+        "ladder_filled_notional",
         "ladder_order_ids",
     ):
         state.pop(key, None)
@@ -596,10 +907,13 @@ def record_exit_from_order(state, order):
         state["last_exit_price"] = float(order["filled_avg_price"])
     if order.get("filled_at"):
         state["last_exit_at"] = order.get("filled_at")
+    if order.get("filled_qty") or order.get("qty"):
+        state["last_exit_qty"] = int(float(order.get("filled_qty") or order.get("qty")))
     return {
         "last_exit_order_id": state.get("last_exit_order_id"),
         "last_exit_price": state.get("last_exit_price"),
         "last_exit_at": state.get("last_exit_at"),
+        "last_exit_qty": state.get("last_exit_qty"),
     }
 
 
@@ -620,17 +934,15 @@ def reconcile_flat_position_state(client, symbol, state):
                 raise
 
     if order_is_open(active_stop_order):
-        return {
-            "position_qty": 0,
-            "cleared_stale_state": False,
-            "waiting_for_stop_order_id": active_stop_id,
-            "stop_order_status": active_stop_order.get("status"),
-        }
+        client.cancel_order(active_stop_id)
+        canceled_stop_order_ids = [active_stop_id]
+    else:
+        canceled_stop_order_ids = []
+        exit_details = record_exit_from_order(state, active_stop_order)
 
-    exit_details = record_exit_from_order(state, active_stop_order)
-
-    canceled_stop_order_ids = []
     for order in client.open_stop_orders(symbol):
+        if order["id"] in canceled_stop_order_ids:
+            continue
         client.cancel_order(order["id"])
         canceled_stop_order_ids.append(order["id"])
 
@@ -656,10 +968,24 @@ def reconcile_flat_position_state(client, symbol, state):
 
 def update_stop_order(client, symbol, qty, stop_price, state):
     rounded_stop = dollars(stop_price)
-    if state.get("active_stop_price") == rounded_stop and state.get("active_stop_qty") == qty:
+    active_stop_id = state.get("active_stop_order_id")
+    open_stop_orders = client.open_stop_orders(symbol)
+    active_open_stop = next(
+        (order for order in open_stop_orders if order.get("id") == active_stop_id),
+        None,
+    )
+    if (
+        active_open_stop
+        and state.get("active_stop_price") == rounded_stop
+        and state.get("active_stop_qty") == qty
+        and int(float(active_open_stop.get("qty") or 0)) == qty
+        and dollars(float(active_open_stop.get("stop_price") or 0)) == rounded_stop
+    ):
+        for order in open_stop_orders:
+            if order.get("id") != active_stop_id:
+                client.cancel_order(order["id"])
         return None
 
-    active_stop_id = state.get("active_stop_order_id")
     if active_stop_id:
         try:
             order = client.replace_order(
@@ -673,12 +999,15 @@ def update_stop_order(client, symbol, qty, stop_price, state):
             state["active_stop_order_id"] = order["id"]
             state["active_stop_price"] = rounded_stop
             state["active_stop_qty"] = qty
+            for open_order in open_stop_orders:
+                if open_order.get("id") != active_stop_id:
+                    client.cancel_order(open_order["id"])
             return order
         except urllib.error.HTTPError as exc:
             if exc.code not in (404, 422):
                 raise
 
-    for order in client.open_stop_orders(symbol):
+    for order in open_stop_orders:
         client.cancel_order(order["id"])
 
     order = client.submit_order(
@@ -706,7 +1035,32 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
             and plan.get("status") == "active_signal"
             and desired_limit
         ):
+            current_qty = int(float(order.get("qty") or 0))
             desired_qty = dynamic_entry_quantity(config, plan)
+            daily_limit = dynamic_entry_share_limit(
+                client,
+                config,
+                state,
+                desired_limit,
+                desired_qty,
+            )
+            desired_qty = min(desired_qty, daily_limit["remaining_qty"] + current_qty)
+            desired_qty, risk_caps = apply_order_risk_caps(
+                client, config, desired_qty, float(desired_limit), current_qty=0
+            )
+            if desired_qty <= 0:
+                client.cancel_order(order_id)
+                state.pop("reentry_order_id", None)
+                state.pop("current_entry_order_id", None)
+                return {
+                    "status": "dynamic_entry_order_canceled_risk_cap",
+                    "old_order_id": order_id,
+                    "target_notional": dynamic_entry_notional(config, plan),
+                    "mode": plan.get("mode"),
+                    "risk_caps": risk_caps,
+                    "daily_limit": daily_limit,
+                    "dynamic_plan": serializable_plan(plan),
+                }
             adjusted_qty, sizing = cash_protected_quantity(
                 client, config, desired_qty, float(desired_limit)
             )
@@ -720,11 +1074,12 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                     "target_notional": dynamic_entry_notional(config, plan),
                     "mode": plan.get("mode"),
                     "sizing": sizing,
+                    "risk_caps": risk_caps,
+                    "daily_limit": daily_limit,
                     "dynamic_plan": serializable_plan(plan),
                 }
             desired_qty = adjusted_qty
             current_limit = float(order.get("limit_price") or 0)
-            current_qty = int(float(order.get("qty") or 0))
             min_change = config.get("dynamic_replace_min_change_percent", 0.25) / 100
             if (
                 current_qty != desired_qty
@@ -750,6 +1105,8 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                     "target_notional": dynamic_entry_notional(config, plan),
                     "mode": plan.get("mode"),
                     "sizing": sizing,
+                    "risk_caps": risk_caps,
+                    "daily_limit": daily_limit,
                 }
         return {
             "status": "waiting_for_reentry_fill",
@@ -779,9 +1136,73 @@ def build_exit_trade_from_state(state):
     }
 
 
+def dynamic_entry_reference_qty(client, config, state, fallback_qty):
+    position = client.position(config["symbol"])
+    position_qty = position_quantity(position)
+    for value in (
+        position_qty,
+        state.get("active_stop_qty"),
+        state.get("last_exit_qty"),
+        fallback_qty,
+    ):
+        qty = int(float(value or 0))
+        if qty > 0:
+            return qty
+    return 0
+
+
+def dynamic_entry_share_limit(client, config, state, limit_price, fallback_qty):
+    affordable_qty, cash_sizing = cash_available_share_count(
+        client,
+        config,
+        float(limit_price),
+    )
+    reference_qty = dynamic_entry_reference_qty(client, config, state, fallback_qty)
+    daily_share_limit = min(reference_qty, affordable_qty)
+    shares_today = int(float(state.get("reentry_shares_today", 0) or 0))
+    remaining_qty = max(0, daily_share_limit - shares_today)
+    return {
+        "reference_qty": reference_qty,
+        "affordable_qty": affordable_qty,
+        "daily_share_limit": daily_share_limit,
+        "shares_today": shares_today,
+        "remaining_qty": remaining_qty,
+        **cash_sizing,
+    }
+
+
 def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     symbol = config["symbol"]
     requested_qty = dynamic_entry_quantity(config, plan)
+    daily_limit = dynamic_entry_share_limit(
+        client,
+        config,
+        state,
+        plan["limit_price"],
+        requested_qty,
+    )
+    requested_qty = min(requested_qty, daily_limit["remaining_qty"])
+    if requested_qty <= 0:
+        return {
+            "status": "dynamic_entry_limit_reached",
+            "reason": f"{reason_prefix}_{plan['mode']}",
+            "reentry_shares_today": state.get("reentry_shares_today", 0),
+            "daily_limit": daily_limit,
+            "dynamic_plan": serializable_plan(plan),
+        }
+
+    requested_qty, risk_caps = apply_order_risk_caps(
+        client, config, requested_qty, float(plan["limit_price"]), current_qty=0
+    )
+    if requested_qty <= 0:
+        return {
+            "status": "dynamic_entry_risk_cap_blocked",
+            "reason": f"{reason_prefix}_{plan['mode']}",
+            "risk_caps": risk_caps,
+            "daily_limit": daily_limit,
+            "dynamic_plan": serializable_plan(plan),
+        }
+
     qty, sizing = cash_protected_quantity(
         client, config, requested_qty, float(plan["limit_price"])
     )
@@ -792,6 +1213,7 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
             "reason": f"{reason_prefix}_{plan['mode']}",
             "target_notional": target_notional,
             "sizing": sizing,
+            "risk_caps": risk_caps,
             "dynamic_plan": serializable_plan(plan),
         }
 
@@ -809,6 +1231,7 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     state["reentry_order_id"] = order["id"]
     state["reentry_reason"] = f"{reason_prefix}_{plan['mode']}"
     state["reentries_today"] = state.get("reentries_today", 0) + 1
+    state["reentry_shares_today"] = state.get("reentry_shares_today", 0) + qty
     reset_managed_position_state(state)
     return {
         "status": "dynamic_reentry_order_submitted",
@@ -819,6 +1242,8 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
         "market_filter_ignored": plan.get("market_filter_ignored", False),
         "reentry_order_id": order["id"],
         "sizing": sizing,
+        "risk_caps": risk_caps,
+        "daily_limit": daily_limit,
         "dynamic_plan": serializable_plan(plan),
     }
 
@@ -828,12 +1253,8 @@ def reset_entry_day_if_needed(state):
     if state.get("reentry_day") != today_key:
         state["reentry_day"] = today_key
         state["reentries_today"] = 0
+        state["reentry_shares_today"] = 0
         state["reentry_pullback_seen"] = False
-
-
-def dynamic_entry_limit_reached(config, state):
-    max_per_day = config.get("reentry_max_per_day", 1)
-    return state.get("reentries_today", 0) >= max_per_day
 
 
 def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
@@ -853,13 +1274,6 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     if plan.get("status") != "active_signal":
         return {
             "status": "dynamic_entry_waiting_for_signal",
-            "dynamic_plan": serializable_plan(plan),
-        }
-
-    if dynamic_entry_limit_reached(config, state):
-        return {
-            "status": "dynamic_entry_limit_reached",
-            "reentries_today": state.get("reentries_today", 0),
             "dynamic_plan": serializable_plan(plan),
         }
 
@@ -926,12 +1340,6 @@ def handle_reentry(client, config, state):
             "cooldown_seconds": cooldown_seconds,
         }
 
-    if dynamic_entry_limit_reached(config, state):
-        return {
-            "status": "reentry_limit_reached",
-            "reentries_today": state.get("reentries_today", 0),
-        }
-
     if config.get("dynamic_reentry_enabled"):
         return handle_dynamic_flat_entry(
             client,
@@ -988,6 +1396,34 @@ def handle_reentry(client, config, state):
         }
 
     requested_qty = int(config.get("reentry_quantity", config["entry_quantity"]))
+    daily_limit = dynamic_entry_share_limit(
+        client,
+        config,
+        state,
+        limit_price,
+        requested_qty,
+    )
+    requested_qty = min(requested_qty, daily_limit["remaining_qty"])
+    if requested_qty <= 0:
+        return {
+            "status": "reentry_limit_reached",
+            "reentry_shares_today": state.get("reentry_shares_today", 0),
+            "daily_limit": daily_limit,
+        }
+
+    requested_qty, risk_caps = apply_order_risk_caps(
+        client, config, requested_qty, float(limit_price), current_qty=0
+    )
+    if requested_qty <= 0:
+        return {
+            "status": "reentry_risk_cap_blocked",
+            "reason": reason,
+            "current_price": current_price,
+            "limit_price": limit_price,
+            "risk_caps": risk_caps,
+            "daily_limit": daily_limit,
+        }
+
     qty, sizing = cash_protected_quantity(
         client, config, requested_qty, float(limit_price)
     )
@@ -998,6 +1434,7 @@ def handle_reentry(client, config, state):
             "current_price": current_price,
             "limit_price": limit_price,
             "sizing": sizing,
+            "risk_caps": risk_caps,
         }
 
     order = client.submit_order(
@@ -1015,6 +1452,7 @@ def handle_reentry(client, config, state):
     state["reentry_order_id"] = order["id"]
     state["reentry_reason"] = reason
     state["reentries_today"] = state.get("reentries_today", 0) + 1
+    state["reentry_shares_today"] = state.get("reentry_shares_today", 0) + qty
     reset_managed_position_state(state)
 
     return {
@@ -1025,6 +1463,8 @@ def handle_reentry(client, config, state):
         "qty": order.get("qty"),
         "reentry_order_id": order["id"],
         "sizing": sizing,
+        "risk_caps": risk_caps,
+        "daily_limit": daily_limit,
     }
 
 
@@ -1062,6 +1502,9 @@ def run_once(client, config, state, clock=None):
             return {"status": "no_entry_order_configured", "symbol": symbol}
         state.setdefault("entry_fill_price", float(position["avg_entry_price"]))
         state.setdefault("highest_trail_rung", 0)
+        state.setdefault("base_position_qty", int(config.get("entry_quantity", qty)))
+        state.setdefault("ladder_filled_qty", 0)
+        state.setdefault("ladder_filled_notional", 0.0)
         state.setdefault("filled_ladder_steps", [])
         state.setdefault("ladder_order_ids", {})
 
@@ -1094,6 +1537,9 @@ def run_once(client, config, state, clock=None):
 
     state.setdefault("entry_fill_price", fill_price)
     state.setdefault("highest_trail_rung", 0)
+    state.setdefault("base_position_qty", int(config.get("entry_quantity", qty)))
+    state.setdefault("ladder_filled_qty", 0)
+    state.setdefault("ladder_filled_notional", 0.0)
     state.setdefault("filled_ladder_steps", [])
     state.setdefault("ladder_order_ids", {})
 
@@ -1109,7 +1555,8 @@ def run_once(client, config, state, clock=None):
         return handle_reentry(client, config, state)
 
     current_price = client.latest_trade_price(symbol)
-    base_floor = fill_price * (1 - config["initial_stop_loss_percent"] / 100)
+    context = risk_context(client, config) if risk_context_needed(config) else None
+    base_floor = initial_floor_price(config, fill_price, context)
     trail_step = config["trail_trigger_step_percent"] / 100
     current_rung = int((current_price / fill_price - 1) / trail_step)
     current_rung = max(0, current_rung)
@@ -1118,8 +1565,9 @@ def run_once(client, config, state, clock=None):
         state["highest_trail_rung"] = current_rung
 
     if state["highest_trail_rung"] > 0:
+        trail_below = trail_below_current_percent(config, state["highest_trail_rung"])
         candidate_floor = current_price * (
-            1 - config["trail_stop_below_current_percent"] / 100
+            1 - trail_below / 100
         )
     else:
         candidate_floor = base_floor
@@ -1132,22 +1580,102 @@ def run_once(client, config, state, clock=None):
 
     ladder_orders = []
     skipped_ladder_orders = []
-    for drop_step in config["ladder_drop_steps_percent"]:
-        if drop_step in state["filled_ladder_steps"]:
+    max_ladder_count, ladder_limit_detail = adaptive_ladder_limit(config, context)
+    for ladder_step in ladder_steps(config, fill_price, context):
+        step_key = ladder_step["key"]
+        legacy_step = ladder_step.get("drop_step_percent")
+        if (
+            step_key in state["filled_ladder_steps"]
+            or legacy_step in state["filled_ladder_steps"]
+            or len(state["filled_ladder_steps"]) >= max_ladder_count
+        ):
+            if len(state["filled_ladder_steps"]) >= max_ladder_count:
+                skipped_ladder_orders.append(
+                    {
+                        **ladder_step,
+                        "status": "max_ladder_count_blocked",
+                        "ladder_limit": ladder_limit_detail,
+                    }
+                )
             continue
 
-        trigger_price = fill_price * (1 - drop_step / 100)
+        trigger_price = ladder_step["trigger_price"]
         if current_price <= trigger_price:
+            if (
+                risk_setting(config, "ladder_requires_market_ok", False)
+                and context
+                and not context.get("market_ok", True)
+            ):
+                skipped_ladder_orders.append(
+                    {
+                        **ladder_step,
+                        "status": "market_regime_blocked",
+                    }
+                )
+                continue
+
             requested_qty = int(config["ladder_buy_quantity"])
+            requested_qty, adaptive_qty = adaptive_ladder_quantity(
+                config,
+                requested_qty,
+                state.get("base_position_qty", config.get("entry_quantity", qty)),
+                context,
+            )
+            if requested_qty <= 0:
+                skipped_ladder_orders.append(
+                    {
+                        **ladder_step,
+                        "status": "adaptive_ladder_size_blocked",
+                        "adaptive_ladder": adaptive_qty,
+                        "ladder_limit": ladder_limit_detail,
+                    }
+                )
+                continue
+
+            requested_qty, ladder_caps = apply_ladder_risk_caps(
+                client, config, state, requested_qty, current_price, current_qty=qty
+            )
+            if requested_qty <= 0:
+                skipped_ladder_orders.append(
+                    {
+                        **ladder_step,
+                        "status": "ladder_risk_cap_blocked",
+                        "adaptive_ladder": adaptive_qty,
+                        "ladder_limit": ladder_limit_detail,
+                        "ladder_caps": ladder_caps,
+                    }
+                )
+                continue
+
+            requested_qty, risk_caps = apply_order_risk_caps(
+                client, config, requested_qty, current_price, current_qty=qty
+            )
+            if requested_qty <= 0:
+                skipped_ladder_orders.append(
+                    {
+                        **ladder_step,
+                        "status": "risk_cap_blocked",
+                        "adaptive_ladder": adaptive_qty,
+                        "ladder_limit": ladder_limit_detail,
+                        "ladder_caps": ladder_caps,
+                        "risk_caps": risk_caps,
+                    }
+                )
+                continue
+
             ladder_qty, sizing = cash_protected_quantity(
                 client, config, requested_qty, current_price
             )
             if ladder_qty <= 0:
                 skipped_ladder_orders.append(
                     {
-                        "drop_step_percent": drop_step,
+                        **ladder_step,
                         "status": "cash_reserve_blocked",
                         "sizing": sizing,
+                        "adaptive_ladder": adaptive_qty,
+                        "ladder_limit": ladder_limit_detail,
+                        "ladder_caps": ladder_caps,
+                        "risk_caps": risk_caps,
                     }
                 )
                 continue
@@ -1161,9 +1689,20 @@ def run_once(client, config, state, clock=None):
                     "time_in_force": "day",
                 }
             )
-            state["filled_ladder_steps"].append(drop_step)
-            state["ladder_order_ids"][str(drop_step)] = order["id"]
-            ladder_orders.append({"order": order, "sizing": sizing})
+            state["filled_ladder_steps"].append(step_key)
+            state["ladder_order_ids"][step_key] = order["id"]
+            state["ladder_filled_qty"] = state.get("ladder_filled_qty", 0) + ladder_qty
+            state["ladder_filled_notional"] = state.get("ladder_filled_notional", 0.0) + ladder_qty * current_price
+            ladder_orders.append(
+                {
+                    "order": order,
+                    "sizing": sizing,
+                    "adaptive_ladder": adaptive_qty,
+                    "ladder_limit": ladder_limit_detail,
+                    "ladder_caps": ladder_caps,
+                    "risk_caps": risk_caps,
+                }
+            )
 
     return {
         "status": "managed",
@@ -1175,6 +1714,10 @@ def run_once(client, config, state, clock=None):
         "updated_stop_order": stop_order["id"] if stop_order else None,
         "new_ladder_orders": [item["order"]["id"] for item in ladder_orders],
         "ladder_sizing": [item["sizing"] for item in ladder_orders],
+        "adaptive_ladder": [item["adaptive_ladder"] for item in ladder_orders],
+        "ladder_limit": ladder_limit_detail,
+        "ladder_caps": [item["ladder_caps"] for item in ladder_orders],
+        "ladder_risk_caps": [item["risk_caps"] for item in ladder_orders],
         "skipped_ladder_orders": skipped_ladder_orders,
     }
 

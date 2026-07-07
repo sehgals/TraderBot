@@ -3,6 +3,7 @@ import datetime
 import json
 import math
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,9 +47,18 @@ class AlpacaData:
         request = urllib.request.Request(
             f"{base_url}{path}", headers=self.headers, method="GET"
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body) if body else None
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    body = response.read().decode("utf-8")
+                    return json.loads(body) if body else None
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+        raise last_error
 
     def trading(self, path):
         return self.request(self.trade_base_url, path)
@@ -793,14 +803,18 @@ def main():
     if not exits:
         raise SystemExit("No completed ledger exits found for the selected symbols.")
 
+    bar_symbols = symbols if args.scan_current else {item["symbol"] for item in exits}
     bar_cache = {}
-    for symbol in sorted(symbols | {MARKET_SYMBOL}):
+    for symbol in sorted(bar_symbols | {MARKET_SYMBOL}):
         try:
             bar_cache[symbol] = calculate_indicators(
                 data.bars(symbol, args.start, args.end, args.timeframe)
             )
         except urllib.error.HTTPError as exc:
             print(f"Skipping {symbol}: HTTP {exc.code} {exc.reason}")
+            bar_cache[symbol] = []
+        except urllib.error.URLError as exc:
+            print(f"Skipping {symbol}: {exc.reason}")
             bar_cache[symbol] = []
 
     market_bars = bar_cache.get(MARKET_SYMBOL, [])

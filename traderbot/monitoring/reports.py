@@ -318,7 +318,10 @@ def summarize_positions(positions):
                 "daily_gain_loss_percent": day_plpc * 100,
             }
         )
-    return sorted(summaries, key=lambda item: item.get("symbol") or "")
+    return sorted(
+        summaries,
+        key=lambda item: (-(item.get("total_gain_loss") or 0), item.get("symbol") or ""),
+    )
 
 
 def pct_change(start_value, end_value):
@@ -514,10 +517,23 @@ def aggregate_cash_blocks(blocks):
     return sorted(summaries, key=lambda item: (-item["count"], item["symbol"]))
 
 
-def markdown_table(headers, rows):
+def markdown_table(headers, rows, alignments=None):
+    def separator(alignment):
+        if alignment == "right":
+            return "---:"
+        if alignment == "center":
+            return ":---:"
+        return "---"
+
+    alignments = alignments or []
     lines = [
         "| " + " | ".join(headers) + " |",
-        "| " + " | ".join("---" for _ in headers) + " |",
+        "| "
+        + " | ".join(
+            separator(alignments[index] if index < len(alignments) else None)
+            for index, _ in enumerate(headers)
+        )
+        + " |",
     ]
     lines.extend("| " + " | ".join(str(cell) for cell in row) + " |" for row in rows)
     return lines
@@ -543,7 +559,11 @@ def render_fill_table(items, empty_text, include_realized_pl=False):
     if include_realized_pl:
         headers.extend(["Avg Entry", "Realized P/L"])
     headers.extend(["Fills", "Last Fill"])
-    return markdown_table(headers, rows)
+    alignments = ["left", "right", "right", "right"]
+    if include_realized_pl:
+        alignments.extend(["right", "right"])
+    alignments.extend(["right", "right"])
+    return markdown_table(headers, rows, alignments)
 
 
 def render_bot_order_table(items):
@@ -560,7 +580,11 @@ def render_bot_order_table(items):
                 short_time(item.get("timestamp")),
             ]
         )
-    return markdown_table(["Symbol", "Qty", "Limit", "Reason", "Submitted"], rows)
+    return markdown_table(
+        ["Symbol", "Qty", "Limit", "Reason", "Submitted"],
+        rows,
+        ["left", "right", "right", "left", "right"],
+    )
 
 
 def render_cash_block_table(items):
@@ -597,6 +621,18 @@ def render_cash_block_table(items):
             "Last",
         ],
         rows,
+        [
+            "left",
+            "right",
+            "right",
+            "right",
+            "right",
+            "right",
+            "right",
+            "right",
+            "right",
+            "right",
+        ],
     )
 
 
@@ -604,6 +640,8 @@ def signed_money(value):
     if value in (None, ""):
         return "n/a"
     numeric = float(value)
+    if numeric < 0:
+        return f"-${abs(numeric):,.2f}"
     sign = "+" if numeric > 0 else ""
     return f"{sign}${numeric:,.2f}"
 
@@ -628,8 +666,10 @@ def render_positions_table(positions):
                 money(item.get("market_value")),
                 money(item.get("avg_entry_price")),
                 money(item.get("current_price")),
-                f"{signed_money(item.get('total_gain_loss'))} ({signed_percent(item.get('total_gain_loss_percent'))})",
-                f"{signed_money(item.get('daily_gain_loss'))} ({signed_percent(item.get('daily_gain_loss_percent'))})",
+                signed_money(item.get("total_gain_loss")),
+                signed_percent(item.get("total_gain_loss_percent")),
+                signed_money(item.get("daily_gain_loss")),
+                signed_percent(item.get("daily_gain_loss_percent")),
             ]
         )
     return markdown_table(
@@ -640,9 +680,12 @@ def render_positions_table(positions):
             "Avg Entry",
             "Current",
             "Total P/L",
+            "Total %",
             "Day P/L",
+            "Day %",
         ],
         rows,
+        ["left", "right", "right", "right", "right", "right", "right", "right", "right"],
     )
 
 
@@ -672,6 +715,7 @@ def render_markdown(report):
                     money(account.get("buying_power")),
                 ]
             ],
+            ["right", "right", "right", "right", "right"],
         )
     )
     if report.get("account_error"):
