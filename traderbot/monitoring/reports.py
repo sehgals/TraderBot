@@ -83,7 +83,40 @@ def configured_watchers(project_root, watchers_path):
         log_path = Path(watcher.get("log", ""))
         if not log_path.is_absolute():
             log_path = project_root / log_path
-        yield {**watcher, "log_path": log_path}
+        state_path = Path(watcher.get("state", ""))
+        if not state_path.is_absolute():
+            state_path = project_root / state_path
+        yield {**watcher, "log_path": log_path, "state_path": state_path}
+
+
+def signal_strength(plan):
+    if not plan:
+        return {"signal_strength": "Unavailable", "signal_score": None, "signal_as_of": None}
+    blockers = set(plan.get("blockers") or [])
+    score = round(max(0, 13 - len(blockers)) / 13 * 100)
+    if score >= 85:
+        label = "Strong"
+    elif score >= 65:
+        label = "Moderate"
+    elif score >= 40:
+        label = "Weak"
+    else:
+        label = "Very Weak"
+    return {
+        "signal_strength": label,
+        "signal_score": score,
+        "signal_as_of": plan.get("last_bar_time"),
+        "signal_status": plan.get("status"),
+        "signal_blockers": sorted(blockers),
+    }
+
+
+def watcher_signal_strengths(project_root, watchers_path):
+    strengths = {}
+    for watcher in configured_watchers(project_root, watchers_path):
+        state = load_json(watcher["state_path"], {})
+        strengths[watcher.get("symbol")] = signal_strength(state.get("dynamic_entry_plan"))
+    return strengths
 
 
 def cash_blocked_detail(record, result):
@@ -278,6 +311,73 @@ def enrich_sold_fills_with_pl(sold, fills, start_at, end_at):
     return enriched
 
 
+def watcher_entry_history(project_root, watchers_path, end_at):
+    """Return entry-price snapshots retained by watcher state and logs."""
+    history = defaultdict(list)
+    state_fallbacks = {}
+    for watcher in configured_watchers(project_root, watchers_path):
+        symbol = watcher.get("symbol")
+        if not symbol:
+            continue
+        state = load_json(watcher["state_path"], {})
+        exit_price = state.get("last_exit_entry_price")
+        exit_at = parse_time(state.get("last_exit_at"))
+        if exit_price not in (None, "") and exit_at:
+            state_fallbacks[(symbol, state.get("last_exit_order_id"))] = float(exit_price)
+
+        log_path = watcher["log_path"]
+        if not log_path.exists():
+            continue
+        with log_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                timestamp = parse_time(record.get("timestamp"))
+                if not timestamp or timestamp.astimezone(LOCAL_TZ) >= end_at:
+                    continue
+                result = record.get("result") or {}
+                entry_price = result.get("entry_fill_price")
+                if entry_price in (None, ""):
+                    continue
+                history[symbol].append((timestamp.astimezone(LOCAL_TZ), float(entry_price)))
+    return history, state_fallbacks
+
+
+def enrich_sold_fills_from_watchers(sold, project_root, watchers_path, end_at):
+    """Fill unmatched sold cost basis from the latest local watcher snapshot."""
+    history, state_fallbacks = watcher_entry_history(project_root, watchers_path, end_at)
+    enriched = []
+    for item in sold:
+        if item.get("avg_entry_price") is not None:
+            enriched.append(item)
+            continue
+        symbol = item.get("symbol")
+        sold_at = parse_time(item.get("timestamp"))
+        entry_price = state_fallbacks.get((symbol, item.get("order_id")))
+        if entry_price is None and sold_at:
+            sold_at = sold_at.astimezone(LOCAL_TZ)
+            candidates = [price for timestamp, price in history.get(symbol, []) if timestamp <= sold_at]
+            if candidates:
+                entry_price = candidates[-1]
+        if entry_price is None:
+            enriched.append(item)
+            continue
+        qty = abs(as_float(item.get("qty")))
+        sell_price = as_float(item.get("price"))
+        enriched.append(
+            {
+                **item,
+                "avg_entry_price": entry_price,
+                "cost_basis": qty * entry_price,
+                "realized_pl": qty * (sell_price - entry_price),
+                "pl_source": "watcher",
+            }
+        )
+    return enriched
+
+
 def merge_fills(*fill_groups):
     merged = {}
     for fills in fill_groups:
@@ -344,9 +444,18 @@ def portfolio_summary(client, account, reporting_config=None):
         total_gain_percent = pct_change(values[0], portfolio_value)
     if total_gain_percent is None and total_gain_baseline not in (None, "", 0):
         total_gain_percent = pct_change(float(total_gain_baseline), portfolio_value)
+    cash_balance = as_float(account.get("cash"))
+    cash_available = max(0.0, cash_balance)
+    margin_used = max(0.0, -cash_balance)
+    non_margin_buying_power = account.get("non_marginable_buying_power")
+    if non_margin_buying_power in (None, ""):
+        non_margin_buying_power = cash_available
     return {
-        "cash": account.get("cash"),
-        "buying_power": account.get("buying_power"),
+        "cash": cash_available,
+        "margin_used": margin_used,
+        "buying_power": non_margin_buying_power,
+        "cash_balance": account.get("cash"),
+        "margin_buying_power": account.get("buying_power"),
         "equity": account.get("equity"),
         "portfolio_value": account.get("portfolio_value"),
         "day_gain_percent": day_gain_percent,
@@ -375,7 +484,13 @@ def build_report(project_root, watchers_path, report_date, client=None):
             fills = merge_fills(client.fills(iso_utc(fill_start_at), iso_utc(end_at)), day_fills)
             bought, sold = summarize_fills(day_fills)
             sold = enrich_sold_fills_with_pl(sold, fills, start_at, end_at)
+            sold = enrich_sold_fills_from_watchers(sold, project_root, watchers_path, end_at)
             positions = summarize_positions(client.positions())
+            strengths = watcher_signal_strengths(project_root, watchers_path)
+            positions = [
+                {**position, **strengths.get(position.get("symbol"), signal_strength(None))}
+                for position in positions
+            ]
         except Exception as exc:
             account_error = f"{type(exc).__name__}: {exc}"
 
@@ -658,7 +773,14 @@ def render_positions_table(positions):
     if not positions:
         return ["No open Alpaca positions found."]
     rows = []
-    for item in positions:
+    def total_percent_sort_key(item):
+        try:
+            total_percent = float(item.get("total_gain_loss_percent"))
+        except (TypeError, ValueError):
+            return (1, 0, item.get("symbol") or "")
+        return (0, -total_percent, item.get("symbol") or "")
+
+    for item in sorted(positions, key=total_percent_sort_key):
         rows.append(
             [
                 item.get("symbol") or "n/a",
@@ -668,6 +790,11 @@ def render_positions_table(positions):
                 money(item.get("current_price")),
                 signed_money(item.get("total_gain_loss")),
                 signed_percent(item.get("total_gain_loss_percent")),
+                (
+                    f'{item.get("signal_strength")} ({item.get("signal_score")}%)'
+                    if item.get("signal_score") is not None
+                    else "Unavailable"
+                ),
                 signed_money(item.get("daily_gain_loss")),
                 signed_percent(item.get("daily_gain_loss_percent")),
             ]
@@ -681,11 +808,12 @@ def render_positions_table(positions):
             "Current",
             "Total P/L",
             "Total %",
+            "Signal Strength",
             "Day P/L",
             "Day %",
         ],
         rows,
-        ["left", "right", "right", "right", "right", "right", "right", "right", "right"],
+        ["left", "right", "right", "right", "right", "right", "right", "left", "right", "right"],
     )
 
 
@@ -705,17 +833,25 @@ def render_markdown(report):
     ]
     lines.extend(
         markdown_table(
-            ["Portfolio", "Day Gain", "Total Gain", "Cash", "Buying Power"],
+            [
+                "Portfolio",
+                "Day Gain",
+                "Total Gain",
+                "Cash Available",
+                "Margin Used",
+                "Buying Power (No Margin)",
+            ],
             [
                 [
                     money(account.get("portfolio_value")),
                     percent(account.get("day_gain_percent")),
                     percent(account.get("total_gain_percent")),
                     money(account.get("cash")),
+                    money(account.get("margin_used")),
                     money(account.get("buying_power")),
                 ]
             ],
-            ["right", "right", "right", "right", "right"],
+            ["right", "right", "right", "right", "right", "right"],
         )
     )
     if report.get("account_error"):
@@ -735,6 +871,17 @@ def render_markdown(report):
         ]
     )
     lines.extend(render_positions_table(positions))
+    lines.extend(
+        [
+            "",
+            "### Signal Strength Method",
+            "Signal Strength scores the latest saved technical strategy plan against 13 checks: market condition, exit-ledger eligibility, same-day loss lockout, price above EMA9, EMA9 above EMA21, EMA21 slope, chase protection, pullback volume, breakout volume, trend alignment, pullback touch, breakout confirmation, and reward/risk.",
+            "",
+            "`Score = (13 - failed checks) / 13 × 100`. Failed checks are stored as signal blockers in the JSON report.",
+            "",
+            "Ratings: **Strong 85–100%**, **Moderate 65–84%**, **Weak 40–64%**, and **Very Weak below 40%**. **Unavailable** means no saved strategy plan exists. The score uses the plan timestamp recorded as `signal_as_of`; it is a technical indicator, not a prediction or guarantee.",
+        ]
+    )
     lines.extend(
         [
             "",

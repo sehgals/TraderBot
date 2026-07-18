@@ -159,6 +159,7 @@ class AlpacaClient:
     def fills(self, after, until=None):
         fills = []
         page_token = None
+        seen_page_tokens = set()
         while True:
             params = {
                 "activity_types": "FILL",
@@ -173,13 +174,21 @@ class AlpacaClient:
             query = urllib.parse.urlencode(params)
             payload = self.trading("GET", f"/account/activities?{query}") or []
             if isinstance(payload, dict):
-                fills.extend(payload.get("activities", []))
+                page = payload.get("activities", [])
+                fills.extend(page)
                 page_token = payload.get("next_page_token")
             else:
-                fills.extend(payload)
-                page_token = None
+                page = payload
+                fills.extend(page)
+                # Alpaca's activities endpoint normally returns a bare list.  In
+                # that response shape the id of the last activity is the token
+                # for the next page; no next_page_token field is supplied.
+                page_token = page[-1].get("id") if len(page) == 100 else None
             if not page_token:
                 return fills
+            if page_token in seen_page_tokens:
+                return fills
+            seen_page_tokens.add(page_token)
 
     def positions(self):
         return self.trading("GET", "/positions") or []
@@ -232,6 +241,10 @@ class AlpacaClient:
             and order.get("type") == "stop"
         ]
 
+    def open_orders(self):
+        query = urllib.parse.urlencode({"status": "open", "nested": "false"})
+        return self.trading("GET", f"/orders?{query}") or []
+
     def cancel_order(self, order_id):
         try:
             self.trading("DELETE", f"/orders/{order_id}")
@@ -269,24 +282,19 @@ def cash_reserve_percent(config):
 
 
 def cash_protected_quantity(client, config, desired_qty, estimated_price):
-    reserve_percent = cash_reserve_percent(config)
-    if reserve_percent <= 0:
-        return desired_qty, {
-            "cash_reserve_enforced": False,
-            "requested_qty": desired_qty,
-        }
-
+    reserve_percent = max(0.0, cash_reserve_percent(config))
     account = client.account()
     cash = float(account.get("cash", 0))
     buying_power = float(account.get("buying_power", cash))
     equity = float(account.get("equity", 0))
     min_cash_balance = equity * reserve_percent / 100
-    available_notional = max(0, max(cash, buying_power) - min_cash_balance)
+    available_notional = max(0, cash - min_cash_balance)
     max_qty = math.floor(available_notional / estimated_price)
     qty = max(0, min(desired_qty, max_qty))
     estimated_notional = qty * estimated_price
     return qty, {
         "cash_reserve_enforced": True,
+        "margin_disabled": True,
         "min_cash_balance_percent": reserve_percent,
         "cash": cash,
         "buying_power": buying_power,
@@ -306,11 +314,13 @@ def cash_available_share_count(client, config, estimated_price):
     cash = float(account.get("cash", 0))
     buying_power = float(account.get("buying_power", cash))
     equity = float(account.get("equity", 0))
-    min_cash_balance = equity * cash_reserve_percent(config) / 100
-    available_notional = max(0, max(cash, buying_power) - min_cash_balance)
+    reserve_percent = max(0.0, cash_reserve_percent(config))
+    min_cash_balance = equity * reserve_percent / 100
+    available_notional = max(0, cash - min_cash_balance)
     return math.floor(available_notional / estimated_price), {
         "cash": cash,
         "buying_power": buying_power,
+        "margin_disabled": True,
         "equity": equity,
         "min_cash_balance": min_cash_balance,
         "available_notional": available_notional,
@@ -903,6 +913,8 @@ def record_exit_from_order(state, order):
         return None
 
     state["last_exit_order_id"] = order["id"]
+    if state.get("entry_fill_price") is not None:
+        state["last_exit_entry_price"] = float(state["entry_fill_price"])
     if order.get("filled_avg_price"):
         state["last_exit_price"] = float(order["filled_avg_price"])
     if order.get("filled_at"):
