@@ -4,6 +4,7 @@ import json
 from traderbot.monitoring.reports import (
     enrich_sold_fills_from_watchers,
     portfolio_summary,
+    render_fill_table,
     render_markdown,
     render_positions_table,
     signal_strength,
@@ -27,6 +28,60 @@ def test_positions_table_sorts_total_percent_descending_with_missing_values_last
     symbols = [line.split("|")[1].strip() for line in table[2:]]
 
     assert symbols == ["WIN", "FLAT", "LOSS", "MISSING"]
+
+
+def test_positions_table_pads_columns_for_plain_text_alignment():
+    positions = [
+        {"symbol": "A", "qty": 1, "market_value": 10},
+        {"symbol": "LONG", "qty": 1000, "market_value": 12345},
+    ]
+
+    table = render_positions_table(positions)
+    pipe_positions = [[index for index, char in enumerate(line) if char == "|"] for line in table]
+
+    assert all(positions == pipe_positions[0] for positions in pipe_positions[1:])
+    assert "| Symbol " in table[0]
+    assert "|      1 " in table[2]
+
+
+def test_bought_and_sold_tables_pad_columns_for_plain_text_alignment():
+    bought = render_fill_table(
+        [
+            {
+                "symbol": "A",
+                "qty": 1,
+                "price": 10,
+                "order_id": "buy-1",
+                "timestamp": "2026-07-28T14:00:00Z",
+            }
+        ],
+        "No buys.",
+    )
+    sold = render_fill_table(
+        [
+            {
+                "symbol": "LONG",
+                "qty": 1000,
+                "price": 12,
+                "avg_entry_price": 10,
+                "realized_pl": 2000,
+                "order_id": "sell-1",
+                "timestamp": "2026-07-28T15:00:00Z",
+            }
+        ],
+        "No sells.",
+        include_realized_pl=True,
+    )
+
+    for table in (bought, sold):
+        pipe_positions = [
+            [index for index, char in enumerate(line) if char == "|"]
+            for line in table
+        ]
+        assert all(row == pipe_positions[0] for row in pipe_positions[1:])
+
+    assert "|      1 " in bought[2]
+    assert "|   1000 " in sold[2]
 
 
 def test_portfolio_summary_excludes_margin_from_snapshot_funds():

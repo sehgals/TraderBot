@@ -632,7 +632,7 @@ def aggregate_cash_blocks(blocks):
     return sorted(summaries, key=lambda item: (-item["count"], item["symbol"]))
 
 
-def markdown_table(headers, rows, alignments=None):
+def markdown_table(headers, rows, alignments=None, pad_columns=False, minimum_width=0):
     def separator(alignment):
         if alignment == "right":
             return "---:"
@@ -641,16 +641,38 @@ def markdown_table(headers, rows, alignments=None):
         return "---"
 
     alignments = alignments or []
+    string_rows = [[str(cell) for cell in row] for row in rows]
+    widths = [len(header) for header in headers]
+    if pad_columns:
+        for row in string_rows:
+            for index, cell in enumerate(row):
+                widths[index] = max(widths[index], len(cell))
+        widths = [max(width, minimum_width) for width in widths]
+
+    def format_cell(value, index):
+        if not pad_columns:
+            return value
+        alignment = alignments[index] if index < len(alignments) else None
+        return value.rjust(widths[index]) if alignment == "right" else value.ljust(widths[index])
+
     lines = [
-        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(format_cell(header, index) for index, header in enumerate(headers)) + " |",
         "| "
         + " | ".join(
-            separator(alignments[index] if index < len(alignments) else None)
+            format_cell(
+                separator(alignments[index] if index < len(alignments) else None),
+                index,
+            )
             for index, _ in enumerate(headers)
         )
         + " |",
     ]
-    lines.extend("| " + " | ".join(str(cell) for cell in row) + " |" for row in rows)
+    lines.extend(
+        "| "
+        + " | ".join(format_cell(cell, index) for index, cell in enumerate(row))
+        + " |"
+        for row in string_rows
+    )
     return lines
 
 
@@ -678,7 +700,13 @@ def render_fill_table(items, empty_text, include_realized_pl=False):
     if include_realized_pl:
         alignments.extend(["right", "right"])
     alignments.extend(["right", "right"])
-    return markdown_table(headers, rows, alignments)
+    return markdown_table(
+        headers,
+        rows,
+        alignments,
+        pad_columns=True,
+        minimum_width=6,
+    )
 
 
 def render_bot_order_table(items):
@@ -814,6 +842,8 @@ def render_positions_table(positions):
         ],
         rows,
         ["left", "right", "right", "right", "right", "right", "right", "left", "right", "right"],
+        pad_columns=True,
+        minimum_width=6,
     )
 
 
