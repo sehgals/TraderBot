@@ -1504,10 +1504,10 @@ def run_once(client, config, state, clock=None):
 
     entry_order_id = state.get("current_entry_order_id") or config.get("entry_order_id")
     entry_order = client.order(entry_order_id) if entry_order_id else None
+    position = client.position(symbol)
+    qty = position_quantity(position)
 
     if not entry_order_id:
-        position = client.position(symbol)
-        qty = position_quantity(position)
         if qty <= 0:
             if config.get("dynamic_entry_enabled"):
                 return handle_dynamic_flat_entry(client, config, state, exit_trade=None)

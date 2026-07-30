@@ -7,6 +7,7 @@ from traderbot.core_strategy_engine.engine import (
     apply_order_risk_caps,
     initial_floor_price,
     reconcile_flat_position_state,
+    run_once,
     trail_below_current_percent,
     update_stop_order,
 )
@@ -55,6 +56,9 @@ class FakeClient:
 
     def account(self):
         return self._account
+
+    def latest_trade_price(self, symbol):
+        return float(self._position["current_price"])
 
 
 class RiskControlTests(unittest.TestCase):
@@ -109,6 +113,50 @@ class RiskControlTests(unittest.TestCase):
 
         self.assertIsNone(update_stop_order(client, "SPY", 100, 590, state))
         self.assertEqual(client.canceled, ["duplicate"])
+
+    def test_saved_filled_entry_order_loads_live_quantity_before_managing_position(self):
+        client = FakeClient(
+            position={
+                "symbol": "GFS",
+                "qty": "10",
+                "avg_entry_price": "66.82",
+                "current_price": "54.00",
+            },
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "GFS",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "filled",
+                    "qty": "74",
+                    "filled_avg_price": "66.82",
+                }
+            ],
+        )
+        config = {
+            "symbol": "GFS",
+            "entry_quantity": 1,
+            "initial_stop_loss_percent": 20,
+            "trail_trigger_step_percent": 5,
+            "trail_stop_below_current_percent": 2.5,
+            "ladder_buy_quantity": 0,
+            "ladder_drop_steps_percent": [],
+        }
+        state = {"current_entry_order_id": "entry-1"}
+
+        result = run_once(
+            client,
+            config,
+            state,
+            clock={"is_open": True},
+        )
+
+        self.assertEqual(result["status"], "managed")
+        self.assertEqual(result["position_qty"], 10)
+        self.assertEqual(client.submitted[0]["side"], "sell")
+        self.assertEqual(client.submitted[0]["qty"], "10")
+        self.assertEqual(state["active_stop_qty"], 10)
 
     def test_atr_or_percent_initial_floor_is_capped(self):
         config = {
