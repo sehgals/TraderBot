@@ -4,6 +4,8 @@ import json
 from traderbot.monitoring.reports import (
     enrich_sold_fills_from_watchers,
     portfolio_summary,
+    render_bot_order_table,
+    render_cash_block_table,
     render_fill_table,
     render_markdown,
     render_positions_table,
@@ -82,6 +84,76 @@ def test_bought_and_sold_tables_pad_columns_for_plain_text_alignment():
 
     assert "|      1 " in bought[2]
     assert "|   1000 " in sold[2]
+
+
+def test_snapshot_table_pads_columns_for_plain_text_alignment():
+    markdown = render_markdown(
+        {
+            "report_date": "2026-08-05",
+            "account": {
+                "portfolio_value": 123456.78,
+                "day_gain_percent": 1.25,
+                "total_gain_percent": 12.5,
+                "cash": 987.65,
+                "margin_used": 0,
+                "buying_power": 5432.10,
+            },
+            "current_positions": [],
+        }
+    )
+    lines = markdown.splitlines()
+    snapshot_start = lines.index("## Snapshot") + 1
+    table = lines[snapshot_start : snapshot_start + 3]
+    pipe_positions = [[index for index, char in enumerate(line) if char == "|"] for line in table]
+
+    assert all(row == pipe_positions[0] for row in pipe_positions[1:])
+
+
+def test_bot_order_and_cash_block_tables_pad_columns_for_plain_text_alignment():
+    bot_orders = render_bot_order_table(
+        [
+            {
+                "symbol": "A",
+                "qty": 1,
+                "limit_price": 10,
+                "reason": "breakout",
+                "timestamp": "2026-08-04T14:00:00Z",
+            },
+            {
+                "symbol": "LONG",
+                "qty": 1000,
+                "limit_price": 123.45,
+                "reason": "dynamic_breakout_continuation",
+                "timestamp": "2026-08-04T15:00:00Z",
+            },
+        ]
+    )
+    cash_blocks = render_cash_block_table(
+        [
+            {
+                "symbol": "A",
+                "timestamp": "2026-08-04T14:00:00Z",
+                "cash": 100,
+                "min_cash_balance": 50,
+                "target_notional": 500,
+                "requested_qty": 5,
+                "available_notional": 50,
+            },
+            {
+                "symbol": "LONG",
+                "timestamp": "2026-08-04T15:00:00Z",
+                "cash": 1000,
+                "min_cash_balance": 250,
+                "target_notional": 2000,
+                "requested_qty": 20,
+                "available_notional": 750,
+            },
+        ]
+    )
+
+    for table in (bot_orders, cash_blocks):
+        pipe_positions = [[index for index, char in enumerate(line) if char == "|"] for line in table]
+        assert all(row == pipe_positions[0] for row in pipe_positions[1:])
 
 
 def test_portfolio_summary_excludes_margin_from_snapshot_funds():

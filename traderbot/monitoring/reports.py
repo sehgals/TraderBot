@@ -727,6 +727,8 @@ def render_bot_order_table(items):
         ["Symbol", "Qty", "Limit", "Reason", "Submitted"],
         rows,
         ["left", "right", "right", "left", "right"],
+        pad_columns=True,
+        minimum_width=6,
     )
 
 
@@ -776,6 +778,8 @@ def render_cash_block_table(items):
             "right",
             "right",
         ],
+        pad_columns=True,
+        minimum_width=6,
     )
 
 
@@ -882,6 +886,8 @@ def render_markdown(report):
                 ]
             ],
             ["right", "right", "right", "right", "right", "right"],
+            pad_columns=True,
+            minimum_width=6,
         )
     )
     if report.get("account_error"):
