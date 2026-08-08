@@ -5,6 +5,9 @@ from traderbot.core_strategy_engine.engine import (
     adaptive_ladder_quantity,
     apply_ladder_risk_caps,
     apply_order_risk_caps,
+    cash_available_share_count,
+    cash_protected_quantity,
+    effective_managed_stop_price,
     initial_floor_price,
     reconcile_flat_position_state,
     run_once,
@@ -38,6 +41,15 @@ class FakeClient:
             if order.get("symbol") == symbol
             and order.get("side") == "sell"
             and order.get("type") == "stop"
+            and order.get("status") in ("new", "accepted", "pending_new", "partially_filled")
+        ]
+
+    def open_buy_orders(self, symbol):
+        return [
+            order
+            for order in self.orders
+            if order.get("symbol") == symbol
+            and order.get("side") == "buy"
             and order.get("status") in ("new", "accepted", "pending_new", "partially_filled")
         ]
 
@@ -85,6 +97,29 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(result["canceled_stop_order_ids"], ["stop-1"])
         self.assertNotIn("active_stop_order_id", state)
 
+    def test_flat_reconciliation_preserves_untracked_open_buy_order(self):
+        client = FakeClient(
+            position=None,
+            orders=[
+                {
+                    "id": "overnight-buy",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "accepted",
+                    "qty": "6",
+                    "limit_price": "398.96",
+                }
+            ],
+        )
+        state = {}
+
+        result = reconcile_flat_position_state(client, "WAT", state)
+
+        self.assertEqual(result["open_buy_order_ids"], ["overnight-buy"])
+        self.assertEqual(state["current_entry_order_id"], "overnight-buy")
+        self.assertEqual(state["reentry_order_id"], "overnight-buy")
+
     def test_update_stop_cleans_duplicate_when_state_matches(self):
         client = FakeClient(
             position={"qty": "100"},
@@ -120,7 +155,7 @@ class RiskControlTests(unittest.TestCase):
                 "symbol": "GFS",
                 "qty": "10",
                 "avg_entry_price": "66.82",
-                "current_price": "54.00",
+                "current_price": "46.00",
             },
             orders=[
                 {
@@ -156,7 +191,33 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(result["position_qty"], 10)
         self.assertEqual(client.submitted[0]["side"], "sell")
         self.assertEqual(client.submitted[0]["qty"], "10")
+        self.assertEqual(client.submitted[0]["stop_price"], "44.85")
         self.assertEqual(state["active_stop_qty"], 10)
+        self.assertTrue(result["recovery_stop_active"])
+        self.assertAlmostEqual(result["planned_floor_price"], 53.456)
+        self.assertEqual(result["effective_stop_price"], 44.85)
+
+    def test_recovery_stop_ratchets_up_but_not_down(self):
+        config = {
+            "trail_stop_below_current_percent": 2.5,
+            "recovery_stop_enabled": True,
+        }
+        state = {}
+
+        first_price, first_detail = effective_managed_stop_price(
+            config, state, current_price=46, planned_floor=53.456
+        )
+        higher_price, _ = effective_managed_stop_price(
+            config, state, current_price=48, planned_floor=53.456
+        )
+        retained_price, _ = effective_managed_stop_price(
+            config, state, current_price=47, planned_floor=53.456
+        )
+
+        self.assertTrue(first_detail["recovery_stop_active"])
+        self.assertEqual(first_price, 44.85)
+        self.assertEqual(higher_price, 46.8)
+        self.assertEqual(retained_price, 46.8)
 
     def test_atr_or_percent_initial_floor_is_capped(self):
         config = {
@@ -191,6 +252,31 @@ class RiskControlTests(unittest.TestCase):
 
         self.assertEqual(qty, 15)
         self.assertTrue(detail["risk_caps_enforced"])
+
+    def test_cash_reserve_uses_cash_not_margin_buying_power(self):
+        client = FakeClient(account={"equity": "50000", "cash": "-1000", "buying_power": "100000"})
+        config = {"min_cash_balance_percent": 20}
+
+        qty, detail = cash_protected_quantity(client, config, 10, 100)
+        affordable_qty, share_detail = cash_available_share_count(client, config, 100)
+
+        self.assertEqual(qty, 0)
+        self.assertEqual(affordable_qty, 0)
+        self.assertEqual(detail["min_cash_balance"], 10000)
+        self.assertEqual(detail["available_notional"], 0)
+        self.assertEqual(share_detail["available_notional"], 0)
+
+    def test_zero_cash_reserve_still_cannot_use_margin(self):
+        client = FakeClient(account={"equity": "50000", "cash": "0", "buying_power": "100000"})
+        config = {"min_cash_balance_percent": 0}
+
+        qty, detail = cash_protected_quantity(client, config, 10, 100)
+        affordable_qty, share_detail = cash_available_share_count(client, config, 100)
+
+        self.assertEqual(qty, 0)
+        self.assertEqual(affordable_qty, 0)
+        self.assertTrue(detail["margin_disabled"])
+        self.assertTrue(share_detail["margin_disabled"])
 
     def test_ladder_notional_cap_shrinks_quantity(self):
         client = FakeClient(account={"equity": "100000", "cash": "100000", "buying_power": "100000"})

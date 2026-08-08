@@ -24,6 +24,8 @@ DEFAULT_WATCHERS_PATH = "config/watchers.json"
 STRATEGY_CONFIG_DIR = Path("traderbot/core_strategy_engine/strategies/configs")
 RUNTIME_STATE_DIR = Path("runtime/state")
 RUNTIME_LOG_DIR = Path("runtime/logs")
+MARGIN_REDUCTION_STATE = RUNTIME_STATE_DIR / "margin_reduction_state.json"
+MARGIN_REDUCTION_LOG = RUNTIME_LOG_DIR / "margin_reduction.jsonl"
 
 
 def utc_now():
@@ -294,6 +296,118 @@ def due_watchers(watchers):
     ]
 
 
+def position_margin_rank(position):
+    try:
+        total_plpc = float(position.get("unrealized_plpc", 0))
+    except (TypeError, ValueError):
+        total_plpc = 0.0
+    try:
+        day_plpc = float(position.get("unrealized_intraday_plpc", 0))
+    except (TypeError, ValueError):
+        day_plpc = 0.0
+    return (total_plpc, day_plpc, position.get("symbol") or "")
+
+
+def run_margin_reducer(client, supervisor_config, project_root, clock):
+    config = supervisor_config.get("auto_margin_reduction", {})
+    if not config.get("enabled", False):
+        return {"status": "disabled"}
+
+    account = client.account()
+    cash = float(account.get("cash", 0) or 0)
+    margin_used = max(0.0, -cash)
+    target = max(0.0, float(config.get("target_margin_dollars", 0)))
+    if margin_used <= target:
+        return {"status": "no_margin", "margin_used": margin_used, "target": target}
+
+    open_orders = client.open_orders()
+    canceled_buy_order_ids = []
+    for order in open_orders:
+        if order.get("side") == "buy":
+            client.cancel_order(order["id"])
+            canceled_buy_order_ids.append(order["id"])
+
+    result = {
+        "margin_used": margin_used,
+        "target": target,
+        "canceled_buy_order_ids": canceled_buy_order_ids,
+    }
+    if not clock.get("is_open"):
+        return {**result, "status": "market_closed_margin_reduction_deferred"}
+
+    today = datetime.datetime.now().astimezone().date().isoformat()
+    state_path = project_root / MARGIN_REDUCTION_STATE
+    state = load_json(state_path, {})
+    if state.get("date") != today:
+        state = {"date": today, "submitted_notional": 0.0}
+
+    daily_cap = max(0.0, float(config.get("max_daily_liquidation_dollars", 5000)))
+    submitted = float(state.get("submitted_notional", 0) or 0)
+    remaining_daily = max(0.0, daily_cap - submitted)
+    if remaining_daily <= 0:
+        return {**result, "status": "daily_margin_reduction_cap_reached", "daily_cap": daily_cap}
+
+    if any(
+        order.get("side") == "sell"
+        and str(order.get("client_order_id", "")).startswith("margin-reducer-")
+        for order in open_orders
+    ):
+        return {**result, "status": "margin_reduction_order_pending"}
+
+    excluded = set(config.get("excluded_symbols", []))
+    positions = [
+        position for position in client.positions()
+        if position.get("symbol") not in excluded and float(position.get("qty", 0) or 0) > 0
+    ]
+    if not positions:
+        return {**result, "status": "no_position_available_for_margin_reduction"}
+    position = min(positions, key=position_margin_rank)
+    symbol = position["symbol"]
+    price = float(position.get("current_price", 0) or 0)
+    held_qty = int(float(position.get("qty", 0) or 0))
+    max_order = max(0.0, float(config.get("max_order_dollars", 1000)))
+    order_budget = min(margin_used - target, remaining_daily, max_order)
+    qty = min(held_qty, int(order_budget // price)) if price > 0 else 0
+    if qty <= 0:
+        return {**result, "status": "margin_reduction_budget_below_share_price", "symbol": symbol}
+
+    canceled_sell_order_ids = []
+    for order in open_orders:
+        if order.get("symbol") == symbol and order.get("side") == "sell":
+            client.cancel_order(order["id"])
+            canceled_sell_order_ids.append(order["id"])
+
+    estimated_notional = round(qty * price, 2)
+    order = client.submit_order(
+        {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": (
+                f"margin-reducer-{today.replace('-', '')}-{symbol.lower()}-{int(submitted)}"
+            ),
+        }
+    )
+    state["submitted_notional"] = round(submitted + estimated_notional, 2)
+    state["last_order_id"] = order.get("id")
+    state["last_symbol"] = symbol
+    save_json(state_path, state)
+    return {
+        **result,
+        "status": "margin_reduction_order_submitted",
+        "symbol": symbol,
+        "qty": qty,
+        "estimated_notional": estimated_notional,
+        "total_gain_loss_percent": float(position.get("unrealized_plpc", 0) or 0) * 100,
+        "order_id": order.get("id"),
+        "canceled_sell_order_ids": canceled_sell_order_ids,
+        "daily_submitted_notional": state["submitted_notional"],
+        "daily_cap": daily_cap,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=DEFAULT_WATCHERS_PATH)
@@ -322,6 +436,11 @@ def main():
 
     max_concurrency = max(1, int(supervisor_config.get("max_concurrency", 3)))
     scheduler_sleep = max(1, int(supervisor_config.get("scheduler_sleep_seconds", 2)))
+    margin_reduction_interval = max(
+        30,
+        int(supervisor_config.get("auto_margin_reduction", {}).get("poll_seconds", 300)),
+    )
+    next_margin_reduction_at = 0.0
 
     for index, watcher in enumerate(watchers):
         watcher["next_run_at"] = 0.0 if args.once else time.monotonic() + index
@@ -343,6 +462,24 @@ def main():
                     "timestamp": iso_now(),
                     "next_open": None,
                 }
+
+            if time.monotonic() >= next_margin_reduction_at:
+                try:
+                    margin_result = run_margin_reducer(
+                        client, supervisor_config, project_root, clock
+                    )
+                except Exception as exc:
+                    margin_result = {
+                        "status": "margin_reduction_error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                append_jsonl(
+                    project_root / MARGIN_REDUCTION_LOG,
+                    {"timestamp": iso_now(), "result": margin_result},
+                )
+                print(json.dumps({"timestamp": iso_now(), **margin_result}, sort_keys=True), flush=True)
+                next_margin_reduction_at = time.monotonic() + margin_reduction_interval
 
             futures = {
                 executor.submit(run_watcher, client, watcher, supervisor_config, clock): watcher

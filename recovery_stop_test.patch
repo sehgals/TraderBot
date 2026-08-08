@@ -1,0 +1,52 @@
+diff --git a/tests/unit/test_risk_controls.py b/tests/unit/test_risk_controls.py
+--- a/tests/unit/test_risk_controls.py
++++ b/tests/unit/test_risk_controls.py
+@@ -7,6 +7,7 @@ from traderbot.core_strategy_engine.engine import (
+     apply_order_risk_caps,
++    effective_managed_stop_price,
+     initial_floor_price,
+     reconcile_flat_position_state,
+     run_once,
+@@ -120,7 +121,7 @@ class RiskControlTests(unittest.TestCase):
+                 "symbol": "GFS",
+                 "qty": "10",
+                 "avg_entry_price": "66.82",
+-                "current_price": "54.00",
++                "current_price": "46.00",
+             },
+             orders=[
+                 {
+@@ -156,7 +157,33 @@ class RiskControlTests(unittest.TestCase):
+         self.assertEqual(result["position_qty"], 10)
+         self.assertEqual(client.submitted[0]["side"], "sell")
+         self.assertEqual(client.submitted[0]["qty"], "10")
++        self.assertEqual(client.submitted[0]["stop_price"], "44.85")
+         self.assertEqual(state["active_stop_qty"], 10)
++        self.assertTrue(result["recovery_stop_active"])
++        self.assertAlmostEqual(result["planned_floor_price"], 53.456)
++        self.assertEqual(result["effective_stop_price"], 44.85)
++
++    def test_recovery_stop_ratchets_up_but_not_down(self):
++        config = {
++            "trail_stop_below_current_percent": 2.5,
++            "recovery_stop_enabled": True,
++        }
++        state = {}
++
++        first_price, first_detail = effective_managed_stop_price(
++            config, state, current_price=46, planned_floor=53.456
++        )
++        higher_price, _ = effective_managed_stop_price(
++            config, state, current_price=48, planned_floor=53.456
++        )
++        retained_price, _ = effective_managed_stop_price(
++            config, state, current_price=47, planned_floor=53.456
++        )
++
++        self.assertTrue(first_detail["recovery_stop_active"])
++        self.assertEqual(first_price, 44.85)
++        self.assertEqual(higher_price, 46.8)
++        self.assertEqual(retained_price, 46.8)
+ 
+     def test_atr_or_percent_initial_floor_is_capped(self):
+         config = {

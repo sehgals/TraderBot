@@ -533,6 +533,21 @@ def short_time(value):
     return timestamp.astimezone(LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
 
 
+def full_timestamp(value):
+    timestamp = parse_time(value)
+    if not timestamp:
+        return "n/a"
+    local = timestamp.astimezone(LOCAL_TZ)
+    zone_name = local.tzname() or "local time"
+    offset = local.strftime("%z")
+    formatted_offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+    return (
+        f"{local.strftime('%B')} {local.day}, {local.year} at "
+        f"{local.strftime('%I:%M:%S %p').lstrip('0')} "
+        f"{zone_name} (UTC{formatted_offset})"
+    )
+
+
 def as_float(value, default=0.0):
     try:
         return float(value)
@@ -861,7 +876,7 @@ def render_markdown(report):
     lines = [
         f"# TraderBot Daily Report - {report['report_date']}",
         "",
-        f"Generated: {short_time(report.get('generated_at'))}",
+        f"Generated: {full_timestamp(report.get('generated_at'))}",
         "",
         "## Snapshot",
     ]

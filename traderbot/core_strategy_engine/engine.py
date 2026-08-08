@@ -15,6 +15,7 @@ DEFAULT_CONFIG_PATH = "traderbot/core_strategy_engine/strategies/configs/strateg
 DEFAULT_STATE_PATH = "runtime/state/strategy_state.json"
 MARKET_SYMBOL = "QQQ"
 DEFAULT_MIN_CASH_BALANCE_PERCENT = 20
+MAX_ENTRY_CLOCK_AGE_SECONDS = 30
 RISK_PROFILE_DEFAULTS = {
     "index_etf": {
         "initial_stop_mode": "atr_or_percent",
@@ -52,6 +53,31 @@ RISK_PROFILE_DEFAULTS = {
         "max_ladder_count": 0,
     },
 }
+
+
+def fresh_open_market_clock(clock, now=None, max_age_seconds=MAX_ENTRY_CLOCK_AGE_SECONDS):
+    if not clock or not clock.get("is_open"):
+        return False, "market is closed"
+
+    timestamp = clock.get("timestamp")
+    if not timestamp:
+        return False, "market clock timestamp is missing"
+    try:
+        clock_time = datetime.datetime.fromisoformat(
+            str(timestamp).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False, f"market clock timestamp is invalid: {timestamp}"
+    if clock_time.tzinfo is None:
+        return False, "market clock timestamp has no timezone"
+
+    checked_at = now or datetime.datetime.now(datetime.timezone.utc)
+    age_seconds = (checked_at - clock_time.astimezone(datetime.timezone.utc)).total_seconds()
+    if age_seconds < -5:
+        return False, f"market clock timestamp is {abs(age_seconds):.1f}s in the future"
+    if age_seconds > max_age_seconds:
+        return False, f"market clock is stale by {age_seconds:.1f}s"
+    return True, None
 
 
 def risk_setting(config, key, default=None):
@@ -245,6 +271,14 @@ class AlpacaClient:
         query = urllib.parse.urlencode({"status": "open", "nested": "false"})
         return self.trading("GET", f"/orders?{query}") or []
 
+    def open_buy_orders(self, symbol):
+        return [
+            order
+            for order in self.open_orders()
+            if order.get("symbol") == symbol
+            and order.get("side") == "buy"
+        ]
+
     def cancel_order(self, order_id):
         try:
             self.trading("DELETE", f"/orders/{order_id}")
@@ -253,6 +287,20 @@ class AlpacaClient:
                 raise
 
     def submit_order(self, payload):
+        if payload.get("side") == "buy":
+            clock = self.clock()
+            allowed, reason = fresh_open_market_clock(clock)
+            if not allowed:
+                raise RuntimeError(f"buy order blocked: {reason}")
+            open_orders = self.open_buy_orders(payload.get("symbol"))
+            if open_orders:
+                order_ids = ", ".join(
+                    str(order.get("id")) for order in open_orders
+                )
+                raise RuntimeError(
+                    "buy order blocked: existing open buy order(s) for "
+                    f"{payload.get('symbol')}: {order_ids}"
+                )
         return self.trading("POST", "/orders", payload)
 
     def replace_order(self, order_id, payload):
@@ -871,6 +919,8 @@ def reset_managed_position_state(state):
         "active_stop_order_id",
         "active_stop_price",
         "active_stop_qty",
+        "recovery_stop_active",
+        "recovery_stop_price",
         "entry_fill_price",
         "filled_ladder_steps",
         "floor_price",
@@ -881,6 +931,45 @@ def reset_managed_position_state(state):
         "ladder_order_ids",
     ):
         state.pop(key, None)
+
+
+def effective_managed_stop_price(config, state, current_price, planned_floor):
+    if planned_floor < current_price:
+        state.pop("recovery_stop_active", None)
+        state.pop("recovery_stop_price", None)
+        return planned_floor, {
+            "recovery_stop_active": False,
+            "planned_floor_price": planned_floor,
+        }
+
+    if not risk_setting(config, "recovery_stop_enabled", True):
+        return planned_floor, {
+            "recovery_stop_active": False,
+            "planned_floor_price": planned_floor,
+            "recovery_stop_disabled": True,
+        }
+
+    distance_percent = float(
+        risk_setting(
+            config,
+            "recovery_stop_below_current_percent",
+            risk_setting(config, "trail_stop_below_current_percent", 2.5),
+        )
+    )
+    if not 0 < distance_percent < 100:
+        raise ValueError("recovery_stop_below_current_percent must be between 0 and 100")
+
+    candidate = current_price * (1 - distance_percent / 100)
+    previous_recovery = float(state.get("recovery_stop_price", 0) or 0)
+    recovery_price = max(previous_recovery, candidate)
+    state["recovery_stop_active"] = True
+    state["recovery_stop_price"] = recovery_price
+    return recovery_price, {
+        "recovery_stop_active": True,
+        "recovery_stop_price": recovery_price,
+        "recovery_stop_below_current_percent": distance_percent,
+        "planned_floor_price": planned_floor,
+    }
 
 
 def reset_entry_tracking_state(state):
@@ -906,6 +995,37 @@ def order_is_open(order):
         "pending_new",
         "partially_filled",
     )
+
+
+def symbol_open_buy_orders(client, symbol):
+    if hasattr(client, "open_buy_orders"):
+        return list(client.open_buy_orders(symbol) or [])
+    if hasattr(client, "open_orders"):
+        return [
+            order
+            for order in (client.open_orders() or [])
+            if order.get("symbol") == symbol
+            and order.get("side") == "buy"
+        ]
+    return []
+
+
+def track_existing_open_buy_order(client, symbol, state):
+    open_orders = symbol_open_buy_orders(client, symbol)
+    if not open_orders:
+        return []
+    tracked_id = state.get("reentry_order_id") or state.get("current_entry_order_id")
+    tracked = next(
+        (order for order in open_orders if order.get("id") == tracked_id),
+        None,
+    )
+    selected = tracked or sorted(
+        open_orders,
+        key=lambda order: (order.get("created_at") or "", order.get("id") or ""),
+    )[0]
+    state["current_entry_order_id"] = selected["id"]
+    state["reentry_order_id"] = selected["id"]
+    return open_orders
 
 
 def record_exit_from_order(state, order):
@@ -969,11 +1089,14 @@ def reconcile_flat_position_state(client, symbol, state):
         )
     )
     reset_managed_position_state(state)
-    reset_entry_tracking_state(state)
+    open_buy_orders = track_existing_open_buy_order(client, symbol, state)
+    if not open_buy_orders:
+        reset_entry_tracking_state(state)
     return {
         "position_qty": 0,
         "cleared_stale_state": had_managed_state,
         "canceled_stop_order_ids": canceled_stop_order_ids,
+        "open_buy_order_ids": [order.get("id") for order in open_buy_orders],
         **(exit_details or {}),
     }
 
@@ -1277,11 +1400,18 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     plan = dynamic_entry_plan(symbol, bars, market_bars, exit_trade, ignore_ledger=ignore_ledger)
     state["dynamic_entry_plan"] = serializable_plan(plan)
 
+    open_buy_orders = track_existing_open_buy_order(client, symbol, state)
     reentry_order_id = state.get("reentry_order_id")
     if reentry_order_id:
         pending = update_dynamic_pending_order(client, config, state, reentry_order_id, plan)
         if pending:
-            return {**pending, "dynamic_plan": serializable_plan(plan)}
+            return {
+                **pending,
+                "open_buy_order_ids": [
+                    order.get("id") for order in open_buy_orders
+                ],
+                "dynamic_plan": serializable_plan(plan),
+            }
 
     if plan.get("status") != "active_signal":
         return {
@@ -1588,7 +1718,19 @@ def run_once(client, config, state, clock=None):
     floor_price = max(previous_floor, base_floor, candidate_floor)
     state["floor_price"] = floor_price
 
-    stop_order = update_stop_order(client, symbol, qty, floor_price, state)
+    effective_stop_price, recovery_stop = effective_managed_stop_price(
+        config,
+        state,
+        current_price,
+        floor_price,
+    )
+    stop_order = update_stop_order(
+        client,
+        symbol,
+        qty,
+        effective_stop_price,
+        state,
+    )
 
     ladder_orders = []
     skipped_ladder_orders = []
@@ -1722,6 +1864,8 @@ def run_once(client, config, state, clock=None):
         "current_price": current_price,
         "position_qty": qty,
         "floor_price": floor_price,
+        "effective_stop_price": effective_stop_price,
+        **recovery_stop,
         "highest_trail_rung": state["highest_trail_rung"],
         "updated_stop_order": stop_order["id"] if stop_order else None,
         "new_ladder_orders": [item["order"]["id"] for item in ladder_orders],
