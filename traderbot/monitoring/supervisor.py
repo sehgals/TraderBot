@@ -6,6 +6,7 @@ import os
 import signal
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 from traderbot.core_strategy_engine.engine import (
@@ -18,6 +19,7 @@ from traderbot.core_strategy_engine.strategies import (
     DEFAULT_STRATEGY_TYPE,
     resolve_strategy,
 )
+from traderbot.broker.execution_gateway import ExecutionGateway
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -26,6 +28,7 @@ RUNTIME_STATE_DIR = Path("runtime/state")
 RUNTIME_LOG_DIR = Path("runtime/logs")
 MARGIN_REDUCTION_STATE = RUNTIME_STATE_DIR / "margin_reduction_state.json"
 MARGIN_REDUCTION_LOG = RUNTIME_LOG_DIR / "margin_reduction.jsonl"
+POSITION_HEALTH_ALERT_LOG = RUNTIME_LOG_DIR / "position_health_alerts.jsonl"
 
 
 def utc_now():
@@ -229,6 +232,10 @@ def run_watcher(client, watcher, supervisor_config, clock):
     strategy_config = dict(watcher.get("config_defaults", {}))
     if watcher.get("config_path"):
         strategy_config.update(load_json(watcher["config_path"], {}))
+    strategy_config["position_health"] = {
+        **(supervisor_config.get("position_health") or {}),
+        **(strategy_config.get("position_health") or {}),
+    }
     strategy_config.setdefault("symbol", watcher["symbol"])
     strategy_config.setdefault(
         "strategy_type",
@@ -296,6 +303,40 @@ def due_watchers(watchers):
     ]
 
 
+def record_position_health_alert(project_root, watcher, result):
+    health = result.get("position_health") or {}
+    state = health.get("state")
+    reasons = health.get("reasons") or []
+    alertable = state in ("Critical", "Unprotected") or any(
+        str(reason).startswith("health_context_error") for reason in reasons
+    )
+    if not alertable:
+        watcher.pop("last_health_alert_key", None)
+        return None
+
+    alert_key = (
+        state,
+        health.get("bar_id"),
+        health.get("recommended_action"),
+        tuple(sorted(reasons)),
+    )
+    if watcher.get("last_health_alert_key") == alert_key:
+        return None
+    watcher["last_health_alert_key"] = alert_key
+    record = {
+        "timestamp": iso_now(),
+        "symbol": watcher["symbol"],
+        "state": state,
+        "score": health.get("score"),
+        "recommended_action": health.get("recommended_action"),
+        "bar_id": health.get("bar_id"),
+        "as_of": health.get("as_of"),
+        "reasons": reasons,
+    }
+    append_jsonl(project_root / POSITION_HEALTH_ALERT_LOG, record)
+    return record
+
+
 def position_margin_rank(position):
     try:
         total_plpc = float(position.get("unrealized_plpc", 0))
@@ -324,7 +365,9 @@ def run_margin_reducer(client, supervisor_config, project_root, clock):
     canceled_buy_order_ids = []
     for order in open_orders:
         if order.get("side") == "buy":
-            client.cancel_order(order["id"])
+            client.cancel_order(order["id"], symbol=order.get("symbol")) if hasattr(
+                client, "symbol_transaction"
+            ) else client.cancel_order(order["id"])
             canceled_buy_order_ids.append(order["id"])
 
     result = {
@@ -371,25 +414,33 @@ def run_margin_reducer(client, supervisor_config, project_root, clock):
     if qty <= 0:
         return {**result, "status": "margin_reduction_budget_below_share_price", "symbol": symbol}
 
-    canceled_sell_order_ids = []
-    for order in open_orders:
-        if order.get("symbol") == symbol and order.get("side") == "sell":
-            client.cancel_order(order["id"])
-            canceled_sell_order_ids.append(order["id"])
-
-    estimated_notional = round(qty * price, 2)
-    order = client.submit_order(
-        {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "sell",
-            "type": "market",
-            "time_in_force": "day",
-            "client_order_id": (
-                f"margin-reducer-{today.replace('-', '')}-{symbol.lower()}-{int(submitted)}"
-            ),
-        }
+    transaction = (
+        client.symbol_transaction(symbol)
+        if hasattr(client, "symbol_transaction")
+        else nullcontext()
     )
+    with transaction:
+        canceled_sell_order_ids = []
+        for order in open_orders:
+            if order.get("symbol") == symbol and order.get("side") == "sell":
+                client.cancel_order(order["id"], symbol=symbol) if hasattr(
+                    client, "symbol_transaction"
+                ) else client.cancel_order(order["id"])
+                canceled_sell_order_ids.append(order["id"])
+
+        estimated_notional = round(qty * price, 2)
+        order = client.submit_order(
+            {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": (
+                    f"margin-reducer-{today.replace('-', '')}-{symbol.lower()}-{int(submitted)}"
+                ),
+            }
+        )
     state["submitted_notional"] = round(submitted + estimated_notional, 2)
     state["last_order_id"] = order.get("id")
     state["last_symbol"] = symbol
@@ -424,7 +475,7 @@ def main():
         return 0
 
     load_env()
-    client = AlpacaClient()
+    client = ExecutionGateway(AlpacaClient())
     stop_requested = False
 
     def request_stop(signum, frame):
@@ -489,6 +540,7 @@ def main():
                 watcher = futures[future]
                 record = future.result()
                 result = record["result"]
+                record_position_health_alert(project_root, watcher, result)
                 promoted = promote_new_watcher_if_bought(
                     project_root,
                     watchers_config_path,

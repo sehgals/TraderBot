@@ -119,6 +119,44 @@ def watcher_signal_strengths(project_root, watchers_path):
     return strengths
 
 
+def unavailable_position_health(reason="health_assessment_missing"):
+    return {
+        "position_health_state": "Unavailable",
+        "position_health_score": None,
+        "position_health_action": "freeze",
+        "position_health_as_of": None,
+        "position_health_reasons": [reason],
+    }
+
+
+def report_position_health(assessment):
+    if not assessment:
+        return unavailable_position_health()
+    return {
+        "position_health_state": assessment.get("state") or "Unavailable",
+        "position_health_score": assessment.get("score"),
+        "position_health_action": assessment.get("recommended_action") or "freeze",
+        "position_health_as_of": assessment.get("as_of"),
+        "position_health_reasons": assessment.get("reasons") or [],
+        "position_health_downside_score": assessment.get("downside_score"),
+        "position_health_trend_score": assessment.get("trend_score"),
+        "position_health_reward_risk_score": assessment.get("reward_risk_score"),
+        "position_health_remaining_r": assessment.get("remaining_r"),
+        "position_health_stop_price": assessment.get("stop_price"),
+        "position_health_stop_qty": assessment.get("stop_qty"),
+        "position_health_data_fresh": assessment.get("data_fresh", False),
+        "position_health_model_version": assessment.get("model_version"),
+    }
+
+
+def watcher_position_healths(project_root, watchers_path):
+    health = {}
+    for watcher in configured_watchers(project_root, watchers_path):
+        state = load_json(watcher["state_path"], {})
+        health[watcher.get("symbol")] = report_position_health(state.get("position_health"))
+    return health
+
+
 def cash_blocked_detail(record, result):
     sizing = result.get("sizing") or {}
     plan = result.get("dynamic_plan") or {}
@@ -486,9 +524,15 @@ def build_report(project_root, watchers_path, report_date, client=None):
             sold = enrich_sold_fills_with_pl(sold, fills, start_at, end_at)
             sold = enrich_sold_fills_from_watchers(sold, project_root, watchers_path, end_at)
             positions = summarize_positions(client.positions())
-            strengths = watcher_signal_strengths(project_root, watchers_path)
+            health = watcher_position_healths(project_root, watchers_path)
             positions = [
-                {**position, **strengths.get(position.get("symbol"), signal_strength(None))}
+                {
+                    **position,
+                    **health.get(
+                        position.get("symbol"),
+                        unavailable_position_health("position_watcher_missing"),
+                    ),
+                }
                 for position in positions
             ]
         except Exception as exc:
@@ -838,9 +882,16 @@ def render_positions_table(positions):
                 signed_money(item.get("total_gain_loss")),
                 signed_percent(item.get("total_gain_loss_percent")),
                 (
-                    f'{item.get("signal_strength")} ({item.get("signal_score")}%)'
-                    if item.get("signal_score") is not None
-                    else "Unavailable"
+                    f'{item.get("position_health_state")} '
+                    f'({item.get("position_health_score")}%)'
+                    if item.get("position_health_score") is not None
+                    else item.get("position_health_state", "Unavailable")
+                ),
+                item.get("position_health_action") or "freeze",
+                (
+                    f'{float(item.get("position_health_remaining_r")):.2f}'
+                    if item.get("position_health_remaining_r") is not None
+                    else "n/a"
                 ),
                 signed_money(item.get("daily_gain_loss")),
                 signed_percent(item.get("daily_gain_loss_percent")),
@@ -855,12 +906,17 @@ def render_positions_table(positions):
             "Current",
             "Total P/L",
             "Total %",
-            "Signal Strength",
+            "Position Health",
+            "Action",
+            "Remaining R",
             "Day P/L",
             "Day %",
         ],
         rows,
-        ["left", "right", "right", "right", "right", "right", "right", "left", "right", "right"],
+        [
+            "left", "right", "right", "right", "right", "right", "right",
+            "left", "left", "right", "right", "right",
+        ],
         pad_columns=True,
         minimum_width=6,
     )
@@ -925,12 +981,12 @@ def render_markdown(report):
     lines.extend(
         [
             "",
-            "### Signal Strength Method",
-            "Signal Strength scores the latest saved technical strategy plan against 13 checks: market condition, exit-ledger eligibility, same-day loss lockout, price above EMA9, EMA9 above EMA21, EMA21 slope, chase protection, pullback volume, breakout volume, trend alignment, pullback touch, breakout confirmation, and reward/risk.",
+            "### Position Health Method",
+            "Position Health evaluates an open holding using entry-relative downside (45%), fresh holding-period trend (35%), and remaining reward/risk to the active broker stop (20%). Entry Setup scores are reserved for flat candidates and are not used as holding labels.",
             "",
-            "`Score = (13 - failed checks) / 13 × 100`. Failed checks are stored as signal blockers in the JSON report.",
+            "Hard safety rules override the weighted score: incomplete stop coverage is Unprotected, a 6% entry-relative loss requires reduction, and the broker-held 8% catastrophic stop exits the remainder.",
             "",
-            "Ratings: **Strong 85–100%**, **Moderate 65–84%**, **Weak 40–64%**, and **Very Weak below 40%**. **Unavailable** means no saved strategy plan exists. The score uses the plan timestamp recorded as `signal_as_of`; it is a technical indicator, not a prediction or guarantee.",
+            "Ratings: **Healthy 80-100**, **Stable 65-79**, **Watch 45-64**, **At Risk 25-44**, and **Critical below 25**. **Unavailable** freezes discretionary actions until fresh, complete health data is available. The score is a risk-management assessment, not a return prediction.",
         ]
     )
     lines.extend(

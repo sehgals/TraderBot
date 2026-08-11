@@ -1,16 +1,23 @@
+import datetime
 import unittest
 
 from traderbot.core_strategy_engine.engine import (
     adaptive_ladder_limit,
     adaptive_ladder_quantity,
+    adverse_reduction_details,
     apply_ladder_risk_caps,
     apply_order_risk_caps,
     cash_available_share_count,
     cash_protected_quantity,
     effective_managed_stop_price,
+    ensure_catastrophic_stop,
+    ensure_position_episode,
     initial_floor_price,
     reconcile_flat_position_state,
+    resolve_adverse_reduction_order,
     run_once,
+    submit_confirmed_health_action,
+    submit_adverse_reduction,
     trail_below_current_percent,
     update_stop_order,
 )
@@ -73,7 +80,368 @@ class FakeClient:
         return float(self._position["current_price"])
 
 
+class FakeHealthClient(FakeClient):
+    def stock_bars(self, symbol, start, end, timeframe):
+        now = datetime.datetime.now(datetime.timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
+        bars = []
+        for index in range(80):
+            close = 95 + index * (0.10 if symbol == "WAT" else 0.05)
+            bars.append(
+                {
+                    "t": (now - datetime.timedelta(hours=79 - index)).isoformat(),
+                    "o": close - 0.1,
+                    "h": close + 0.2,
+                    "l": close - 0.2,
+                    "c": close,
+                    "v": 1000 + index,
+                }
+            )
+        return bars
+
+
 class RiskControlTests(unittest.TestCase):
+    def test_managed_position_persists_fresh_position_health_snapshot(self):
+        client = FakeHealthClient(
+            position={
+                "symbol": "WAT",
+                "qty": "10",
+                "avg_entry_price": "100",
+                "current_price": "105",
+            }
+        )
+        config = {
+            "symbol": "WAT",
+            "entry_quantity": 10,
+            "initial_stop_loss_percent": 20,
+            "trail_trigger_step_percent": 5,
+            "trail_stop_below_current_percent": 2.5,
+            "ladder_buy_quantity": 0,
+            "ladder_drop_steps_percent": [],
+            "position_health": {
+                "enabled": True,
+                "shadow_mode": True,
+                "timeframe": "60Min",
+                "lookback_days": 45,
+                "refresh_seconds": 3300,
+            },
+        }
+        state = {}
+
+        result = run_once(client, config, state, clock={"is_open": True})
+
+        self.assertEqual(result["status"], "managed")
+        self.assertEqual(result["position_health"]["state"], "Healthy")
+        self.assertTrue(result["position_health"]["data_fresh"])
+        self.assertEqual(state["position_episode"]["symbol"], "WAT")
+        self.assertEqual(state["position_health"]["model_version"], "health-v1")
+
+    def test_first_fill_creates_position_episode_and_preserves_setup(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "4",
+            "avg_entry_price": "400",
+            "current_price": "401",
+        }
+        state = {
+            "current_entry_order_id": "entry-1",
+            "dynamic_entry_plan": {
+                "status": "active_signal",
+                "mode": "dynamic_breakout_continuation",
+                "last_bar_time": "2026-08-11T15:55:00Z",
+                "atr14": 4,
+                "breakout_limit": 400,
+                "blockers": ["no_chase"],
+            },
+        }
+
+        episode = ensure_position_episode(
+            {"symbol": "WAT"},
+            state,
+            position,
+            entry_order={"id": "entry-1", "status": "partially_filled"},
+        )
+
+        self.assertEqual(episode["state"], "OPEN_PARTIAL")
+        self.assertEqual(episode["entry_setup_score"], 92)
+        self.assertEqual(episode["original_target_price"], 408)
+        self.assertEqual(state["managed_entry_order_id"], "entry-1")
+
+    def test_health_action_is_inert_in_shadow_mode(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "10",
+                "avg_entry_price": "400",
+                "current_price": "390",
+            }
+        )
+        state = {
+            "position_health_confirmation": {"action": "reduce", "count": 2},
+            "position_episode": {"episode_id": "episode-1"},
+        }
+
+        result = submit_confirmed_health_action(
+            client,
+            {"symbol": "WAT", "position_health": {"shadow_mode": True}},
+            state,
+            client._position,
+            {"recommended_action": "reduce", "score": 30, "state": "At Risk"},
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.submitted, [])
+
+    def test_confirmed_health_reduction_submits_once_when_enabled(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "10",
+                "avg_entry_price": "400",
+                "current_price": "390",
+            },
+            orders=[
+                {
+                    "id": "stop-1",
+                    "symbol": "WAT",
+                    "side": "sell",
+                    "type": "stop",
+                    "status": "new",
+                    "qty": "10",
+                    "stop_price": "368",
+                }
+            ],
+        )
+        state = {
+            "active_stop_order_id": "stop-1",
+            "position_health_confirmation": {"action": "reduce", "count": 2},
+            "position_episode": {"episode_id": "episode-1", "state_version": 1},
+        }
+
+        result = submit_confirmed_health_action(
+            client,
+            {
+                "symbol": "WAT",
+                "position_health": {
+                    "shadow_mode": False,
+                    "reduction_confirmation_bars": 2,
+                },
+            },
+            state,
+            client._position,
+            {"recommended_action": "reduce", "score": 30, "state": "At Risk"},
+        )
+
+        self.assertEqual(result["status"], "position_health_reduce_order_submitted")
+        self.assertEqual(result["qty"], 5)
+        self.assertEqual(client.canceled, ["stop-1"])
+        self.assertEqual(client.submitted[0]["side"], "sell")
+        self.assertEqual(client.submitted[0]["client_order_id"].split("-")[1], "health")
+
+    def test_adverse_reduction_sells_half_once_at_six_percent_loss(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "11",
+            "avg_entry_price": "400",
+            "current_price": "375",
+        }
+        client = FakeClient(
+            position=position,
+            orders=[
+                {
+                    "id": "protective-stop",
+                    "symbol": "WAT",
+                    "side": "sell",
+                    "type": "stop",
+                    "status": "new",
+                    "qty": "11",
+                    "stop_price": "368",
+                }
+            ],
+        )
+        state = {
+            "active_stop_order_id": "protective-stop",
+            "active_stop_price": "368.00",
+            "active_stop_qty": 11,
+        }
+
+        result = submit_adverse_reduction(client, {"symbol": "WAT"}, position, 375, state)
+
+        self.assertEqual(result["status"], "adverse_reduction_order_submitted")
+        self.assertEqual(result["trigger_price"], 376)
+        self.assertEqual(result["qty"], 6)
+        self.assertEqual(client.canceled, ["protective-stop"])
+        self.assertEqual(client.submitted[0]["side"], "sell")
+        self.assertEqual(client.submitted[0]["type"], "market")
+        self.assertEqual(client.submitted[0]["qty"], "6")
+        self.assertNotIn("active_stop_order_id", state)
+
+    def test_adverse_reduction_does_not_trigger_above_threshold(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "10",
+            "avg_entry_price": "400",
+            "current_price": "377",
+        }
+        client = FakeClient(position=position)
+
+        result = submit_adverse_reduction(client, {"symbol": "WAT"}, position, 377, {})
+
+        self.assertIsNone(result)
+        self.assertEqual(client.submitted, [])
+
+    def test_adverse_reduction_pending_order_is_not_duplicated(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "reduce-1",
+                    "symbol": "WAT",
+                    "side": "sell",
+                    "type": "market",
+                    "status": "accepted",
+                    "qty": "5",
+                }
+            ]
+        )
+        state = {"adverse_reduction_order_id": "reduce-1"}
+
+        result = resolve_adverse_reduction_order(client, state)
+
+        self.assertEqual(result["status"], "adverse_reduction_order_pending")
+        self.assertEqual(state["adverse_reduction_order_id"], "reduce-1")
+
+    def test_filled_adverse_reduction_sets_one_time_lockout(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "reduce-1",
+                    "symbol": "WAT",
+                    "side": "sell",
+                    "type": "market",
+                    "status": "filled",
+                    "qty": "5",
+                    "filled_qty": "5",
+                    "filled_avg_price": "375",
+                }
+            ]
+        )
+        state = {"adverse_reduction_order_id": "reduce-1"}
+
+        result = resolve_adverse_reduction_order(client, state)
+
+        self.assertEqual(result["status"], "adverse_reduction_filled")
+        self.assertTrue(state["adverse_reduction_completed"])
+        self.assertNotIn("adverse_reduction_order_id", state)
+
+    def test_adverse_reduction_configuration_validation(self):
+        with self.assertRaises(ValueError):
+            adverse_reduction_details(
+                {"adverse_reduction_trigger_percent": 0}, 100, 10
+            )
+        with self.assertRaises(ValueError):
+            adverse_reduction_details(
+                {"adverse_reduction_fraction": 1.1}, 100, 10
+            )
+
+    def test_partial_entry_fill_gets_immediate_broker_stop(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "4",
+                "avg_entry_price": "400",
+                "current_price": "399",
+            },
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "partially_filled",
+                    "qty": "12",
+                    "filled_qty": "4",
+                    "filled_avg_price": "400",
+                }
+            ],
+        )
+        config = {"symbol": "WAT", "catastrophic_stop_loss_percent": 8}
+        state = {"current_entry_order_id": "entry-1"}
+
+        result = run_once(client, config, state, clock={"is_open": True})
+
+        self.assertEqual(result["status"], "waiting_for_entry_fill")
+        self.assertEqual(result["catastrophic_stop"]["stop_price"], "368.00")
+        self.assertEqual(client.submitted[0]["side"], "sell")
+        self.assertEqual(client.submitted[0]["type"], "stop")
+        self.assertEqual(client.submitted[0]["qty"], "4")
+
+    def test_catastrophic_stop_adopts_existing_tighter_stop(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "4",
+                "avg_entry_price": "400",
+                "current_price": "410",
+            },
+            orders=[
+                {
+                    "id": "existing-stop",
+                    "symbol": "WAT",
+                    "side": "sell",
+                    "type": "stop",
+                    "status": "new",
+                    "qty": "4",
+                    "stop_price": "390.00",
+                }
+            ],
+        )
+        state = {}
+
+        result = ensure_catastrophic_stop(client, {"symbol": "WAT"}, client._position, state)
+
+        self.assertFalse(result["created"])
+        self.assertEqual(result["order_id"], "existing-stop")
+        self.assertEqual(client.submitted, [])
+        self.assertEqual(state["active_stop_price"], "390.00")
+
+    def test_catastrophic_stop_uses_current_price_fallback_after_gap(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "4",
+                "avg_entry_price": "400",
+                "current_price": "350",
+            }
+        )
+
+        result = ensure_catastrophic_stop(client, {"symbol": "WAT"}, client._position, {})
+
+        self.assertEqual(result["stop_price"], "341.25")
+        self.assertEqual(client.submitted[0]["stop_price"], "341.25")
+
+    def test_restart_while_market_closed_restores_missing_stop(self):
+        client = FakeClient(
+            position={
+                "symbol": "WAT",
+                "qty": "4",
+                "avg_entry_price": "400",
+                "current_price": "399",
+            }
+        )
+        config = {"symbol": "WAT", "catastrophic_stop_loss_percent": 8}
+
+        result = run_once(
+            client,
+            config,
+            {},
+            clock={"is_open": False, "timestamp": "now", "next_open": "later"},
+        )
+
+        self.assertEqual(result["status"], "market_closed_sleeping")
+        self.assertEqual(result["catastrophic_stop"]["stop_price"], "368.00")
+        self.assertEqual(client.submitted[0]["type"], "stop")
+
     def test_flat_position_cancels_open_stops(self):
         client = FakeClient(
             position=None,
@@ -96,6 +464,26 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(client.canceled, ["stop-1"])
         self.assertEqual(result["canceled_stop_order_ids"], ["stop-1"])
         self.assertNotIn("active_stop_order_id", state)
+
+    def test_flat_reconciliation_archives_closed_position_episode(self):
+        client = FakeClient(position=None)
+        state = {
+            "position_episode": {
+                "episode_id": "episode-1",
+                "symbol": "WAT",
+                "state": "OPEN",
+            },
+            "position_health": {"score": 42, "state": "At Risk"},
+        }
+
+        reconcile_flat_position_state(client, "WAT", state)
+
+        self.assertNotIn("position_episode", state)
+        self.assertEqual(len(state["closed_position_episodes"]), 1)
+        archived = state["closed_position_episodes"][0]
+        self.assertEqual(archived["episode_id"], "episode-1")
+        self.assertEqual(archived["state"], "CLOSED")
+        self.assertEqual(archived["final_health"]["score"], 42)
 
     def test_flat_reconciliation_preserves_untracked_open_buy_order(self):
         client = FakeClient(
@@ -173,6 +561,7 @@ class RiskControlTests(unittest.TestCase):
             "symbol": "GFS",
             "entry_quantity": 1,
             "initial_stop_loss_percent": 20,
+            "adverse_reduction_trigger_percent": 40,
             "trail_trigger_step_percent": 5,
             "trail_stop_below_current_percent": 2.5,
             "ladder_buy_quantity": 0,
@@ -194,7 +583,7 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(client.submitted[0]["stop_price"], "44.85")
         self.assertEqual(state["active_stop_qty"], 10)
         self.assertTrue(result["recovery_stop_active"])
-        self.assertAlmostEqual(result["planned_floor_price"], 53.456)
+        self.assertAlmostEqual(result["planned_floor_price"], 61.4744)
         self.assertEqual(result["effective_stop_price"], 44.85)
 
     def test_recovery_stop_ratchets_up_but_not_down(self):

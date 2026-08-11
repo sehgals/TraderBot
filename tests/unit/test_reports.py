@@ -183,12 +183,42 @@ def test_signal_strength_uses_strategy_blockers():
     assert weak["signal_strength"] == "Weak"
 
 
-def test_report_explains_signal_strength_method():
+def test_report_explains_position_health_method():
     markdown = render_markdown({"report_date": "2026-07-10", "current_positions": []})
 
-    assert "### Signal Strength Method" in markdown
-    assert "13 checks" in markdown
-    assert "technical indicator, not a prediction or guarantee" in markdown
+    assert "### Position Health Method" in markdown
+    assert "entry-relative downside (45%)" in markdown
+    assert "Entry Setup scores are reserved for flat candidates" in markdown
+    assert "risk-management assessment, not a return prediction" in markdown
+
+
+def test_positions_table_uses_position_health_not_entry_signal():
+    table = render_positions_table(
+        [
+            {
+                "symbol": "WAT",
+                "qty": 4,
+                "market_value": 1640,
+                "avg_entry_price": 400,
+                "current_price": 410,
+                "total_gain_loss": 40,
+                "total_gain_loss_percent": 2.5,
+                "position_health_state": "Healthy",
+                "position_health_score": 88,
+                "position_health_action": "hold",
+                "position_health_remaining_r": 1.75,
+                "signal_strength": "Weak",
+                "signal_score": 40,
+            }
+        ]
+    )
+    rendered = "\n".join(table)
+
+    assert "Position Health" in rendered
+    assert "Healthy (88%)" in rendered
+    assert "1.75" in rendered
+    assert "Signal Strength" not in rendered
+    assert "Weak (40%)" not in rendered
 
 
 def test_sold_fill_uses_latest_watcher_entry_price(tmp_path):

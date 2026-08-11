@@ -134,13 +134,19 @@ pythonw.exe -m traderbot.cli.supervisor --config C:\Users\Admin\Documents\Trader
 
 Managed strategies support:
 
-- Initial floor stop below entry.
+- Broker-held 8% catastrophic protection for every filled share.
+- One-time 50% adverse reduction at a 6% entry-relative loss.
 - Trailing floor that only moves upward.
 - Optional DCA ladder buys.
 - Dynamic ledger-aware reentry after exits.
 - Dynamic market-action-only entries for new candidate symbols.
+- Shadow-mode Position Health assessments using downside state, 60-minute trend, and remaining reward/risk.
 
 Dynamic plans write `dynamic_entry_plan` into strategy state with pullback/breakout levels, price-action context, ledger caps, and blockers.
+
+The first fill creates a position episode and transfers decision authority from Entry Setup to Position Health. Daily reports use Position Health for open holdings; cached entry scores are retained only for entry attribution. Score-driven reductions and exits remain disabled while `position_health.shadow_mode` is `true`.
+
+See [Position Health and Trade Lifecycle Architecture](docs/position_health_design.md) for component ownership, state transitions, scoring, execution safety, tests, and rollout criteria.
 
 ## Backtesting
 

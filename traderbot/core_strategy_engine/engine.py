@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -9,12 +10,18 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import nullcontext
+
+from traderbot.core_strategy_engine.position_health import evaluate_position_health
 
 
 DEFAULT_CONFIG_PATH = "traderbot/core_strategy_engine/strategies/configs/strategy_config.json"
 DEFAULT_STATE_PATH = "runtime/state/strategy_state.json"
 MARKET_SYMBOL = "QQQ"
 DEFAULT_MIN_CASH_BALANCE_PERCENT = 20
+DEFAULT_CATASTROPHIC_STOP_LOSS_PERCENT = 8
+DEFAULT_ADVERSE_REDUCTION_TRIGGER_PERCENT = 6
+DEFAULT_ADVERSE_REDUCTION_FRACTION = 0.5
 MAX_ENTRY_CLOCK_AGE_SECONDS = 30
 RISK_PROFILE_DEFAULTS = {
     "index_etf": {
@@ -168,6 +175,15 @@ class AlpacaClient:
     def order(self, order_id):
         return self.trading("GET", f"/orders/{order_id}")
 
+    def order_by_client_order_id(self, client_order_id):
+        query = urllib.parse.urlencode({"client_order_id": client_order_id})
+        try:
+            return self.trading("GET", f"/orders:by_client_order_id?{query}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
     def clock(self):
         return self.trading("GET", "/clock")
 
@@ -309,6 +325,17 @@ class AlpacaClient:
 
 def dollars(value):
     return f"{value:.2f}"
+
+
+def action_client_order_id(prefix, symbol, episode_id, sequence=1):
+    digest = hashlib.sha256(str(episode_id).encode("utf-8")).hexdigest()[:12]
+    return f"tb-{prefix}-{str(symbol).lower()}-{digest}-{int(sequence)}"[:48]
+
+
+def cancel_symbol_order(client, order_id, symbol):
+    if hasattr(client, "symbol_transaction"):
+        return client.cancel_order(order_id, symbol=symbol)
+    return client.cancel_order(order_id)
 
 
 def dynamic_entry_notional(config, plan):
@@ -929,6 +956,14 @@ def reset_managed_position_state(state):
         "ladder_filled_qty",
         "ladder_filled_notional",
         "ladder_order_ids",
+        "adverse_reduction_order_id",
+        "adverse_reduction_completed",
+        "adverse_reduction_qty",
+        "adverse_reduction_trigger_price",
+        "position_episode",
+        "position_health",
+        "position_health_last_evaluated_at",
+        "position_health_confirmation",
     ):
         state.pop(key, None)
 
@@ -1066,7 +1101,7 @@ def reconcile_flat_position_state(client, symbol, state):
                 raise
 
     if order_is_open(active_stop_order):
-        client.cancel_order(active_stop_id)
+        cancel_symbol_order(client, active_stop_id, symbol)
         canceled_stop_order_ids = [active_stop_id]
     else:
         canceled_stop_order_ids = []
@@ -1075,7 +1110,7 @@ def reconcile_flat_position_state(client, symbol, state):
     for order in client.open_stop_orders(symbol):
         if order["id"] in canceled_stop_order_ids:
             continue
-        client.cancel_order(order["id"])
+        cancel_symbol_order(client, order["id"], symbol)
         canceled_stop_order_ids.append(order["id"])
 
     had_managed_state = any(
@@ -1088,6 +1123,21 @@ def reconcile_flat_position_state(client, symbol, state):
             "floor_price",
         )
     )
+    episode = state.get("position_episode")
+    if episode:
+        closed_episode = {
+            **episode,
+            "state": "CLOSED",
+            "closed_at": (exit_details or {}).get("last_exit_at")
+            or iso_utc(datetime.datetime.now(datetime.timezone.utc)),
+            "exit_order_id": (exit_details or {}).get("last_exit_order_id"),
+            "exit_price": (exit_details or {}).get("last_exit_price"),
+            "final_health": state.get("position_health"),
+        }
+        history = list(state.get("closed_position_episodes") or [])
+        if not any(item.get("episode_id") == closed_episode.get("episode_id") for item in history):
+            history.append(closed_episode)
+        state["closed_position_episodes"] = history[-50:]
     reset_managed_position_state(state)
     open_buy_orders = track_existing_open_buy_order(client, symbol, state)
     if not open_buy_orders:
@@ -1118,7 +1168,7 @@ def update_stop_order(client, symbol, qty, stop_price, state):
     ):
         for order in open_stop_orders:
             if order.get("id") != active_stop_id:
-                client.cancel_order(order["id"])
+                cancel_symbol_order(client, order["id"], symbol)
         return None
 
     if active_stop_id:
@@ -1136,14 +1186,14 @@ def update_stop_order(client, symbol, qty, stop_price, state):
             state["active_stop_qty"] = qty
             for open_order in open_stop_orders:
                 if open_order.get("id") != active_stop_id:
-                    client.cancel_order(open_order["id"])
+                    cancel_symbol_order(client, open_order["id"], symbol)
             return order
         except urllib.error.HTTPError as exc:
             if exc.code not in (404, 422):
                 raise
 
     for order in open_stop_orders:
-        client.cancel_order(order["id"])
+        cancel_symbol_order(client, order["id"], symbol)
 
     order = client.submit_order(
         {
@@ -1159,6 +1209,498 @@ def update_stop_order(client, symbol, qty, stop_price, state):
     state["active_stop_price"] = rounded_stop
     state["active_stop_qty"] = qty
     return order
+
+
+def ensure_catastrophic_stop(client, config, position, state):
+    """Keep every live long position covered by a broker-held stop order.
+
+    This runs before entry-order status handling so shares from a partial fill are
+    protected instead of waiting for the complete entry order to fill.  A stop
+    already at or above the catastrophic floor is retained and adopted into
+    state, allowing the normal managed-stop logic to tighten it later.
+    """
+    qty = position_quantity(position)
+    if qty <= 0:
+        return None
+
+    entry_price = float(position["avg_entry_price"])
+    catastrophic_floor = catastrophic_floor_price(config, entry_price)
+    current_price = float(position.get("current_price") or entry_price)
+    # A sell stop cannot safely be submitted above the current market.  On a
+    # restart after a gap, place it just below the observed price immediately.
+    valid_floor = min(catastrophic_floor, current_price * 0.975)
+    rounded_floor = dollars(valid_floor)
+    open_stops = client.open_stop_orders(config["symbol"])
+    adequate = [
+        order
+        for order in open_stops
+        if int(float(order.get("qty") or 0)) == qty
+        and float(order.get("stop_price") or 0) >= float(rounded_floor)
+    ]
+    if adequate:
+        selected = max(adequate, key=lambda order: float(order.get("stop_price") or 0))
+        state["active_stop_order_id"] = selected["id"]
+        state["active_stop_price"] = dollars(float(selected["stop_price"]))
+        state["active_stop_qty"] = qty
+        update_stop_order(
+            client,
+            config["symbol"],
+            qty,
+            float(selected["stop_price"]),
+            state,
+        )
+        return {
+            "order_id": selected["id"],
+            "stop_price": state["active_stop_price"],
+            "qty": qty,
+            "created": False,
+        }
+
+    order = update_stop_order(
+        client,
+        config["symbol"],
+        qty,
+        valid_floor,
+        state,
+    )
+    return {
+        "order_id": state["active_stop_order_id"],
+        "stop_price": state["active_stop_price"],
+        "qty": qty,
+        "created": order is not None,
+    }
+
+
+def catastrophic_floor_price(config, entry_price):
+    loss_percent = float(
+        risk_setting(
+            config,
+            "catastrophic_stop_loss_percent",
+            DEFAULT_CATASTROPHIC_STOP_LOSS_PERCENT,
+        )
+    )
+    if not 0 < loss_percent < 100:
+        raise ValueError("catastrophic_stop_loss_percent must be between 0 and 100")
+    return entry_price * (1 - loss_percent / 100)
+
+
+def adverse_reduction_details(config, entry_price, qty):
+    trigger_percent = float(
+        risk_setting(
+            config,
+            "adverse_reduction_trigger_percent",
+            DEFAULT_ADVERSE_REDUCTION_TRIGGER_PERCENT,
+        )
+    )
+    fraction = float(
+        risk_setting(
+            config,
+            "adverse_reduction_fraction",
+            DEFAULT_ADVERSE_REDUCTION_FRACTION,
+        )
+    )
+    if not 0 < trigger_percent < 100:
+        raise ValueError("adverse_reduction_trigger_percent must be between 0 and 100")
+    if not 0 < fraction <= 1:
+        raise ValueError("adverse_reduction_fraction must be greater than 0 and at most 1")
+    return {
+        "trigger_percent": trigger_percent,
+        "trigger_price": entry_price * (1 - trigger_percent / 100),
+        "qty": min(qty, max(1, math.ceil(qty * fraction))),
+        "fraction": fraction,
+    }
+
+
+def submit_adverse_reduction(client, config, position, current_price, state):
+    if state.get("adverse_reduction_completed"):
+        return None
+
+    qty = position_quantity(position)
+    if qty <= 0:
+        return None
+    entry_price = float(position["avg_entry_price"])
+    details = adverse_reduction_details(config, entry_price, qty)
+    if current_price > details["trigger_price"]:
+        return None
+
+    transaction = (
+        client.symbol_transaction(config["symbol"])
+        if hasattr(client, "symbol_transaction")
+        else nullcontext()
+    )
+    with transaction:
+        canceled_stop_order_ids = []
+        for order in client.open_stop_orders(config["symbol"]):
+            cancel_symbol_order(client, order["id"], config["symbol"])
+            canceled_stop_order_ids.append(order["id"])
+        for key in ("active_stop_order_id", "active_stop_price", "active_stop_qty"):
+            state.pop(key, None)
+
+        order = client.submit_order(
+            {
+                "symbol": config["symbol"],
+                "qty": str(details["qty"]),
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": action_client_order_id(
+                    "hard-reduce",
+                    config["symbol"],
+                    (state.get("position_episode") or {}).get("episode_id", config["symbol"]),
+                ),
+            }
+        )
+    state["adverse_reduction_order_id"] = order["id"]
+    state["adverse_reduction_qty"] = details["qty"]
+    state["adverse_reduction_trigger_price"] = details["trigger_price"]
+    return {
+        "status": "adverse_reduction_order_submitted",
+        "order_id": order["id"],
+        "qty": details["qty"],
+        "position_qty": qty,
+        "current_price": current_price,
+        **details,
+        "canceled_stop_order_ids": canceled_stop_order_ids,
+    }
+
+
+def resolve_adverse_reduction_order(client, state):
+    order_id = state.get("adverse_reduction_order_id")
+    if not order_id:
+        return None
+    order = client.order(order_id)
+    if order_is_open(order):
+        return {
+            "status": "adverse_reduction_order_pending",
+            "order_id": order_id,
+            "order_status": order.get("status"),
+        }
+    state.pop("adverse_reduction_order_id", None)
+    if order.get("status") == "filled":
+        state["adverse_reduction_completed"] = True
+        return {
+            "status": "adverse_reduction_filled",
+            "order_id": order_id,
+            "filled_qty": order.get("filled_qty") or order.get("qty"),
+            "filled_avg_price": order.get("filled_avg_price"),
+        }
+    return {
+        "status": "adverse_reduction_not_filled",
+        "order_id": order_id,
+        "order_status": order.get("status"),
+    }
+
+
+def position_health_config(config):
+    nested = dict(config.get("position_health") or {})
+    for key in (
+        "catastrophic_stop_loss_percent",
+        "adverse_reduction_trigger_percent",
+    ):
+        if key in config and key not in nested:
+            nested[key] = config[key]
+    if "adverse_reduction_trigger_percent" in nested:
+        nested.setdefault(
+            "hard_reduction_loss_percent",
+            nested["adverse_reduction_trigger_percent"],
+        )
+    nested.setdefault("enabled", True)
+    nested.setdefault("shadow_mode", True)
+    nested.setdefault("timeframe", "60Min")
+    nested.setdefault("lookback_days", 45)
+    nested.setdefault("refresh_seconds", 3300)
+    nested.setdefault("reduction_confirmation_bars", 2)
+    nested.setdefault("exit_confirmation_bars", 2)
+    nested.setdefault("health_reduction_fraction", 0.5)
+    nested.setdefault("minimum_add_health_score", 80)
+    nested.setdefault("minimum_add_setup_score", 85)
+    nested.setdefault("minimum_add_remaining_r", 1.5)
+    nested.setdefault("max_adds_per_episode", 1)
+    nested.setdefault("max_add_fraction_of_initial_qty", 0.5)
+    return nested
+
+
+def timeframe_minutes(timeframe):
+    value = str(timeframe or "60Min").strip().lower()
+    if value.endswith("min"):
+        return max(1, int(value[:-3]))
+    if value.endswith("hour"):
+        return max(1, int(value[:-4])) * 60
+    if value.endswith("day"):
+        return max(1, int(value[:-3])) * 1440
+    raise ValueError(f"unsupported position health timeframe: {timeframe}")
+
+
+def entry_setup_score(plan):
+    if not plan:
+        return None
+    blockers = set(plan.get("blockers") or [])
+    return round(max(0, 13 - len(blockers)) / 13 * 100)
+
+
+def initial_entry_target(config, state, entry_price):
+    plan = state.get("dynamic_entry_plan") or {}
+    atr = float(plan.get("atr14") or 0)
+    if plan.get("mode") == "dynamic_breakout_continuation":
+        target = float(plan.get("breakout_limit") or entry_price) + 2 * atr
+        source = "entry_breakout_plus_2atr"
+    else:
+        target = float(plan.get("breakout_trigger") or 0)
+        source = "entry_recent_high"
+    if target <= entry_price:
+        risk_percent = float(
+            risk_setting(
+                config,
+                "catastrophic_stop_loss_percent",
+                DEFAULT_CATASTROPHIC_STOP_LOSS_PERCENT,
+            )
+        )
+        target = entry_price * (1 + 1.5 * risk_percent / 100)
+        source = "reconstructed_1_5r_target"
+    return target, source
+
+
+def ensure_position_episode(config, state, position, entry_order=None):
+    qty = position_quantity(position)
+    if qty <= 0:
+        return None
+    entry_price = float(position.get("avg_entry_price") or 0)
+    episode = state.get("position_episode")
+    if episode and episode.get("symbol") == config["symbol"]:
+        episode["current_qty"] = qty
+        episode["average_entry_price"] = entry_price
+        return episode
+
+    target_price, target_source = initial_entry_target(config, state, entry_price)
+    opened_at = (
+        (entry_order or {}).get("filled_at")
+        or (entry_order or {}).get("created_at")
+        or iso_utc(datetime.datetime.now(datetime.timezone.utc))
+    )
+    entry_order_id = (entry_order or {}).get("id") or state.get("current_entry_order_id")
+    episode_id = f"{config['symbol']}:{entry_order_id or opened_at}"
+    plan = state.get("dynamic_entry_plan") or {}
+    episode = {
+        "episode_id": episode_id,
+        "symbol": config["symbol"],
+        "state": "OPEN_PARTIAL"
+        if (entry_order or {}).get("status") == "partially_filled"
+        else "OPEN",
+        "state_version": 1,
+        "opened_at": opened_at,
+        "entry_order_id": entry_order_id,
+        "entry_setup_score": entry_setup_score(plan),
+        "entry_setup_status": plan.get("status"),
+        "entry_setup_mode": plan.get("mode"),
+        "entry_setup_as_of": plan.get("last_bar_time"),
+        "original_target_price": target_price,
+        "target_source": target_source,
+        "initial_qty": qty,
+        "current_qty": qty,
+        "average_entry_price": entry_price,
+        "add_count": 0,
+        "adverse_reduction_completed": bool(state.get("adverse_reduction_completed")),
+    }
+    state["position_episode"] = episode
+    if entry_order_id:
+        state["managed_entry_order_id"] = entry_order_id
+    return episode
+
+
+def position_health_market_context(client, config):
+    settings = position_health_config(config)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = iso_utc(now - datetime.timedelta(days=int(settings["lookback_days"])))
+    end = iso_utc(now)
+    timeframe = settings["timeframe"]
+    bars = calculate_indicators(client.stock_bars(config["symbol"], start, end, timeframe))
+    market_bars = calculate_indicators(client.stock_bars(MARKET_SYMBOL, start, end, timeframe))
+    if len(bars) < 51 or len(market_bars) < 51:
+        return {
+            "as_of": bars[-1]["t"].isoformat() if bars else None,
+            "bar_id": None,
+            "timeframe_minutes": timeframe_minutes(timeframe),
+            "latest_bar": None,
+            "relative_strength_5d": None,
+            "market_ok": None,
+        }
+
+    latest = dict(bars[-1])
+    prior_slope = bars[-6]
+    latest["ema21_slope"] = (
+        (latest["ema21"] - prior_slope["ema21"]) / prior_slope["ema21"]
+        if prior_slope["ema21"]
+        else 0
+    )
+    bars_per_day = max(1, round(390 / timeframe_minutes(timeframe)))
+    relative_lookback = min(len(bars) - 1, len(market_bars) - 1, bars_per_day * 5)
+    stock_return = bars[-1]["c"] / bars[-1 - relative_lookback]["c"] - 1
+    market_return = market_bars[-1]["c"] / market_bars[-1 - relative_lookback]["c"] - 1
+    as_of = latest["t"].isoformat()
+    return {
+        "as_of": as_of,
+        "bar_id": f"{config['symbol']}:{timeframe}:{as_of}",
+        "timeframe_minutes": timeframe_minutes(timeframe),
+        "latest_bar": latest,
+        "relative_strength_5d": stock_return - market_return,
+        "market_ok": market_ok_at(market_bars, latest["t"]),
+    }
+
+
+def health_refresh_due(state, settings, now=None):
+    previous = parse_alpaca_time(state.get("position_health_last_evaluated_at"))
+    if previous is None or not state.get("position_health"):
+        return True
+    checked_at = now or datetime.datetime.now(datetime.timezone.utc)
+    return (checked_at - previous).total_seconds() >= int(settings["refresh_seconds"])
+
+
+def refresh_position_health(client, config, state, position, force=False):
+    settings = position_health_config(config)
+    if not settings.get("enabled", True):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if not force and not health_refresh_due(state, settings, now=now):
+        return state.get("position_health")
+
+    episode = ensure_position_episode(config, state, position)
+    protection = {
+        "stop_price": state.get("active_stop_price"),
+        "stop_qty": state.get("active_stop_qty", 0),
+    }
+    try:
+        context = position_health_market_context(client, config)
+        if episode.get("target_source") == "reconstructed_1_5r_target":
+            latest_bar = context.get("latest_bar") or {}
+            atr = float(latest_bar.get("atr14") or 0)
+            if atr > 0:
+                entry_price = float(episode["average_entry_price"])
+                episode["original_target_price"] = entry_price + 2 * atr
+                episode["target_source"] = "reconstructed_current_2atr"
+        assessment = evaluate_position_health(
+            position,
+            episode,
+            context,
+            protection,
+            settings,
+            now=now,
+        )
+    except Exception as exc:
+        assessment = evaluate_position_health(
+            position,
+            episode,
+            {},
+            protection,
+            settings,
+            now=now,
+        )
+        assessment["reasons"] = sorted(
+            set(assessment.get("reasons", []))
+            | {f"health_context_error:{type(exc).__name__}"}
+        )
+
+    previous = state.get("position_health") or {}
+    confirmation = state.get("position_health_confirmation") or {}
+    if assessment.get("bar_id") and assessment.get("bar_id") != previous.get("bar_id"):
+        action = assessment.get("recommended_action")
+        if action in ("reduce", "exit"):
+            count = confirmation.get("count", 0) + 1 if confirmation.get("action") == action else 1
+            state["position_health_confirmation"] = {
+                "action": action,
+                "count": count,
+                "last_bar_id": assessment["bar_id"],
+            }
+        else:
+            state["position_health_confirmation"] = {
+                "action": action,
+                "count": 0,
+                "last_bar_id": assessment["bar_id"],
+            }
+    state["position_health"] = assessment
+    state["position_health_last_evaluated_at"] = iso_utc(now)
+    episode["current_qty"] = position_quantity(position)
+    episode["average_entry_price"] = float(position.get("avg_entry_price") or 0)
+    episode["latest_health_state"] = assessment.get("state")
+    episode["latest_health_score"] = assessment.get("score")
+    return assessment
+
+
+def submit_confirmed_health_action(client, config, state, position, health):
+    settings = position_health_config(config)
+    if settings.get("shadow_mode", True) or not health:
+        return None
+    action = health.get("recommended_action")
+    if action not in ("reduce", "exit"):
+        return None
+    if action == "reduce" and state.get("adverse_reduction_completed"):
+        return None
+
+    confirmation = state.get("position_health_confirmation") or {}
+    required = int(
+        settings[
+            "exit_confirmation_bars"
+            if action == "exit"
+            else "reduction_confirmation_bars"
+        ]
+    )
+    if confirmation.get("action") != action or int(confirmation.get("count", 0)) < required:
+        return None
+
+    position_qty = position_quantity(position)
+    if position_qty <= 0:
+        return None
+    if action == "exit":
+        action_qty = position_qty
+    else:
+        fraction = float(settings["health_reduction_fraction"])
+        if not 0 < fraction <= 1:
+            raise ValueError("health_reduction_fraction must be greater than 0 and at most 1")
+        action_qty = min(position_qty, max(1, math.ceil(position_qty * fraction)))
+
+    transaction = (
+        client.symbol_transaction(config["symbol"])
+        if hasattr(client, "symbol_transaction")
+        else nullcontext()
+    )
+    with transaction:
+        canceled_stop_order_ids = []
+        for order in client.open_stop_orders(config["symbol"]):
+            cancel_symbol_order(client, order["id"], config["symbol"])
+            canceled_stop_order_ids.append(order["id"])
+        for key in ("active_stop_order_id", "active_stop_price", "active_stop_qty"):
+            state.pop(key, None)
+
+        order = client.submit_order(
+            {
+                "symbol": config["symbol"],
+                "qty": str(action_qty),
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": action_client_order_id(
+                    f"health-{action}",
+                    config["symbol"],
+                    (state.get("position_episode") or {}).get("episode_id", config["symbol"]),
+                ),
+            }
+        )
+    state["adverse_reduction_order_id"] = order["id"]
+    state["adverse_reduction_qty"] = action_qty
+    state["position_health_action_reason"] = f"health_{action}"
+    episode = state.get("position_episode") or {}
+    episode["state"] = "EXIT_PENDING" if action == "exit" else "REDUCE_PENDING"
+    episode["state_version"] = int(episode.get("state_version", 0)) + 1
+    return {
+        "status": f"position_health_{action}_order_submitted",
+        "order_id": order["id"],
+        "qty": action_qty,
+        "position_qty": position_qty,
+        "health_score": health.get("score"),
+        "health_state": health.get("state"),
+        "confirmation_bars": confirmation.get("count"),
+        "canceled_stop_order_ids": canceled_stop_order_ids,
+        "position_health": health,
+    }
 
 
 def update_dynamic_pending_order(client, config, state, order_id, plan):
@@ -1184,7 +1726,7 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                 client, config, desired_qty, float(desired_limit), current_qty=0
             )
             if desired_qty <= 0:
-                client.cancel_order(order_id)
+                cancel_symbol_order(client, order_id, config["symbol"])
                 state.pop("reentry_order_id", None)
                 state.pop("current_entry_order_id", None)
                 return {
@@ -1200,7 +1742,7 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                 client, config, desired_qty, float(desired_limit)
             )
             if adjusted_qty <= 0:
-                client.cancel_order(order_id)
+                cancel_symbol_order(client, order_id, config["symbol"])
                 state.pop("reentry_order_id", None)
                 state.pop("current_entry_order_id", None)
                 return {
@@ -1612,6 +2154,28 @@ def handle_reentry(client, config, state):
 
 def run_once(client, config, state, clock=None):
     symbol = config["symbol"]
+    reduction_resolution = resolve_adverse_reduction_order(client, state)
+    if (
+        reduction_resolution
+        and reduction_resolution["status"] == "adverse_reduction_order_pending"
+    ):
+        return reduction_resolution
+    if reduction_resolution and reduction_resolution["status"] == "adverse_reduction_filled":
+        episode = state.get("position_episode") or {}
+        episode["state"] = (
+            "CLOSED"
+            if state.get("position_health_action_reason") == "health_exit"
+            else "REDUCED"
+        )
+        episode["state_version"] = int(episode.get("state_version", 0)) + 1
+
+    position = client.position(symbol)
+    qty = position_quantity(position)
+    catastrophic_stop = None
+    if qty > 0:
+        catastrophic_stop = ensure_catastrophic_stop(client, config, position, state)
+        ensure_position_episode(config, state, position)
+
     if clock is None:
         clock = client.clock()
     if not clock.get("is_open"):
@@ -1628,14 +2192,13 @@ def run_once(client, config, state, clock=None):
             "timestamp": clock.get("timestamp"),
             "next_open": clock.get("next_open"),
             "reconciliation": reconciliation,
+            "catastrophic_stop": catastrophic_stop,
             "dynamic_plan": dynamic_plan,
             "dynamic_plan_error": dynamic_plan_error,
         }
 
     entry_order_id = state.get("current_entry_order_id") or config.get("entry_order_id")
     entry_order = client.order(entry_order_id) if entry_order_id else None
-    position = client.position(symbol)
-    qty = position_quantity(position)
 
     if not entry_order_id:
         if qty <= 0:
@@ -1651,6 +2214,25 @@ def run_once(client, config, state, clock=None):
         state.setdefault("ladder_order_ids", {})
 
     if entry_order and entry_order.get("status") != "filled":
+        health = refresh_position_health(client, config, state, position)
+        settings = position_health_config(config)
+        should_cancel_remainder = (
+            not settings.get("shadow_mode", True)
+            and (
+                health is None
+                or health.get("score") is None
+                or health.get("score") < int(settings.get("stable_score", 65))
+            )
+        )
+        if should_cancel_remainder and order_is_open(entry_order):
+            cancel_symbol_order(client, entry_order["id"], symbol)
+            return {
+                "status": "entry_remainder_canceled_by_position_health",
+                "entry_order_id": entry_order["id"],
+                "entry_order_status": entry_order.get("status"),
+                "catastrophic_stop": catastrophic_stop,
+                "position_health": health,
+            }
         if config.get("reentry_enabled") and entry_order.get("status") in (
             "canceled",
             "expired",
@@ -1662,6 +2244,8 @@ def run_once(client, config, state, clock=None):
         return {
             "status": "waiting_for_entry_fill",
             "entry_order_status": entry_order.get("status"),
+            "catastrophic_stop": catastrophic_stop,
+            "position_health": health,
         }
 
     fill_price = (
@@ -1697,8 +2281,21 @@ def run_once(client, config, state, clock=None):
         return handle_reentry(client, config, state)
 
     current_price = client.latest_trade_price(symbol)
+    adverse_reduction = submit_adverse_reduction(
+        client,
+        config,
+        position,
+        current_price,
+        state,
+    )
+    if adverse_reduction:
+        return adverse_reduction
+
     context = risk_context(client, config) if risk_context_needed(config) else None
-    base_floor = initial_floor_price(config, fill_price, context)
+    base_floor = max(
+        initial_floor_price(config, fill_price, context),
+        catastrophic_floor_price(config, fill_price),
+    )
     trail_step = config["trail_trigger_step_percent"] / 100
     current_rung = int((current_price / fill_price - 1) / trail_step)
     current_rung = max(0, current_rung)
@@ -1731,10 +2328,33 @@ def run_once(client, config, state, clock=None):
         effective_stop_price,
         state,
     )
+    position_for_health = dict(position)
+    position_for_health["current_price"] = current_price
+    health = refresh_position_health(
+        client,
+        config,
+        state,
+        position_for_health,
+    )
+    health_action = submit_confirmed_health_action(
+        client,
+        config,
+        state,
+        position_for_health,
+        health,
+    )
+    if health_action:
+        return health_action
 
     ladder_orders = []
     skipped_ladder_orders = []
     max_ladder_count, ladder_limit_detail = adaptive_ladder_limit(config, context)
+    if state.get("adverse_reduction_completed"):
+        max_ladder_count = 0
+        ladder_limit_detail = {
+            **ladder_limit_detail,
+            "adverse_reduction_ladder_lockout": True,
+        }
     for ladder_step in ladder_steps(config, fill_price, context):
         step_key = ladder_step["key"]
         legacy_step = ladder_step.get("drop_step_percent")
@@ -1868,6 +2488,7 @@ def run_once(client, config, state, clock=None):
         **recovery_stop,
         "highest_trail_rung": state["highest_trail_rung"],
         "updated_stop_order": stop_order["id"] if stop_order else None,
+        "position_health": health,
         "new_ladder_orders": [item["order"]["id"] for item in ladder_orders],
         "ladder_sizing": [item["sizing"] for item in ladder_orders],
         "adaptive_ladder": [item["adaptive_ladder"] for item in ladder_orders],
@@ -1888,7 +2509,9 @@ def main():
     load_env()
     config = load_json(args.config, {})
     state = load_json(args.state, {})
-    client = AlpacaClient()
+    from traderbot.broker.execution_gateway import ExecutionGateway
+
+    client = ExecutionGateway(AlpacaClient())
 
     while True:
         try:
