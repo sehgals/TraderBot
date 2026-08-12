@@ -126,6 +126,8 @@ def unavailable_position_health(reason="health_assessment_missing"):
         "position_health_action": "freeze",
         "position_health_as_of": None,
         "position_health_reasons": [reason],
+        "position_health_data_complete": False,
+        "position_health_data_fresh": False,
     }
 
 
@@ -142,8 +144,10 @@ def report_position_health(assessment):
         "position_health_trend_score": assessment.get("trend_score"),
         "position_health_reward_risk_score": assessment.get("reward_risk_score"),
         "position_health_remaining_r": assessment.get("remaining_r"),
+        "position_health_entry_return_percent": assessment.get("entry_return_percent"),
         "position_health_stop_price": assessment.get("stop_price"),
         "position_health_stop_qty": assessment.get("stop_qty"),
+        "position_health_data_complete": assessment.get("data_complete", False),
         "position_health_data_fresh": assessment.get("data_fresh", False),
         "position_health_model_version": assessment.get("model_version"),
     }
@@ -922,6 +926,59 @@ def render_positions_table(positions):
     )
 
 
+def render_position_health_table(positions):
+    if not positions:
+        return ["No open positions to assess."]
+
+    rows = []
+    for item in sorted(positions, key=lambda position: position.get("symbol") or ""):
+        score = item.get("position_health_score")
+        state = item.get("position_health_state") or "Unavailable"
+        health = f"{state} ({score}%)" if score is not None else state
+        stop_price = item.get("position_health_stop_price")
+        stop_qty = item.get("position_health_stop_qty")
+        protection = (
+            f"{money(stop_price)} x {number(stop_qty)}"
+            if stop_price is not None and stop_qty is not None
+            else "n/a"
+        )
+        if item.get("position_health_data_fresh") and item.get("position_health_data_complete"):
+            data_status = "Fresh / Complete"
+        elif item.get("position_health_data_fresh"):
+            data_status = "Fresh / Incomplete"
+        elif item.get("position_health_data_complete"):
+            data_status = "Stale / Complete"
+        else:
+            data_status = "Stale / Incomplete"
+        reasons = item.get("position_health_reasons") or []
+        rows.append(
+            [
+                item.get("symbol") or "n/a",
+                health,
+                item.get("position_health_action") or "freeze",
+                percent(item.get("position_health_entry_return_percent")),
+                number(item.get("position_health_downside_score")),
+                number(item.get("position_health_trend_score")),
+                number(item.get("position_health_reward_risk_score")),
+                number(item.get("position_health_remaining_r")),
+                protection,
+                data_status,
+                short_time(item.get("position_health_as_of")),
+                ", ".join(reasons) if reasons else "none",
+            ]
+        )
+    return markdown_table(
+        [
+            "Symbol", "Health", "Action", "Entry Return", "Downside", "Trend",
+            "Reward/Risk", "Remaining R", "Stop Coverage", "Data", "As Of", "Reasons",
+        ],
+        rows,
+        ["left", "left", "left", "right", "right", "right", "right", "right", "right", "left", "right", "left"],
+        pad_columns=True,
+        minimum_width=6,
+    )
+
+
 def render_markdown(report):
     account = report.get("account") or {}
     positions = report.get("current_positions") or []
@@ -978,6 +1035,13 @@ def render_markdown(report):
         ]
     )
     lines.extend(render_positions_table(positions))
+    lines.extend(
+        [
+            "",
+            "## Position Health",
+        ]
+    )
+    lines.extend(render_position_health_table(positions))
     lines.extend(
         [
             "",

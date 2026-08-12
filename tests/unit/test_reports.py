@@ -8,6 +8,7 @@ from traderbot.monitoring.reports import (
     render_cash_block_table,
     render_fill_table,
     render_markdown,
+    render_position_health_table,
     render_positions_table,
     signal_strength,
 )
@@ -219,6 +220,39 @@ def test_positions_table_uses_position_health_not_entry_signal():
     assert "1.75" in rendered
     assert "Signal Strength" not in rendered
     assert "Weak (40%)" not in rendered
+
+
+def test_position_health_section_shows_components_protection_and_reasons():
+    positions = [
+        {
+            "symbol": "WAT",
+            "position_health_state": "At Risk",
+            "position_health_score": 38,
+            "position_health_action": "reduce",
+            "position_health_entry_return_percent": -5.8553,
+            "position_health_downside_score": 32,
+            "position_health_trend_score": 10,
+            "position_health_reward_risk_score": 100,
+            "position_health_remaining_r": 3.3824,
+            "position_health_stop_price": 16.03,
+            "position_health_stop_qty": 71,
+            "position_health_data_fresh": True,
+            "position_health_data_complete": True,
+            "position_health_as_of": "2026-08-12T18:00:00Z",
+            "position_health_reasons": ["structural_trend_failure"],
+        }
+    ]
+
+    rendered = "\n".join(render_position_health_table(positions))
+
+    assert "At Risk (38%)" in rendered
+    assert "-5.86%" in rendered
+    assert "$16.03 x 71" in rendered
+    assert "Fresh / Complete" in rendered
+    assert "structural_trend_failure" in rendered
+
+    markdown = render_markdown({"report_date": "2026-08-12", "current_positions": positions})
+    assert "## Position Health" in markdown
 
 
 def test_sold_fill_uses_latest_watcher_entry_price(tmp_path):
