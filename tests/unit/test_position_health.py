@@ -15,7 +15,7 @@ NOW = datetime.datetime(2026, 8, 11, 16, 0, tzinfo=datetime.timezone.utc)
 def context(**overrides):
     result = {
         "as_of": "2026-08-11T15:00:00+00:00",
-        "bar_id": "WAT:60Min:2026-08-11T15:00:00+00:00",
+        "bar_id": "WAT:1Hour:2026-08-11T15:00:00+00:00",
         "timeframe_minutes": 60,
         "latest_bar": {
             "c": 105,

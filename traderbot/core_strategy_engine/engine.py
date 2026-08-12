@@ -12,7 +12,10 @@ import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 
-from traderbot.core_strategy_engine.position_health import evaluate_position_health
+from traderbot.core_strategy_engine.position_health import (
+    evaluate_add_eligibility,
+    evaluate_position_health,
+)
 
 
 DEFAULT_CONFIG_PATH = "traderbot/core_strategy_engine/strategies/configs/strategy_config.json"
@@ -1406,7 +1409,12 @@ def position_health_config(config):
         )
     nested.setdefault("enabled", True)
     nested.setdefault("shadow_mode", True)
-    nested.setdefault("timeframe", "60Min")
+    nested.setdefault("timeframe", "1Hour")
+    # Alpaca limits minute-based timeframe multipliers to 59. Preserve
+    # compatibility with older TraderBot configs while sending the supported
+    # hourly representation to the market-data API.
+    if str(nested["timeframe"]).strip().lower() == "60min":
+        nested["timeframe"] = "1Hour"
     nested.setdefault("lookback_days", 45)
     nested.setdefault("refresh_seconds", 3300)
     nested.setdefault("reduction_confirmation_bars", 2)
@@ -1421,7 +1429,7 @@ def position_health_config(config):
 
 
 def timeframe_minutes(timeframe):
-    value = str(timeframe or "60Min").strip().lower()
+    value = str(timeframe or "1Hour").strip().lower()
     if value.endswith("min"):
         return max(1, int(value[:-3]))
     if value.endswith("hour"):
@@ -1509,12 +1517,20 @@ def ensure_position_episode(config, state, position, entry_order=None):
 
 def position_health_market_context(client, config):
     settings = position_health_config(config)
+    symbol = config["symbol"]
+    benchmark_symbol = str(
+        (settings.get("benchmark_by_symbol") or {}).get(symbol)
+        or settings.get("benchmark_symbol")
+        or MARKET_SYMBOL
+    ).upper()
     now = datetime.datetime.now(datetime.timezone.utc)
     start = iso_utc(now - datetime.timedelta(days=int(settings["lookback_days"])))
     end = iso_utc(now)
     timeframe = settings["timeframe"]
-    bars = calculate_indicators(client.stock_bars(config["symbol"], start, end, timeframe))
-    market_bars = calculate_indicators(client.stock_bars(MARKET_SYMBOL, start, end, timeframe))
+    bars = calculate_indicators(client.stock_bars(symbol, start, end, timeframe))
+    market_bars = calculate_indicators(
+        client.stock_bars(benchmark_symbol, start, end, timeframe)
+    )
     if len(bars) < 51 or len(market_bars) < 51:
         return {
             "as_of": bars[-1]["t"].isoformat() if bars else None,
@@ -1523,6 +1539,7 @@ def position_health_market_context(client, config):
             "latest_bar": None,
             "relative_strength_5d": None,
             "market_ok": None,
+            "benchmark_symbol": benchmark_symbol,
         }
 
     latest = dict(bars[-1])
@@ -1539,11 +1556,12 @@ def position_health_market_context(client, config):
     as_of = latest["t"].isoformat()
     return {
         "as_of": as_of,
-        "bar_id": f"{config['symbol']}:{timeframe}:{as_of}",
+        "bar_id": f"{symbol}:{timeframe}:{as_of}",
         "timeframe_minutes": timeframe_minutes(timeframe),
         "latest_bar": latest,
         "relative_strength_5d": stock_return - market_return,
         "market_ok": market_ok_at(market_bars, latest["t"]),
+        "benchmark_symbol": benchmark_symbol,
     }
 
 
@@ -1700,6 +1718,101 @@ def submit_confirmed_health_action(client, config, state, position, health):
         "confirmation_bars": confirmation.get("count"),
         "canceled_stop_order_ids": canceled_stop_order_ids,
         "position_health": health,
+    }
+
+
+def submit_position_health_add(client, config, state, position, health, stop_price):
+    settings = position_health_config(config)
+    if settings.get("shadow_mode", True) or not settings.get("additions_enabled", False):
+        return None
+    if not health or not health.get("data_fresh"):
+        return None
+
+    episode = state.get("position_episode") or {}
+    current_qty = position_quantity(position)
+    if current_qty <= 0 or client.open_buy_orders(config["symbol"]):
+        return None
+
+    entry_assessment = {
+        "score": episode.get("entry_setup_score"),
+        "status": episode.get("entry_setup_status"),
+    }
+    account = client.account()
+    eligibility_config = {
+        **settings,
+        "max_symbol_notional_percent": float(
+            settings.get("max_symbol_notional_percent", 20)
+        ),
+    }
+    eligibility = evaluate_add_eligibility(
+        health,
+        entry_assessment,
+        episode,
+        position,
+        {"stop_price": stop_price, "stop_qty": current_qty},
+        float(account.get("equity") or 0),
+        eligibility_config,
+    )
+    if not eligibility["eligible"]:
+        state["position_health_add_eligibility"] = eligibility
+        return None
+
+    current_price = float(position.get("current_price") or 0)
+    add_qty, cash_detail = cash_protected_quantity(
+        client,
+        config,
+        int(eligibility["qty"]),
+        current_price,
+    )
+    if add_qty <= 0:
+        state["position_health_add_eligibility"] = {
+            **eligibility,
+            "eligible": False,
+            "qty": 0,
+            "reasons": sorted(set(eligibility["reasons"] + ["cash_reserve_blocked"])),
+            "cash": cash_detail,
+        }
+        return None
+
+    with (
+        client.symbol_transaction(config["symbol"])
+        if hasattr(client, "symbol_transaction")
+        else nullcontext()
+    ):
+        order = client.submit_order(
+            {
+                "symbol": config["symbol"],
+                "qty": str(add_qty),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": action_client_order_id(
+                    "health-add",
+                    config["symbol"],
+                    episode.get("episode_id", config["symbol"]),
+                ),
+            }
+        )
+
+    episode["add_count"] = int(episode.get("add_count", 0)) + 1
+    episode["state"] = "OPEN"
+    episode["state_version"] = int(episode.get("state_version", 0)) + 1
+    state["position_health_add_order_id"] = order["id"]
+    state["position_health_action_reason"] = "health_add"
+    state["position_health_add_eligibility"] = {
+        **eligibility,
+        "qty": add_qty,
+        "cash": cash_detail,
+    }
+    return {
+        "status": "position_health_add_order_submitted",
+        "order_id": order["id"],
+        "qty": add_qty,
+        "position_qty": current_qty,
+        "resulting_position_qty": current_qty + add_qty,
+        "health_score": health.get("score"),
+        "position_health": health,
+        "eligibility": state["position_health_add_eligibility"],
     }
 
 
@@ -2345,6 +2458,17 @@ def run_once(client, config, state, clock=None):
     )
     if health_action:
         return health_action
+
+    health_add = submit_position_health_add(
+        client,
+        config,
+        state,
+        position_for_health,
+        health,
+        effective_stop_price,
+    )
+    if health_add:
+        return health_add
 
     ladder_orders = []
     skipped_ladder_orders = []

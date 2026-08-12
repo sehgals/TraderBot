@@ -13,10 +13,13 @@ from traderbot.core_strategy_engine.engine import (
     ensure_catastrophic_stop,
     ensure_position_episode,
     initial_floor_price,
+    position_health_config,
+    position_health_market_context,
     reconcile_flat_position_state,
     resolve_adverse_reduction_order,
     run_once,
     submit_confirmed_health_action,
+    submit_position_health_add,
     submit_adverse_reduction,
     trail_below_current_percent,
     update_stop_order,
@@ -102,6 +105,122 @@ class FakeHealthClient(FakeClient):
 
 
 class RiskControlTests(unittest.TestCase):
+    def test_position_health_uses_symbol_sector_benchmark(self):
+        client = FakeHealthClient(position={})
+        requested_symbols = []
+        original_stock_bars = client.stock_bars
+
+        def recording_stock_bars(symbol, start, end, timeframe):
+            requested_symbols.append(symbol)
+            return original_stock_bars(symbol, start, end, timeframe)
+
+        client.stock_bars = recording_stock_bars
+        context = position_health_market_context(
+            client,
+            {
+                "symbol": "WAT",
+                "position_health": {
+                    "benchmark_symbol": "SPY",
+                    "benchmark_by_symbol": {"WAT": "XLV"},
+                },
+            },
+        )
+
+        self.assertEqual(requested_symbols, ["WAT", "XLV"])
+        self.assertEqual(context["benchmark_symbol"], "XLV")
+
+    def test_position_health_add_respects_cash_reserve_and_twenty_percent_cap(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "100",
+            "avg_entry_price": "100",
+            "current_price": "110",
+            "market_value": "11000",
+        }
+        client = FakeClient(
+            position=position,
+            account={"equity": "100000", "cash": "30000", "buying_power": "100000"},
+        )
+        state = {
+            "position_episode": {
+                "episode_id": "episode-1",
+                "initial_qty": 100,
+                "add_count": 0,
+                "entry_setup_score": 92,
+                "entry_setup_status": "active_signal",
+            }
+        }
+        health = {
+            "score": 90,
+            "data_fresh": True,
+            "remaining_r": 2.0,
+            "components": {"trend_checks": {
+                "price_above_ema21": True,
+                "price_above_ema50": True,
+                "ema21_slope_positive": True,
+                "market_regime_favorable": True,
+            }},
+        }
+        config = {
+            "symbol": "WAT",
+            "min_cash_balance_percent": 20,
+            "position_health": {
+                "shadow_mode": False,
+                "additions_enabled": True,
+                "max_symbol_notional_percent": 20,
+            },
+        }
+
+        result = submit_position_health_add(
+            client, config, state, position, health, stop_price=100
+        )
+
+        self.assertEqual(result["status"], "position_health_add_order_submitted")
+        self.assertEqual(result["qty"], 50)
+        self.assertEqual(client.submitted[0]["side"], "buy")
+        self.assertEqual(state["position_episode"]["add_count"], 1)
+
+    def test_position_health_add_is_blocked_when_cash_reserve_would_be_used(self):
+        position = {
+            "symbol": "WAT", "qty": "100", "avg_entry_price": "100",
+            "current_price": "110", "market_value": "11000",
+        }
+        client = FakeClient(
+            position=position,
+            account={"equity": "100000", "cash": "20000", "buying_power": "100000"},
+        )
+        state = {"position_episode": {
+            "episode_id": "episode-1", "initial_qty": 100, "add_count": 0,
+            "entry_setup_score": 92, "entry_setup_status": "active_signal",
+        }}
+        health = {
+            "score": 90, "data_fresh": True, "remaining_r": 2.0,
+            "components": {"trend_checks": {
+                "price_above_ema21": True, "price_above_ema50": True,
+                "ema21_slope_positive": True, "market_regime_favorable": True,
+            }},
+        }
+        config = {"symbol": "WAT", "min_cash_balance_percent": 20,
+                  "position_health": {"shadow_mode": False, "additions_enabled": True,
+                                      "max_symbol_notional_percent": 20}}
+
+        result = submit_position_health_add(
+            client, config, state, position, health, stop_price=100
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.submitted, [])
+        self.assertIn("cash_reserve_blocked", state["position_health_add_eligibility"]["reasons"])
+
+    def test_position_health_config_uses_alpaca_hourly_timeframe(self):
+        self.assertEqual(position_health_config({})["timeframe"], "1Hour")
+        self.assertEqual(
+            position_health_config(
+                {"position_health": {"timeframe": "60Min"}}
+            )["timeframe"],
+            "1Hour",
+        )
+
     def test_managed_position_persists_fresh_position_health_snapshot(self):
         client = FakeHealthClient(
             position={
@@ -122,7 +241,7 @@ class RiskControlTests(unittest.TestCase):
             "position_health": {
                 "enabled": True,
                 "shadow_mode": True,
-                "timeframe": "60Min",
+                "timeframe": "1Hour",
                 "lookback_days": 45,
                 "refresh_seconds": 3300,
             },

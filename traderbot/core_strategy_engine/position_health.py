@@ -226,6 +226,7 @@ def evaluate_position_health(
         reasons=sorted(set(reasons)),
         components={
             "trend_checks": trend_checks,
+            "benchmark_symbol": context.get("benchmark_symbol"),
             "target_price": target_price,
             "current_price": current_price,
             "entry_price": entry_price,
@@ -250,7 +251,7 @@ def evaluate_add_eligibility(
         "max_adds_per_episode": 1,
         "max_add_fraction_of_initial_qty": 0.5,
         "max_symbol_risk_percent": 0.75,
-        "max_symbol_notional_percent": 15,
+        "max_symbol_notional_percent": 20,
         **(config or {}),
     }
     reasons = []

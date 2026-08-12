@@ -100,6 +100,12 @@ C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\p
 
 `traderbot.monitoring.supervisor` runs all configured watchers from `config/watchers.json`. It replaces deprecated per-symbol PowerShell watcher tasks and reuses one market-clock check per scheduler pass.
 
+The production bot must always run through `TraderBot_Watcher_Supervisor` as the Windows `SYSTEM` service account (`ServiceAccount` logon, highest privileges). It must not run under an interactive user account. Apply or repair this required configuration from an Administrator PowerShell window with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\Admin\Documents\TraderBot\scripts\configure_watcher_supervisor_task.ps1
+```
+
 `traderbot.monitoring.watchdog` is the watchdog used by `TraderBot_Watcher_Supervisor`. It checks for the Python watcher supervisor process and restarts it directly when needed.
 
 When a `new_watchers` candidate becomes an open position, the supervisor promotes it automatically:

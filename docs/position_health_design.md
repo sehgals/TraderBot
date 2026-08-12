@@ -479,7 +479,7 @@ Existing profitable trailing-stop behavior remains valid. Stops may only remain 
   "episode_id": "WAT-20260811-001",
   "symbol": "WAT",
   "as_of": "2026-08-11T17:00:00Z",
-  "bar_id": "WAT:60Min:2026-08-11T17:00:00Z",
+  "bar_id": "WAT:1Hour:2026-08-11T17:00:00Z",
   "score": 72,
   "state": "stable",
   "downside_score": 80,
@@ -647,7 +647,7 @@ Proposed global defaults:
   "position_health": {
     "enabled": true,
     "shadow_mode": true,
-    "timeframe": "60Min",
+    "timeframe": "1Hour",
     "max_data_age_bars": 2,
     "healthy_score": 80,
     "stable_score": 65,
