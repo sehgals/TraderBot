@@ -2,6 +2,7 @@ import datetime
 import json
 
 from traderbot.monitoring.reports import (
+    enrich_bot_orders_with_broker_status,
     enrich_sold_fills_from_watchers,
     portfolio_summary,
     render_bot_order_table,
@@ -17,6 +18,17 @@ from traderbot.monitoring.reports import (
 class FakeClient:
     def portfolio_history(self, **_kwargs):
         return {"equity": [50000, 53000]}
+
+
+class FakeOrderClient:
+    def order(self, _order_id):
+        return {
+            "status": "expired",
+            "time_in_force": "day",
+            "extended_hours": False,
+            "submitted_at": "2026-08-12T13:30:13Z",
+            "expired_at": "2026-08-12T20:00:49Z",
+        }
 
 
 def test_positions_table_sorts_total_percent_descending_with_missing_values_last():
@@ -155,6 +167,21 @@ def test_bot_order_and_cash_block_tables_pad_columns_for_plain_text_alignment():
     for table in (bot_orders, cash_blocks):
         pipe_positions = [[index for index, char in enumerate(line) if char == "|"] for line in table]
         assert all(row == pipe_positions[0] for row in pipe_positions[1:])
+
+
+def test_bot_order_table_includes_broker_lifecycle():
+    orders = enrich_bot_orders_with_broker_status(
+        FakeOrderClient(),
+        [{"symbol": "CRDO", "order_id": "order-1", "qty": 10, "limit_price": 229.8}],
+    )
+
+    rendered = "\n".join(render_bot_order_table(orders))
+
+    assert "TIF" in rendered
+    assert "Final Status" in rendered
+    assert "DAY" in rendered
+    assert "Expired" in rendered
+    assert "6h 30m 36s" in rendered
 
 
 def test_portfolio_summary_excludes_margin_from_snapshot_funds():

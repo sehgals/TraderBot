@@ -224,6 +224,53 @@ def watcher_activity(project_root, watchers_path, report_date):
     }
 
 
+def enrich_bot_orders_with_broker_status(client, orders):
+    enriched = []
+    for item in orders or []:
+        order_id = item.get("order_id")
+        if not order_id:
+            enriched.append({**item, "broker_status": "unavailable"})
+            continue
+        try:
+            broker_order = client.order(order_id)
+            terminal_at = next(
+                (
+                    broker_order.get(field)
+                    for field in ("filled_at", "canceled_at", "expired_at", "failed_at")
+                    if broker_order.get(field)
+                ),
+                None,
+            )
+            submitted_at = broker_order.get("submitted_at") or item.get("timestamp")
+            submitted_time = parse_time(submitted_at)
+            terminal_time = parse_time(terminal_at)
+            active_seconds = (
+                max(0, (terminal_time - submitted_time).total_seconds())
+                if submitted_time and terminal_time
+                else None
+            )
+            enriched.append(
+                {
+                    **item,
+                    "broker_status": broker_order.get("status") or "unavailable",
+                    "time_in_force": broker_order.get("time_in_force"),
+                    "extended_hours": broker_order.get("extended_hours"),
+                    "broker_submitted_at": submitted_at,
+                    "broker_terminal_at": terminal_at,
+                    "active_seconds": active_seconds,
+                }
+            )
+        except Exception as exc:
+            enriched.append(
+                {
+                    **item,
+                    "broker_status": "unavailable",
+                    "broker_order_error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return enriched
+
+
 def fill_side(fill):
     side = (fill.get("side") or fill.get("order_side") or "").lower()
     if side:
@@ -543,6 +590,11 @@ def build_report(project_root, watchers_path, report_date, client=None):
             account_error = f"{type(exc).__name__}: {exc}"
 
     activity = watcher_activity(project_root, watchers_path, report_date)
+    if client:
+        activity["bot_buy_orders_submitted"] = enrich_bot_orders_with_broker_status(
+            client,
+            activity["bot_buy_orders_submitted"],
+        )
     return {
         "report_date": report_date.isoformat(),
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -594,6 +646,19 @@ def full_timestamp(value):
         f"{local.strftime('%I:%M:%S %p').lstrip('0')} "
         f"{zone_name} (UTC{formatted_offset})"
     )
+
+
+def duration(value):
+    if value is None:
+        return "n/a"
+    seconds = max(0, round(float(value)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def as_float(value, default=0.0):
@@ -783,13 +848,17 @@ def render_bot_order_table(items):
                 number(item.get("qty")),
                 money(item.get("limit_price")),
                 item.get("reason") or "n/a",
-                short_time(item.get("timestamp")),
+                (item.get("time_in_force") or "n/a").upper(),
+                (item.get("broker_status") or "unavailable").replace("_", " ").title(),
+                short_time(item.get("broker_submitted_at") or item.get("timestamp")),
+                short_time(item.get("broker_terminal_at")),
+                duration(item.get("active_seconds")),
             ]
         )
     return markdown_table(
-        ["Symbol", "Qty", "Limit", "Reason", "Submitted"],
+        ["Symbol", "Qty", "Limit", "Reason", "TIF", "Final Status", "Submitted", "Ended", "Active Time"],
         rows,
-        ["left", "right", "right", "left", "right"],
+        ["left", "right", "right", "left", "left", "left", "right", "right", "right"],
         pad_columns=True,
         minimum_width=6,
     )
