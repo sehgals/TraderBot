@@ -12,6 +12,7 @@ from traderbot.core_strategy_engine.engine import (
     effective_managed_stop_price,
     ensure_catastrophic_stop,
     ensure_position_episode,
+    evaluate_flat_entry_eligibility,
     initial_floor_price,
     position_health_config,
     position_health_market_context,
@@ -603,6 +604,118 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(archived["episode_id"], "episode-1")
         self.assertEqual(archived["state"], "CLOSED")
         self.assertEqual(archived["final_health"]["score"], 42)
+
+    def test_flat_reconciliation_recovers_manual_exit_from_broker_fills(self):
+        client = FakeClient(position=None)
+        client.fills = lambda after: [
+            {
+                "symbol": "WAT",
+                "side": "sell",
+                "qty": "4",
+                "price": "412.50",
+                "order_id": "manual-sell",
+                "transaction_time": "2026-08-18T14:05:00Z",
+            }
+        ]
+        state = {
+            "entry_fill_price": 400,
+            "active_stop_price": "368.00",
+            "last_position_seen_at": "2026-08-18T14:00:00Z",
+        }
+
+        result = reconcile_flat_position_state(client, "WAT", state)
+
+        self.assertEqual(result["last_exit_order_id"], "manual-sell")
+        self.assertEqual(state["last_exit_price"], 412.50)
+        self.assertEqual(state["last_exit_entry_price"], 400)
+        self.assertEqual(state["last_exit_source"], "broker_fill_reconstruction")
+        self.assertNotIn("exit_record_missing", state)
+
+    def test_flat_reconciliation_marks_missing_exit_without_guessing(self):
+        client = FakeClient(position=None)
+        client.fills = lambda after: []
+        state = {
+            "entry_fill_price": 400,
+            "active_stop_price": "368.00",
+            "last_position_seen_at": "2026-08-18T14:00:00Z",
+        }
+
+        reconcile_flat_position_state(client, "WAT", state)
+
+        self.assertTrue(state["exit_record_missing"])
+        self.assertNotIn("last_exit_price", state)
+
+    def test_flat_reconciliation_combines_multiple_closing_sell_orders(self):
+        client = FakeClient(position=None)
+        client.fills = lambda after: [
+            {
+                "symbol": "WAT", "side": "sell", "qty": "2", "price": "410",
+                "order_id": "sell-1", "transaction_time": "2026-08-18T14:04:00Z",
+            },
+            {
+                "symbol": "WAT", "side": "sell", "qty": "2", "price": "414",
+                "order_id": "sell-2", "transaction_time": "2026-08-18T14:05:00Z",
+            },
+        ]
+        state = {
+            "entry_fill_price": 400,
+            "active_stop_price": "368.00",
+            "last_position_seen_at": "2026-08-18T14:00:00Z",
+            "last_position_qty": 4,
+        }
+
+        reconcile_flat_position_state(client, "WAT", state)
+
+        self.assertEqual(state["last_exit_price"], 412)
+        self.assertEqual(state["last_exit_qty"], 4)
+        self.assertEqual(state["last_exit_order_ids"], ["sell-2", "sell-1"])
+
+    def test_managed_flat_symbol_routes_to_reentry_gate(self):
+        client = FakeClient(position=None)
+        result = run_once(
+            client,
+            {
+                "symbol": "WAT",
+                "dynamic_entry_enabled": False,
+                "reentry_enabled": True,
+                "dynamic_reentry_enabled": True,
+            },
+            {},
+            clock={"is_open": True, "timestamp": "2026-08-18T14:00:00Z"},
+        )
+
+        self.assertEqual(result["status"], "no_long_position_no_reentry_stop")
+
+    def test_flat_entry_eligibility_rejects_stale_plan(self):
+        eligibility = evaluate_flat_entry_eligibility(
+            {"dynamic_entry_enabled": True, "dynamic_timeframe": "5Min"},
+            {},
+            {"status": "active_signal", "last_bar_time": "2026-08-18T13:00:00Z"},
+            now=datetime.datetime(2026, 8, 18, 14, 0, tzinfo=datetime.timezone.utc),
+            mode="new_entry",
+        )
+
+        self.assertFalse(eligibility["eligible"])
+        self.assertIn("stale_entry_plan", eligibility["reasons"])
+
+    def test_managed_reentry_observe_only_never_becomes_order_eligible(self):
+        eligibility = evaluate_flat_entry_eligibility(
+            {
+                "reentry_enabled": True,
+                "dynamic_reentry_enabled": True,
+                "reentry_observe_only": True,
+            },
+            {
+                "last_exit_price": 100,
+                "last_exit_at": "2026-08-18T13:00:00Z",
+            },
+            {"status": "active_signal", "last_bar_time": "2026-08-18T13:55:00Z"},
+            now=datetime.datetime(2026, 8, 18, 14, 0, tzinfo=datetime.timezone.utc),
+            mode="reentry",
+        )
+
+        self.assertFalse(eligibility["eligible"])
+        self.assertEqual(eligibility["reasons"], ["reentry_observe_only"])
 
     def test_flat_reconciliation_preserves_untracked_open_buy_order(self):
         client = FakeClient(

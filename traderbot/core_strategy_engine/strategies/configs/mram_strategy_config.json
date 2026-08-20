@@ -17,7 +17,7 @@
   "min_cash_balance_percent": 20,
   "poll_seconds": 60,
   "reentry_cooldown_seconds": 600,
-  "reentry_enabled": false,
+  "reentry_enabled": true,
   "reentry_max_per_day": 1,
   "reentry_quantity": 1,
   "risk_profile": "speculative",

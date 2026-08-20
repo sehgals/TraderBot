@@ -116,6 +116,22 @@ When a `new_watchers` candidate becomes an open position, the supervisor promote
 - Removes the symbol from `new_watchers`
 - Adds the symbol to `managed_watchers`
 - Enables `dynamic_reentry_enabled` and disables `dynamic_entry_enabled`
+- Enables the managed `reentry_enabled` lifecycle gate
+
+Managed re-entry can be rolled out without submitting orders by setting
+`managed_reentry.observe_only` in `config/watchers.json`. In observe-only mode,
+watchers continue refreshing and reporting re-entry plans, but shared eligibility
+returns `reentry_observe_only` and execution cannot submit a re-entry order.
+
+Audit or migrate every existing managed strategy config with:
+
+```text
+python scripts/migrate_managed_reentry.py --config config/watchers.json
+python scripts/migrate_managed_reentry.py --config config/watchers.json --apply
+```
+
+The first command is a dry run. The apply command backs up every changed strategy
+config under `runtime/backups` before enforcing the managed lifecycle settings.
 
 Task Scheduler should run the watchdog with `pythonw.exe` so no console window flashes:
 

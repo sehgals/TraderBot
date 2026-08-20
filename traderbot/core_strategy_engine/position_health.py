@@ -1,5 +1,6 @@
 import datetime
 import math
+from zoneinfo import ZoneInfo
 
 from traderbot.core_strategy_engine.assessments import PositionHealthAssessment
 
@@ -13,6 +14,9 @@ DEFAULT_HEALTH_CONFIG = {
     "hard_reduction_loss_percent": 6,
     "catastrophic_stop_loss_percent": 8,
 }
+
+
+EASTERN = ZoneInfo("America/New_York")
 
 
 def interpolate(value, low_value, high_value, low_score, high_score):
@@ -85,8 +89,22 @@ def context_is_fresh(as_of, timeframe_minutes, max_age_bars, now=None):
     checked_at = now or datetime.datetime.now(datetime.timezone.utc)
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=datetime.timezone.utc)
+    checked_at = checked_at.astimezone(datetime.timezone.utc)
     allowance = datetime.timedelta(minutes=timeframe_minutes * max_age_bars + 5)
-    return checked_at.astimezone(datetime.timezone.utc) - timestamp <= allowance
+    if checked_at - timestamp <= allowance:
+        return True
+
+    # The final regular-session hourly bar is normally timestamped 15:00 ET.
+    # It cannot be superseded after the 16:00 ET close, so keep it reportable
+    # for the remainder of that trading date instead of aging it out.
+    local_timestamp = timestamp.astimezone(EASTERN)
+    local_checked_at = checked_at.astimezone(EASTERN)
+    return bool(
+        local_checked_at.date() == local_timestamp.date()
+        and local_checked_at.time() >= datetime.time(16, 0)
+        and local_timestamp.time() >= datetime.time(15, 0)
+        and local_timestamp.time() < datetime.time(16, 0)
+    )
 
 
 def health_label(score, config):

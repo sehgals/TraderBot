@@ -4,10 +4,12 @@ import json
 from traderbot.monitoring.reports import (
     enrich_bot_orders_with_broker_status,
     enrich_sold_fills_from_watchers,
+    flat_managed_stock_evaluations,
     portfolio_summary,
     render_bot_order_table,
     render_cash_block_table,
     render_fill_table,
+    render_flat_managed_stocks_table,
     render_markdown,
     render_position_health_table,
     render_positions_table,
@@ -218,6 +220,76 @@ def test_report_explains_position_health_method():
     assert "entry-relative downside (45%)" in markdown
     assert "Entry Setup scores are reserved for flat candidates" in markdown
     assert "risk-management assessment, not a return prediction" in markdown
+
+
+def test_flat_managed_stock_section_explains_current_entry_evaluation():
+    items = [{
+        "symbol": "AMKR",
+        "evaluation_status": "watch",
+        "signal_strength": "Weak",
+        "signal_score": 46,
+        "entry_mode": None,
+        "last_price": 61.33,
+        "next_signal_trigger": 61.44,
+        "limit_price": None,
+        "price_action": "below_21",
+        "volume_ratio": 9.46,
+        "signal_as_of": "2026-08-17T19:55:00Z",
+        "signal_blockers": ["market_ok", "trend_ok"],
+        "entry_eligibility": {
+            "eligible": False,
+            "reasons": ["stale_entry_plan"],
+            "plan_age_seconds": 3600,
+        },
+        "reentry_qualified": False,
+    }]
+
+    rendered = "\n".join(render_flat_managed_stocks_table(items))
+    markdown = render_markdown({
+        "report_date": "2026-08-17",
+        "current_positions": [],
+        "managed_stocks_not_held": items,
+    })
+
+    assert "AMKR" in rendered
+    assert "Weak (46%)" in rendered
+    assert "Historical Weak (46%)" in rendered
+    assert "$61.44" in rendered
+    assert "market_ok, trend_ok" in rendered
+    assert "Stale Entry Plan" in rendered
+    assert "Re-entry Qualified" in rendered
+    assert "NO" in rendered
+    assert "1h 0m 0s" in rendered
+    assert "## Managed Stocks Not Currently Held" in markdown
+    assert "### Entry / Re-entry Method" in markdown
+
+
+def test_flat_managed_stock_evaluations_excludes_open_and_new_watchers(tmp_path):
+    config_path = tmp_path / "watchers.json"
+    flat_state = tmp_path / "flat.json"
+    held_state = tmp_path / "held.json"
+    new_state = tmp_path / "new.json"
+    flat_state.write_text(json.dumps({"dynamic_entry_plan": {
+        "status": "watch", "last_price": 10, "blockers": ["trend_ok"]
+    }}), encoding="utf-8")
+    held_state.write_text("{}", encoding="utf-8")
+    new_state.write_text("{}", encoding="utf-8")
+    config_path.write_text(json.dumps({
+        "managed_watchers": [
+            {"symbol": "FLAT", "state": "flat.json"},
+            {"symbol": "HELD", "state": "held.json"},
+        ],
+        "new_watchers": [{"symbol": "NEW", "state": "new.json"}],
+    }), encoding="utf-8")
+
+    result = flat_managed_stock_evaluations(
+        tmp_path, config_path, [{"symbol": "HELD", "qty": 2}]
+    )
+
+    assert [item["symbol"] for item in result] == ["FLAT"]
+    assert result[0]["evaluation_status"] == "watch"
+    assert result[0]["signal_blockers"] == ["trend_ok"]
+    assert result[0]["reentry_qualified"] is False
 
 
 def test_positions_table_uses_position_health_not_entry_signal():

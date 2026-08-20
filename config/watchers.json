@@ -448,6 +448,12 @@
       "log": "runtime/logs/wat_watcher.jsonl",
       "state": "runtime/state/wat_strategy_state.json",
       "symbol": "WAT"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/azn_strategy_config.json",
+      "log": "runtime/logs/azn_watcher.jsonl",
+      "state": "runtime/state/azn_strategy_state.json",
+      "symbol": "AZN"
     }
   ],
   "max_concurrency": 3,
@@ -487,11 +493,6 @@
       "symbol": "ALGS"
     },
     {
-      "log": "runtime/logs/candidates/azn_watcher.jsonl",
-      "state": "runtime/state/candidates/azn_strategy_state.json",
-      "symbol": "AZN"
-    },
-    {
       "log": "runtime/logs/candidates/crs_watcher.jsonl",
       "state": "runtime/state/candidates/crs_strategy_state.json",
       "symbol": "CRS"
@@ -522,12 +523,9 @@
       "symbol": "KSLV"
     }
   ],
-  "reporting": {
-    "total_gain_baseline": 50000
-  },
   "position_health": {
-    "enabled": true,
-    "benchmark_symbol": "SPY",
+    "additions_enabled": true,
+    "at_risk_score": 25,
     "benchmark_by_symbol": {
       "AIRJ": "XLI",
       "ALGS": "XLK",
@@ -611,28 +609,31 @@
       "ZIM": "XLI",
       "ZM": "XLK"
     },
-    "shadow_mode": false,
-    "timeframe": "1Hour",
-    "lookback_days": 45,
-    "refresh_seconds": 3300,
-    "max_data_age_bars": 2,
-    "healthy_score": 80,
-    "stable_score": 65,
-    "watch_score": 45,
-    "at_risk_score": 25,
-    "reduction_confirmation_bars": 2,
+    "benchmark_symbol": "SPY",
+    "catastrophic_stop_loss_percent": 8,
+    "enabled": true,
     "exit_confirmation_bars": 2,
     "hard_reduction_loss_percent": 6,
     "health_reduction_fraction": 0.5,
-    "catastrophic_stop_loss_percent": 8,
-    "additions_enabled": true,
-    "minimum_add_health_score": 80,
-    "minimum_add_setup_score": 85,
-    "minimum_add_remaining_r": 1.5,
-    "max_adds_per_episode": 1,
+    "healthy_score": 80,
+    "lookback_days": 45,
     "max_add_fraction_of_initial_qty": 0.5,
+    "max_adds_per_episode": 1,
+    "max_data_age_bars": 2,
     "max_symbol_notional_percent": 20,
-    "max_symbol_risk_percent": 0.75
+    "max_symbol_risk_percent": 0.75,
+    "minimum_add_health_score": 80,
+    "minimum_add_remaining_r": 1.5,
+    "minimum_add_setup_score": 85,
+    "reduction_confirmation_bars": 2,
+    "refresh_seconds": 3300,
+    "shadow_mode": false,
+    "stable_score": 65,
+    "timeframe": "1Hour",
+    "watch_score": 45
+  },
+  "reporting": {
+    "total_gain_baseline": 50000
   },
   "scheduler_sleep_seconds": 2
 }

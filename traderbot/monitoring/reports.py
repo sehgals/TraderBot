@@ -4,7 +4,15 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from traderbot.core_strategy_engine.engine import AlpacaClient, load_env, load_json, save_json
+from traderbot.core_strategy_engine.engine import (
+    AlpacaClient,
+    evaluate_flat_entry_eligibility,
+    load_env,
+    load_json,
+    refresh_position_health,
+    save_json,
+)
+from traderbot.monitoring.supervisor import load_supervisor_config
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -119,6 +127,62 @@ def watcher_signal_strengths(project_root, watchers_path):
     return strengths
 
 
+def flat_managed_stock_evaluations(project_root, watchers_path, positions):
+    """Describe the persisted entry decision for managed symbols with no position."""
+    config = load_json(watchers_path, {})
+    held_symbols = {
+        position.get("symbol")
+        for position in (positions or [])
+        if as_float(position.get("qty")) != 0
+    }
+    evaluations = []
+    for watcher in config.get("managed_watchers", config.get("watchers", [])):
+        symbol = watcher.get("symbol")
+        if not symbol or symbol in held_symbols:
+            continue
+        state_path = Path(watcher.get("state", ""))
+        if not state_path.is_absolute():
+            state_path = project_root / state_path
+        state = load_json(state_path, {})
+        plan = state.get("dynamic_entry_plan") or {}
+        config_path = Path(watcher.get("config", ""))
+        if not config_path.is_absolute():
+            config_path = project_root / config_path
+        strategy_config = load_json(config_path, {}) if watcher.get("config") else {}
+        strategy_config["reentry_observe_only"] = (
+            config.get("managed_reentry") or {}
+        ).get("observe_only", strategy_config.get("reentry_observe_only", False))
+        eligibility = evaluate_flat_entry_eligibility(
+            strategy_config,
+            state,
+            plan if plan else None,
+            mode="reentry",
+        )
+        qualification_config = {**strategy_config, "reentry_observe_only": False}
+        reentry_qualification = evaluate_flat_entry_eligibility(
+            qualification_config,
+            state,
+            plan if plan else None,
+            mode="reentry",
+        )
+        evaluations.append(
+            {
+                "symbol": symbol,
+                **signal_strength(plan),
+                "entry_eligibility": eligibility,
+                "reentry_qualified": reentry_qualification.get("eligible", False),
+                "evaluation_status": plan.get("status") or "unavailable",
+                "entry_mode": plan.get("mode"),
+                "last_price": plan.get("last_price"),
+                "next_signal_trigger": plan.get("next_signal_trigger"),
+                "limit_price": plan.get("limit_price"),
+                "price_action": plan.get("price_action"),
+                "volume_ratio": plan.get("volume_ratio"),
+            }
+        )
+    return sorted(evaluations, key=lambda item: item["symbol"])
+
+
 def unavailable_position_health(reason="health_assessment_missing"):
     return {
         "position_health_state": "Unavailable",
@@ -153,11 +217,37 @@ def report_position_health(assessment):
     }
 
 
-def watcher_position_healths(project_root, watchers_path):
+def watcher_position_healths(project_root, watchers_path, client=None, positions=None):
     health = {}
-    for watcher in configured_watchers(project_root, watchers_path):
+    broker_positions = {
+        position.get("symbol"): position for position in (positions or [])
+    }
+    supervisor_config = {}
+    prepared_watchers = None
+    if client is not None:
+        _, supervisor_config, prepared_watchers = load_supervisor_config(watchers_path)
+    watchers = prepared_watchers or configured_watchers(project_root, watchers_path)
+    for watcher in watchers:
         state = load_json(watcher["state_path"], {})
-        health[watcher.get("symbol")] = report_position_health(state.get("position_health"))
+        assessment = state.get("position_health")
+        position = broker_positions.get(watcher.get("symbol"))
+        if client is not None and position is not None:
+            strategy_config = dict(watcher.get("config_defaults", {}))
+            if watcher.get("config_path"):
+                strategy_config.update(load_json(watcher["config_path"], {}))
+            strategy_config["position_health"] = {
+                **(supervisor_config.get("position_health") or {}),
+                **(strategy_config.get("position_health") or {}),
+            }
+            strategy_config.setdefault("symbol", watcher.get("symbol"))
+            assessment = refresh_position_health(
+                client,
+                strategy_config,
+                state,
+                position,
+                force=True,
+            )
+        health[watcher.get("symbol")] = report_position_health(assessment)
     return health
 
 
@@ -561,6 +651,7 @@ def build_report(project_root, watchers_path, report_date, client=None):
     bought = []
     sold = []
     positions = []
+    flat_managed_stocks = []
     account_error = None
 
     if client:
@@ -575,7 +666,15 @@ def build_report(project_root, watchers_path, report_date, client=None):
             sold = enrich_sold_fills_with_pl(sold, fills, start_at, end_at)
             sold = enrich_sold_fills_from_watchers(sold, project_root, watchers_path, end_at)
             positions = summarize_positions(client.positions())
-            health = watcher_position_healths(project_root, watchers_path)
+            flat_managed_stocks = flat_managed_stock_evaluations(
+                project_root, watchers_path, positions
+            )
+            health = watcher_position_healths(
+                project_root,
+                watchers_path,
+                client=client,
+                positions=positions,
+            )
             positions = [
                 {
                     **position,
@@ -601,6 +700,7 @@ def build_report(project_root, watchers_path, report_date, client=None):
         "account": account_summary,
         "account_error": account_error,
         "current_positions": positions,
+        "managed_stocks_not_held": flat_managed_stocks,
         "stocks_bought": bought,
         "stocks_sold": sold,
         **activity,
@@ -1048,6 +1148,62 @@ def render_position_health_table(positions):
     )
 
 
+def render_flat_managed_stocks_table(items):
+    if not items:
+        return ["No managed stocks are currently flat."]
+    rows = []
+    for item in items:
+        eligibility = item.get("entry_eligibility") or {}
+        eligibility_reasons = eligibility.get("reasons") or []
+        if eligibility.get("eligible"):
+            decision = "Eligible For Re-entry"
+        elif eligibility_reasons:
+            decision = eligibility_reasons[0].replace("_", " ").title()
+        else:
+            decision = (item.get("evaluation_status") or "unavailable").replace("_", " ").title()
+        score = item.get("signal_score")
+        signal = (
+            f'{item.get("signal_strength", "Unavailable")} ({score}%)'
+            if score is not None
+            else item.get("signal_strength", "Unavailable")
+        )
+        if "stale_entry_plan" in eligibility_reasons and score is not None:
+            signal = f"Historical {signal}"
+        blockers = item.get("signal_blockers") or []
+        rows.append(
+            [
+                item.get("symbol") or "n/a",
+                "YES" if item.get("reentry_qualified") else "NO",
+                decision,
+                signal,
+                (item.get("entry_mode") or "waiting").replace("_", " "),
+                money(item.get("last_price")),
+                money(item.get("next_signal_trigger")),
+                money(item.get("limit_price")),
+                item.get("price_action") or "n/a",
+                number(item.get("volume_ratio")),
+                short_time(item.get("signal_as_of")),
+                duration(eligibility.get("plan_age_seconds")),
+                ", ".join(eligibility_reasons) if eligibility_reasons else "none",
+                ", ".join(blockers) if blockers else "none",
+            ]
+        )
+    return markdown_table(
+        [
+            "Symbol", "Re-entry Qualified", "Decision", "Entry Setup", "Mode", "Price", "Next Trigger",
+            "Planned Limit", "Price Action", "Volume Ratio", "As Of", "Plan Age",
+            "Eligibility Reasons", "Signal Blockers",
+        ],
+        rows,
+        [
+            "left", "left", "left", "left", "left", "right", "right", "right", "left",
+            "right", "right", "right", "left", "left",
+        ],
+        pad_columns=True,
+        minimum_width=6,
+    )
+
+
 def render_markdown(report):
     account = report.get("account") or {}
     positions = report.get("current_positions") or []
@@ -1055,6 +1211,7 @@ def render_markdown(report):
     sold = report.get("stocks_sold") or []
     bot_buys = report.get("bot_buy_orders_submitted") or []
     cash_blocked = report.get("cash_blocked_buy_signals") or []
+    flat_managed_stocks = report.get("managed_stocks_not_held") or []
     lines = [
         f"# TraderBot Daily Report - {report['report_date']}",
         "",
@@ -1111,6 +1268,22 @@ def render_markdown(report):
         ]
     )
     lines.extend(render_position_health_table(positions))
+    lines.extend(
+        [
+            "",
+            "## Managed Stocks Not Currently Held",
+            "These are configured managed symbols with zero shares at Alpaca. Re-entry Qualified shows whether a symbol passes the execution checks with only observer mode ignored; YES does not authorize an order while observer mode is enabled. Decision and eligibility reasons show actual execution eligibility. Historical plans remain visible for audit but cannot authorize an order.",
+            "",
+        ]
+    )
+    lines.extend(render_flat_managed_stocks_table(flat_managed_stocks))
+    lines.extend(
+        [
+            "",
+            "### Entry / Re-entry Method",
+            "Bots evaluate completed five-minute bars for market regime, EMA trend and slope, VWAP/pullback or breakout confirmation, volume, chase protection, and exit-ledger price constraints. All required checks must pass before an order is eligible; portfolio risk, cash reserve, cooldown, and daily limits can still block submission afterward.",
+        ]
+    )
     lines.extend(
         [
             "",

@@ -180,6 +180,7 @@ def managed_strategy_config(symbol, config):
     managed["strategy_type"] = "managed_dynamic_reentry"
     managed["strategy_name"] = f"Managed dynamic reentry for {symbol}"
     managed["dynamic_entry_enabled"] = False
+    managed["reentry_enabled"] = True
     managed["dynamic_reentry_enabled"] = True
     managed.setdefault("dynamic_entry_notional", 5000)
     managed.setdefault("dynamic_market_filter_ignored_notional", 2500)
@@ -236,6 +237,12 @@ def run_watcher(client, watcher, supervisor_config, clock):
         **(supervisor_config.get("position_health") or {}),
         **(strategy_config.get("position_health") or {}),
     }
+    if watcher.get("group") == "managed":
+        managed_reentry = supervisor_config.get("managed_reentry") or {}
+        strategy_config["reentry_observe_only"] = managed_reentry.get(
+            "observe_only",
+            strategy_config.get("reentry_observe_only", False),
+        )
     strategy_config.setdefault("symbol", watcher["symbol"])
     strategy_config.setdefault(
         "strategy_type",

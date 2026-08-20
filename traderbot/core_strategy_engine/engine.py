@@ -1079,11 +1079,108 @@ def record_exit_from_order(state, order):
         state["last_exit_at"] = order.get("filled_at")
     if order.get("filled_qty") or order.get("qty"):
         state["last_exit_qty"] = int(float(order.get("filled_qty") or order.get("qty")))
+    state["last_exit_source"] = "tracked_order"
     return {
         "last_exit_order_id": state.get("last_exit_order_id"),
         "last_exit_price": state.get("last_exit_price"),
         "last_exit_at": state.get("last_exit_at"),
         "last_exit_qty": state.get("last_exit_qty"),
+    }
+
+
+def record_position_snapshot(state, position, as_of=None):
+    """Retain enough broker state to reconcile an exit observed between polls."""
+    if position_quantity(position) <= 0:
+        return
+    state["last_position_seen_at"] = as_of or iso_utc(
+        datetime.datetime.now(datetime.timezone.utc)
+    )
+    state["last_position_qty"] = position_quantity(position)
+    if position.get("avg_entry_price") not in (None, ""):
+        state["last_position_entry_price"] = float(position["avg_entry_price"])
+
+
+def fill_timestamp_value(fill):
+    return fill.get("transaction_time") or fill.get("timestamp") or fill.get("date")
+
+
+def fill_is_sell(fill):
+    side = str(fill.get("side") or fill.get("order_side") or "").lower()
+    if side:
+        return side == "sell"
+    try:
+        return float(fill.get("qty") or fill.get("net_qty") or 0) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+def reconstruct_exit_from_fills(client, symbol, state):
+    """Recover an untracked/manual exit after a held position is observed flat."""
+    if not hasattr(client, "fills"):
+        return None
+    after = state.get("last_position_seen_at")
+    episode = state.get("position_episode") or {}
+    after = after or episode.get("opened_at")
+    if not after:
+        return None
+    after_at = parse_alpaca_time(after)
+    if after_at:
+        after = iso_utc(after_at - datetime.timedelta(minutes=5))
+    try:
+        fills = client.fills(after)
+    except Exception as exc:
+        state["exit_reconciliation_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    sells = [
+        fill for fill in (fills or [])
+        if fill.get("symbol") == symbol and fill_is_sell(fill) and fill_timestamp_value(fill)
+    ]
+    if not sells:
+        return None
+    ordered_sells = sorted(
+        sells,
+        key=lambda fill: parse_alpaca_time(fill_timestamp_value(fill)),
+        reverse=True,
+    )
+    expected_qty = float(state.get("last_position_qty") or 0)
+    order_fills = []
+    selected_qty = 0.0
+    for fill in ordered_sells:
+        order_fills.append(fill)
+        selected_qty += abs(float(fill.get("qty") or fill.get("net_qty") or 0))
+        if expected_qty <= 0 or selected_qty >= expected_qty:
+            break
+    qty = sum(abs(float(fill.get("qty") or fill.get("net_qty") or 0)) for fill in order_fills)
+    notional = sum(
+        abs(float(fill.get("qty") or fill.get("net_qty") or 0))
+        * float(fill.get("price") or 0)
+        for fill in order_fills
+    )
+    if qty <= 0 or notional <= 0:
+        return None
+    order_ids = list(dict.fromkeys(
+        fill.get("order_id") for fill in order_fills if fill.get("order_id")
+    ))
+    state["last_exit_order_id"] = order_ids[0] if order_ids else None
+    state["last_exit_order_ids"] = order_ids
+    state["last_exit_price"] = notional / qty
+    latest_fill = max(
+        order_fills,
+        key=lambda fill: parse_alpaca_time(fill_timestamp_value(fill)),
+    )
+    state["last_exit_at"] = fill_timestamp_value(latest_fill)
+    state["last_exit_qty"] = int(qty) if qty.is_integer() else qty
+    entry_price = state.get("entry_fill_price") or state.get("last_position_entry_price")
+    if entry_price not in (None, ""):
+        state["last_exit_entry_price"] = float(entry_price)
+    state["last_exit_source"] = "broker_fill_reconstruction"
+    state.pop("exit_reconciliation_error", None)
+    return {
+        "last_exit_order_id": state.get("last_exit_order_id"),
+        "last_exit_price": state["last_exit_price"],
+        "last_exit_at": state["last_exit_at"],
+        "last_exit_qty": state["last_exit_qty"],
+        "last_exit_source": state["last_exit_source"],
     }
 
 
@@ -1126,6 +1223,12 @@ def reconcile_flat_position_state(client, symbol, state):
             "floor_price",
         )
     )
+    if had_managed_state and not exit_details:
+        exit_details = reconstruct_exit_from_fills(client, symbol, state)
+        if not exit_details:
+            state["exit_record_missing"] = True
+        else:
+            state.pop("exit_record_missing", None)
     episode = state.get("position_episode")
     if episode:
         closed_episode = {
@@ -1926,6 +2029,66 @@ def build_exit_trade_from_state(state):
     }
 
 
+def dynamic_plan_max_age_seconds(config):
+    configured = config.get("dynamic_plan_max_age_seconds")
+    if configured not in (None, ""):
+        return int(configured)
+    timeframe = str(config.get("dynamic_timeframe", "5Min")).lower()
+    digits = "".join(character for character in timeframe if character.isdigit())
+    minutes = int(digits or 5) if "min" in timeframe else 5
+    return minutes * 60 * 2 + 60
+
+
+def evaluate_flat_entry_eligibility(config, state, plan=None, now=None, mode=None):
+    """Return the shared configuration, lifecycle, cooldown, and plan decision."""
+    exit_trade = build_exit_trade_from_state(state)
+    mode = mode or ("reentry" if exit_trade else "new_entry")
+    reasons = []
+    if mode == "new_entry":
+        if not config.get("dynamic_entry_enabled"):
+            reasons.append("new_entry_disabled")
+    else:
+        if not config.get("reentry_enabled"):
+            reasons.append("reentry_disabled")
+        if not config.get("dynamic_reentry_enabled"):
+            reasons.append("dynamic_reentry_disabled")
+        if not exit_trade:
+            reasons.append("exit_record_missing")
+        if config.get("reentry_observe_only"):
+            reasons.append("reentry_observe_only")
+
+    now_at = now or datetime.datetime.now(datetime.timezone.utc)
+    cooldown_remaining = 0
+    if mode == "reentry" and exit_trade and exit_trade.get("exit_time"):
+        cooldown = int(config.get("reentry_cooldown_seconds", 600))
+        elapsed = (now_at - exit_trade["exit_time"].astimezone(datetime.timezone.utc)).total_seconds()
+        cooldown_remaining = max(0, math.ceil(cooldown - elapsed))
+        if cooldown_remaining:
+            reasons.append("reentry_cooldown")
+
+    plan_age_seconds = None
+    if plan is not None:
+        plan_at = parse_alpaca_time(plan.get("last_bar_time"))
+        if plan_at:
+            plan_age_seconds = max(
+                0, (now_at - plan_at.astimezone(datetime.timezone.utc)).total_seconds()
+            )
+        if not plan_at or plan_age_seconds > dynamic_plan_max_age_seconds(config):
+            reasons.append("stale_entry_plan")
+        if plan.get("status") != "active_signal":
+            reasons.append("entry_signal_inactive")
+
+    return {
+        "eligible": not reasons,
+        "mode": mode,
+        "reasons": reasons,
+        "cooldown_remaining_seconds": cooldown_remaining,
+        "plan_age_seconds": plan_age_seconds,
+        "plan_status": plan.get("status") if plan else None,
+        "as_of": plan.get("last_bar_time") if plan else None,
+    }
+
+
 def dynamic_entry_reference_qty(client, config, state, fallback_qty):
     position = client.position(config["symbol"])
     position_qty = position_quantity(position)
@@ -2055,6 +2218,14 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     plan = dynamic_entry_plan(symbol, bars, market_bars, exit_trade, ignore_ledger=ignore_ledger)
     state["dynamic_entry_plan"] = serializable_plan(plan)
 
+    eligibility = evaluate_flat_entry_eligibility(
+        config,
+        state,
+        plan,
+        mode="reentry" if exit_trade else "new_entry",
+    )
+    state["flat_entry_eligibility"] = eligibility
+
     open_buy_orders = track_existing_open_buy_order(client, symbol, state)
     reentry_order_id = state.get("reentry_order_id")
     if reentry_order_id:
@@ -2068,9 +2239,10 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
                 "dynamic_plan": serializable_plan(plan),
             }
 
-    if plan.get("status") != "active_signal":
+    if not eligibility["eligible"]:
         return {
             "status": "dynamic_entry_waiting_for_signal",
+            "eligibility": eligibility,
             "dynamic_plan": serializable_plan(plan),
         }
 
@@ -2288,6 +2460,7 @@ def run_once(client, config, state, clock=None):
     if qty > 0:
         catastrophic_stop = ensure_catastrophic_stop(client, config, position, state)
         ensure_position_episode(config, state, position)
+        record_position_snapshot(state, position)
 
     if clock is None:
         clock = client.clock()
@@ -2317,6 +2490,8 @@ def run_once(client, config, state, clock=None):
         if qty <= 0:
             if config.get("dynamic_entry_enabled"):
                 return handle_dynamic_flat_entry(client, config, state, exit_trade=None)
+            if config.get("reentry_enabled"):
+                return handle_reentry(client, config, state)
             return {"status": "no_entry_order_configured", "symbol": symbol}
         state.setdefault("entry_fill_price", float(position["avg_entry_price"]))
         state.setdefault("highest_trail_rung", 0)

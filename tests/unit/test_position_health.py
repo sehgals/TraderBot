@@ -162,6 +162,22 @@ def test_context_freshness_accepts_two_bar_window():
     )
 
 
+def test_context_freshness_keeps_final_hourly_bar_available_after_close():
+    after_close = datetime.datetime(2026, 8, 13, 22, 18, tzinfo=datetime.timezone.utc)
+
+    assert context_is_fresh(
+        "2026-08-13T19:00:00+00:00", 60, 2, now=after_close
+    )
+
+
+def test_context_freshness_does_not_extend_an_older_intraday_bar_after_close():
+    after_close = datetime.datetime(2026, 8, 13, 22, 18, tzinfo=datetime.timezone.utc)
+
+    assert not context_is_fresh(
+        "2026-08-13T18:00:00+00:00", 60, 2, now=after_close
+    )
+
+
 def test_add_eligibility_requires_profitable_healthy_position_and_both_scores():
     health = {
         "score": 90,
