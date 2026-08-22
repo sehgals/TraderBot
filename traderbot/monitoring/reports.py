@@ -156,14 +156,12 @@ def flat_managed_stock_evaluations(project_root, watchers_path, positions):
             strategy_config,
             state,
             plan if plan else None,
-            mode="reentry",
         )
         qualification_config = {**strategy_config, "reentry_observe_only": False}
         reentry_qualification = evaluate_flat_entry_eligibility(
             qualification_config,
             state,
             plan if plan else None,
-            mode="reentry",
         )
         evaluations.append(
             {

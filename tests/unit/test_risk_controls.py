@@ -670,8 +670,8 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(state["last_exit_qty"], 4)
         self.assertEqual(state["last_exit_order_ids"], ["sell-2", "sell-1"])
 
-    def test_managed_flat_symbol_routes_to_reentry_gate(self):
-        client = FakeClient(position=None)
+    def test_managed_flat_symbol_without_exit_routes_to_new_entry(self):
+        client = FakeHealthClient(position=None)
         result = run_once(
             client,
             {
@@ -684,7 +684,10 @@ class RiskControlTests(unittest.TestCase):
             clock={"is_open": True, "timestamp": "2026-08-18T14:00:00Z"},
         )
 
-        self.assertEqual(result["status"], "no_long_position_no_reentry_stop")
+        self.assertEqual(result["status"], "dynamic_entry_waiting_for_signal")
+        self.assertEqual(result["eligibility"]["mode"], "new_entry")
+        self.assertNotIn("new_entry_disabled", result["eligibility"]["reasons"])
+        self.assertNotIn("exit_record_missing", result["eligibility"]["reasons"])
 
     def test_flat_entry_eligibility_rejects_stale_plan(self):
         eligibility = evaluate_flat_entry_eligibility(
@@ -692,6 +695,31 @@ class RiskControlTests(unittest.TestCase):
             {},
             {"status": "active_signal", "last_bar_time": "2026-08-18T13:00:00Z"},
             now=datetime.datetime(2026, 8, 18, 14, 0, tzinfo=datetime.timezone.utc),
+            mode="new_entry",
+        )
+
+        self.assertFalse(eligibility["eligible"])
+        self.assertIn("stale_entry_plan", eligibility["reasons"])
+
+    def test_flat_entry_eligibility_accepts_closing_plan_after_hours(self):
+        eligibility = evaluate_flat_entry_eligibility(
+            {"dynamic_entry_enabled": True, "dynamic_timeframe": "5Min"},
+            {},
+            {"status": "active_signal", "last_bar_time": "2026-08-21T19:55:00Z"},
+            now=datetime.datetime(2026, 8, 21, 20, 18, tzinfo=datetime.timezone.utc),
+            mode="new_entry",
+        )
+
+        self.assertTrue(eligibility["eligible"])
+        self.assertNotIn("stale_entry_plan", eligibility["reasons"])
+        self.assertEqual(eligibility["plan_age_seconds"], 23 * 60)
+
+    def test_flat_entry_eligibility_rejects_old_same_day_plan_after_hours(self):
+        eligibility = evaluate_flat_entry_eligibility(
+            {"dynamic_entry_enabled": True, "dynamic_timeframe": "5Min"},
+            {},
+            {"status": "active_signal", "last_bar_time": "2026-08-21T17:00:00Z"},
+            now=datetime.datetime(2026, 8, 21, 20, 18, tzinfo=datetime.timezone.utc),
             mode="new_entry",
         )
 

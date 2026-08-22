@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import nullcontext
+from zoneinfo import ZoneInfo
 
 from traderbot.core_strategy_engine.position_health import (
     evaluate_add_eligibility,
@@ -26,6 +27,7 @@ DEFAULT_CATASTROPHIC_STOP_LOSS_PERCENT = 8
 DEFAULT_ADVERSE_REDUCTION_TRIGGER_PERCENT = 6
 DEFAULT_ADVERSE_REDUCTION_FRACTION = 0.5
 MAX_ENTRY_CLOCK_AGE_SECONDS = 30
+EASTERN = ZoneInfo("America/New_York")
 RISK_PROFILE_DEFAULTS = {
     "index_etf": {
         "initial_stop_mode": "atr_or_percent",
@@ -2039,13 +2041,39 @@ def dynamic_plan_max_age_seconds(config):
     return minutes * 60 * 2 + 60
 
 
+def dynamic_plan_is_fresh(config, plan_at, now_at):
+    """Keep the final regular-session plan valid after the closing bell."""
+    age_seconds = max(
+        0, (now_at - plan_at.astimezone(datetime.timezone.utc)).total_seconds()
+    )
+    if age_seconds <= dynamic_plan_max_age_seconds(config):
+        return True
+
+    plan_eastern = plan_at.astimezone(EASTERN)
+    now_eastern = now_at.astimezone(EASTERN)
+    market_close = datetime.time(16, 0)
+    closing_window_start = datetime.time(15, 45)
+    return (
+        now_eastern.date() == plan_eastern.date()
+        and now_eastern.time() >= market_close
+        and plan_eastern.time() >= closing_window_start
+    )
+
+
 def evaluate_flat_entry_eligibility(config, state, plan=None, now=None, mode=None):
     """Return the shared configuration, lifecycle, cooldown, and plan decision."""
     exit_trade = build_exit_trade_from_state(state)
-    mode = mode or ("reentry" if exit_trade else "new_entry")
+    mode = mode or (
+        "reentry" if exit_trade or state.get("active_stop_order_id") else "new_entry"
+    )
     reasons = []
     if mode == "new_entry":
-        if not config.get("dynamic_entry_enabled"):
+        new_entry_authorized = config.get("dynamic_entry_enabled") or (
+            not exit_trade
+            and config.get("reentry_enabled")
+            and config.get("dynamic_reentry_enabled")
+        )
+        if not new_entry_authorized:
             reasons.append("new_entry_disabled")
     else:
         if not config.get("reentry_enabled"):
@@ -2073,7 +2101,7 @@ def evaluate_flat_entry_eligibility(config, state, plan=None, now=None, mode=Non
             plan_age_seconds = max(
                 0, (now_at - plan_at.astimezone(datetime.timezone.utc)).total_seconds()
             )
-        if not plan_at or plan_age_seconds > dynamic_plan_max_age_seconds(config):
+        if not plan_at or not dynamic_plan_is_fresh(config, plan_at, now_at):
             reasons.append("stale_entry_plan")
         if plan.get("status") != "active_signal":
             reasons.append("entry_signal_inactive")
@@ -2260,7 +2288,10 @@ def refresh_dynamic_plan_only(client, config, state):
         return None
 
     exit_trade = build_exit_trade_from_state(state)
-    if not exit_trade and not config.get("dynamic_entry_enabled"):
+    if not exit_trade and not (
+        config.get("dynamic_entry_enabled")
+        or (config.get("reentry_enabled") and config.get("dynamic_reentry_enabled"))
+    ):
         return None
 
     bars, market_bars = live_bar_context(client, config["symbol"], config)
@@ -2488,7 +2519,12 @@ def run_once(client, config, state, clock=None):
 
     if not entry_order_id:
         if qty <= 0:
-            if config.get("dynamic_entry_enabled"):
+            if config.get("dynamic_entry_enabled") or (
+                not state.get("last_exit_at")
+                and not state.get("active_stop_order_id")
+                and config.get("reentry_enabled")
+                and config.get("dynamic_reentry_enabled")
+            ):
                 return handle_dynamic_flat_entry(client, config, state, exit_trade=None)
             if config.get("reentry_enabled"):
                 return handle_reentry(client, config, state)
