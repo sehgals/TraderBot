@@ -109,6 +109,7 @@ def load_strategy_configs(watchers_path):
     )
     supervisor_config = load_json(watchers_path, {})
     global_position_health = supervisor_config.get("position_health") or {}
+    global_entry_filters = supervisor_config.get("entry_filters") or {}
     configs = {}
     for watcher in supervisor_config.get("managed_watchers", supervisor_config.get("watchers", [])):
         config_path = project_root / watcher["config"]
@@ -116,6 +117,10 @@ def load_strategy_configs(watchers_path):
         config["position_health"] = {
             **global_position_health,
             **(config.get("position_health") or {}),
+        }
+        config["entry_filters"] = {
+            **global_entry_filters,
+            **(config.get("entry_filters") or {}),
         }
         configs[config["symbol"]] = config
     new_defaults = supervisor_config.get("new_watcher_defaults", {})
@@ -125,6 +130,10 @@ def load_strategy_configs(watchers_path):
         config["position_health"] = {
             **global_position_health,
             **(config.get("position_health") or {}),
+        }
+        config["entry_filters"] = {
+            **global_entry_filters,
+            **(config.get("entry_filters") or {}),
         }
         configs[config["symbol"]] = config
     return configs

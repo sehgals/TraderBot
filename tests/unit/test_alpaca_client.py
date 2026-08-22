@@ -5,6 +5,24 @@ import pytest
 from traderbot.core_strategy_engine.engine import AlpacaClient
 
 
+def test_latest_quote_normalizes_alpaca_fields():
+    client = object.__new__(AlpacaClient)
+    requested = []
+    client.data = lambda method, path: (
+        requested.append((method, path))
+        or {"quote": {"bp": 100.0, "ap": 100.2, "t": "2026-08-20T15:00:00Z"}}
+    )
+
+    quote = client.latest_quote("IBM")
+
+    assert quote == {
+        "bid_price": 100.0,
+        "ask_price": 100.2,
+        "timestamp": "2026-08-20T15:00:00Z",
+    }
+    assert requested == [("GET", "/stocks/IBM/quotes/latest?feed=iex")]
+
+
 def test_fills_paginates_bare_list_activity_responses():
     client = object.__new__(AlpacaClient)
     first_page = [{"id": f"activity-{index}"} for index in range(100)]

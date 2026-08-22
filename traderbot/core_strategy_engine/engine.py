@@ -266,6 +266,16 @@ class AlpacaClient:
         response = self.data("GET", f"/stocks/{symbol}/trades/latest?{query}")
         return float(response["trade"]["p"])
 
+    def latest_quote(self, symbol):
+        query = urllib.parse.urlencode({"feed": "iex"})
+        response = self.data("GET", f"/stocks/{symbol}/quotes/latest?{query}") or {}
+        quote = response.get("quote") or {}
+        return {
+            "bid_price": quote.get("bp"),
+            "ask_price": quote.get("ap"),
+            "timestamp": quote.get("t"),
+        }
+
     def stock_bars(self, symbol, start, end, timeframe):
         bars = []
         page_token = None
@@ -858,7 +868,17 @@ def live_bar_context(client, symbol, config):
                 client.stock_bars(sector_symbol, start, end, timeframe), timeframe, now
             )
         )
-    return bars, market_bars, sector_bars
+    filter_context = {"evaluated_at": now}
+    filter_settings = config.get("entry_filters") or {}
+    spread_settings = filter_settings.get("spread") or {}
+    if spread_settings is True or (
+        isinstance(spread_settings, dict) and spread_settings.get("enabled", False)
+    ):
+        filter_context["quote"] = client.latest_quote(symbol)
+    event_calendar_path = filter_settings.get("event_calendar_path")
+    if event_calendar_path:
+        filter_context["event_calendar"] = load_json(event_calendar_path, {})
+    return bars, market_bars, sector_bars, filter_context
 
 
 def dynamic_entry_plan(
@@ -2611,7 +2631,9 @@ def reset_entry_day_if_needed(state):
 def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     symbol = config["symbol"]
     reset_entry_day_if_needed(state)
-    bars, market_bars, sector_bars = live_bar_context(client, symbol, config)
+    bars, market_bars, sector_bars, filter_context = live_bar_context(
+        client, symbol, config
+    )
     ignore_ledger = not exit_trade
     plan = dynamic_entry_plan(
         symbol,
@@ -2621,6 +2643,7 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
         ignore_ledger=ignore_ledger,
         sector_bars=sector_bars,
         config=config,
+        filter_context=filter_context,
     )
     state["dynamic_entry_plan"] = serializable_plan(plan)
 
@@ -2672,7 +2695,7 @@ def refresh_dynamic_plan_only(client, config, state):
     ):
         return None
 
-    bars, market_bars, sector_bars = live_bar_context(
+    bars, market_bars, sector_bars, filter_context = live_bar_context(
         client, config["symbol"], config
     )
     plan = dynamic_entry_plan(
@@ -2683,6 +2706,7 @@ def refresh_dynamic_plan_only(client, config, state):
         ignore_ledger=not exit_trade,
         sector_bars=sector_bars,
         config=config,
+        filter_context=filter_context,
     )
     state["dynamic_entry_plan"] = serializable_plan(plan)
     return serializable_plan(plan)

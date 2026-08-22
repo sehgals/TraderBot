@@ -237,6 +237,10 @@ def run_watcher(client, watcher, supervisor_config, clock):
         **(supervisor_config.get("position_health") or {}),
         **(strategy_config.get("position_health") or {}),
     }
+    strategy_config["entry_filters"] = {
+        **(supervisor_config.get("entry_filters") or {}),
+        **(strategy_config.get("entry_filters") or {}),
+    }
     if watcher.get("group") == "managed":
         managed_reentry = supervisor_config.get("managed_reentry") or {}
         strategy_config["reentry_observe_only"] = managed_reentry.get(

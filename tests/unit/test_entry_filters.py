@@ -30,7 +30,14 @@ class EntryFilterTests(unittest.TestCase):
                     "gap": {"enabled": True, "maximum_absolute_percent": 5},
                 },
             },
-            {"quote": {"bid_price": 100.0, "ask_price": 100.2}},
+            {
+                "evaluated_at": self.features()["as_of"],
+                "quote": {
+                    "bid_price": 100.0,
+                    "ask_price": 100.2,
+                    "timestamp": "2026-08-20T14:59:45Z",
+                },
+            },
         )
         self.assertTrue(all(result["checks"].values()))
         self.assertAlmostEqual(result["metrics"]["quoted_spread_percent"], 0.1998, places=3)

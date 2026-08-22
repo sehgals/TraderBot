@@ -103,7 +103,20 @@ def evaluate_entry_filters(features, config=None, context=None):
         quote = context.get("quote") or {}
         bid = quote.get("bid_price")
         ask = quote.get("ask_price")
-        valid = bid not in (None, "") and ask not in (None, "")
+        quote_time = quote.get("timestamp")
+        evaluated_at = context.get("evaluated_at") or as_of
+        fresh = False
+        if quote_time:
+            quote_at = datetime.datetime.fromisoformat(
+                str(quote_time).replace("Z", "+00:00")
+            )
+            if quote_at.tzinfo is None:
+                quote_at = quote_at.replace(tzinfo=datetime.timezone.utc)
+            if evaluated_at.tzinfo is None:
+                evaluated_at = evaluated_at.replace(tzinfo=datetime.timezone.utc)
+            age = (evaluated_at - quote_at).total_seconds()
+            fresh = -5 <= age <= float(spread.get("maximum_quote_age_seconds", 60))
+        valid = bid not in (None, "") and ask not in (None, "") and fresh
         spread_percent = None
         if valid:
             bid = float(bid)
@@ -122,6 +135,7 @@ def evaluate_entry_filters(features, config=None, context=None):
                 "quoted_spread_percent": spread_percent,
                 "maximum_spread_percent": float(spread.get("maximum_percent", 0.50)),
                 "spread_source": "quote" if spread_percent is not None else None,
+                "quote_timestamp": quote_time,
             }
         )
 

@@ -281,8 +281,8 @@ class RiskControlTests(unittest.TestCase):
         bars = calculate_indicators(raw)
 
         self.assertIsNone(bars[0]["session_gap_percent"])
-        self.assertEqual(bars[1]["session_gap_percent"], 5.0)
-        self.assertEqual(bars[2]["session_gap_percent"], 5.0)
+        self.assertAlmostEqual(bars[1]["session_gap_percent"], 5.0)
+        self.assertAlmostEqual(bars[2]["session_gap_percent"], 5.0)
 
     def test_structural_stop_drives_risk_based_quantity_and_entry_target(self):
         stop = structural_stop_price({}, 100, 2, 90)

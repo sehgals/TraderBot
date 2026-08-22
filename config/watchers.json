@@ -456,6 +456,36 @@
       "symbol": "AZN"
     }
   ],
+  "entry_filters": {
+    "corporate_actions": {
+      "blackout_days_after": 1,
+      "blackout_days_before": 3,
+      "enabled": false,
+      "missing_data_policy": "block"
+    },
+    "earnings": {
+      "blackout_days_after": 1,
+      "blackout_days_before": 2,
+      "enabled": false,
+      "missing_data_policy": "block"
+    },
+    "gap": {
+      "enabled": true,
+      "maximum_absolute_percent": 8.0,
+      "missing_data_policy": "block"
+    },
+    "liquidity": {
+      "enabled": true,
+      "minimum_sample_size": 5,
+      "missing_data_policy": "block"
+    },
+    "spread": {
+      "enabled": true,
+      "maximum_percent": 0.5,
+      "maximum_quote_age_seconds": 60,
+      "missing_data_policy": "block"
+    }
+  },
   "max_concurrency": 3,
   "new_watcher_defaults": {
     "direct_ladder_authority_enabled": false,
