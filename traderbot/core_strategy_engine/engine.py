@@ -18,6 +18,12 @@ from traderbot.core_strategy_engine.entry_models.features import (
     build_entry_features,
     market_ok_at,
 )
+from traderbot.core_strategy_engine.entry_models.breakout import evaluate_breakout
+from traderbot.core_strategy_engine.entry_models.candidate import (
+    reward_risk_ok,
+    structural_stop_price,
+)
+from traderbot.core_strategy_engine.entry_models.pullback import evaluate_pullback
 from traderbot.core_strategy_engine.position_health import (
     evaluate_add_eligibility,
     evaluate_position_health,
@@ -792,30 +798,6 @@ def prior_window(bars, index, size):
     return bars[max(0, index - size) : index]
 
 
-def reward_risk_ok(entry_price, target_price, atr, minimum=1.5, stop_price=None):
-    stop_price = (
-        float(stop_price)
-        if stop_price not in (None, "")
-        else max(entry_price * 0.98, entry_price - atr)
-    )
-    risk = entry_price - stop_price
-    reward = target_price - entry_price
-    return risk > 0 and reward / risk >= minimum
-
-
-def structural_stop_price(config, entry_price, atr, setup_low):
-    """Risk stop shared by signal qualification, sizing, and management."""
-    atr_multiple = float(config.get("structural_stop_atr_multiple", 1.5))
-    buffer_atr = float(config.get("structural_stop_buffer_atr", 0.1))
-    max_loss_percent = float(config.get("structural_stop_max_percent", 6.0))
-    raw_stop = min(
-        entry_price - atr_multiple * atr,
-        float(setup_low) - buffer_atr * atr,
-    )
-    capped_stop = max(raw_stop, entry_price * (1 - max_loss_percent / 100))
-    return min(capped_stop, entry_price - max(0.01, 0.1 * atr))
-
-
 def price_action_label(bar, ema21_slope):
     if bar["c"] > bar["ema9"] > bar["ema21"] and ema21_slope >= 0.002:
         return "bullish_9_21"
@@ -887,32 +869,18 @@ def dynamic_entry_plan(
         return {"symbol": symbol, "status": "not_enough_bars"}
 
     bar = features["bar"]
-    previous = features["previous_bar"]
     atr = features["atr14"]
     ema21_slope = features["ema21_slope_5bars"]
     recent_high = features["recent_high_20"]
-    recent_low = features["recent_low_20"]
-    pullback_zone = max(
-        bar["ema21"],
-        bar["vwap"],
-        recent_low + 0.382 * (recent_high - recent_low),
-    )
     ledger_cap = features["ledger_cap"]
-    pullback_limit = min(pullback_zone + 0.10 * atr, ledger_cap)
-    breakout_limit = min(recent_high + 0.10 * atr, ledger_cap)
-    pullback_stop = structural_stop_price(
-        config, pullback_limit, atr, min(recent_low, previous["l"])
-    )
-    breakout_stop = structural_stop_price(
-        config, breakout_limit, atr, recent_low
-    )
-    minimum_rr = float(config.get("minimum_entry_reward_risk", 1.5))
-    breakout_target = breakout_limit + max(
-        2.5 * atr,
-        minimum_rr * (breakout_limit - breakout_stop),
-    )
-    pullback_touch_trigger = pullback_zone * 1.005
-    pullback_reclaim_trigger = max(bar["ema9"], bar["vwap"], previous["c"])
+    pullback_candidate = evaluate_pullback(features, config)
+    breakout_candidate = evaluate_breakout(features, config)
+    pullback_zone = pullback_candidate["pullback_zone"]
+    pullback_touch_trigger = pullback_candidate["touch_trigger"]
+    pullback_reclaim_trigger = pullback_candidate["reclaim_trigger"]
+    pullback_limit = pullback_candidate["limit_price"]
+    breakout_limit = breakout_candidate["limit_price"]
+    breakout_target = breakout_candidate["target_price"]
     signal_trigger_candidates = [
         price
         for price in (pullback_reclaim_trigger, recent_high)
@@ -922,96 +890,36 @@ def dynamic_entry_plan(
 
     market_ok = features["market_ok"]
     sector_ok = features["sector_ok"]
-    regime_ok = features["regime_ok"]
     above_exit = features["above_exit"]
     no_same_day_loss_reentry = features["no_same_day_loss_reentry"]
-    no_chase = bar["c"] <= bar["ema21"] + 0.75 * atr
-    trend_base = bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and bar["ema21"] >= bar["ema50"]
-
-    touched_pullback = previous["l"] <= pullback_touch_trigger
-    reclaimed = bar["c"] > pullback_reclaim_trigger
-    reclaim_trend_ok = trend_base and ema21_slope >= 0.002 and no_chase
-    vwap_stability = sum(
-        1
-        for item in features["recent_three_bars"]
-        if item["c"] > item["vwap"]
-    ) >= 2
-    pullback_stock_signal = (
-        regime_ok
-        and
-        above_exit
-        and no_same_day_loss_reentry
-        and touched_pullback
-        and reclaimed
-        and reclaim_trend_ok
-        and vwap_stability
-        and bar["volume_ratio"] >= 1.15
-        and pullback_limit <= ledger_cap
-        and reward_risk_ok(
-            pullback_limit,
-            recent_high,
-            atr,
-            minimum=minimum_rr,
-            stop_price=pullback_stop,
-        )
-    )
-    pullback_signal = pullback_stock_signal
-
-    breakout = bar["c"] > recent_high and bar["volume_ratio"] >= 1.3
-    breakout_trend_ok = (
-        bar["c"] > bar["vwap"]
-        and bar["c"] > bar["ema9"] > bar["ema21"]
-        and bar["ema21"] >= bar["ema50"]
-        and ema21_slope >= 0.002
-    )
-    breakout_stock_signal = (
-        regime_ok
-        and
-        above_exit
-        and no_same_day_loss_reentry
-        and breakout
-        and breakout_trend_ok
-        and bar["volume_ratio"] >= 1.5
-        and breakout_limit <= ledger_cap
-        and reward_risk_ok(
-            breakout_limit,
-            breakout_target,
-            atr,
-            minimum=minimum_rr,
-            stop_price=breakout_stop,
-        )
-    )
-    breakout_signal = breakout_stock_signal
+    pullback_checks = pullback_candidate["checks"]
+    breakout_checks = breakout_candidate["checks"]
+    no_chase = pullback_checks["no_chase"]
+    trend_base = pullback_checks["trend_ok"]
+    touched_pullback = pullback_checks["touched_pullback"]
+    pullback_signal = pullback_candidate["status"] == "active_signal"
+    breakout_signal = breakout_candidate["status"] == "active_signal"
     market_filter_ignored = False
 
     mode = None
-    limit_price = None
+    selected_candidate = None
     if pullback_signal:
-        mode = "dynamic_pullback_reclaim"
-        limit_price = pullback_limit
+        selected_candidate = pullback_candidate
     elif breakout_signal:
-        mode = "dynamic_breakout_continuation"
-        limit_price = breakout_limit
+        selected_candidate = breakout_candidate
 
-    selected_stop = (
-        pullback_stop
-        if mode == "dynamic_pullback_reclaim"
-        else breakout_stop
-        if mode == "dynamic_breakout_continuation"
-        else None
-    )
-    selected_target = (
-        recent_high
-        if mode == "dynamic_pullback_reclaim"
-        else breakout_target
-        if mode == "dynamic_breakout_continuation"
-        else None
-    )
-    selected_risk = limit_price - selected_stop if limit_price and selected_stop else None
+    mode = selected_candidate["legacy_mode"] if selected_candidate else None
+    limit_price = selected_candidate["limit_price"] if selected_candidate else None
+    selected_stop = selected_candidate["stop_price"] if selected_candidate else None
+    selected_target = selected_candidate["target_price"] if selected_candidate else None
+    selected_risk = selected_candidate["risk_per_share"] if selected_candidate else None
     selected_reward_risk = (
-        (selected_target - limit_price) / selected_risk
-        if selected_target and selected_risk and selected_risk > 0
-        else None
+        selected_candidate["expected_reward_risk"] if selected_candidate else None
+    )
+    minimum_rr = (
+        selected_candidate["minimum_reward_risk"]
+        if selected_candidate
+        else float(config.get("minimum_entry_reward_risk", 1.5))
     )
 
     checks = {
@@ -1028,17 +936,9 @@ def dynamic_entry_plan(
         "trend_ok": trend_base,
         "touched_pullback": touched_pullback,
         "breakout_now": bar["c"] > recent_high,
-        "reward_risk_ok": reward_risk_ok(
-            pullback_limit if mode != "dynamic_breakout_continuation" else breakout_limit,
-            recent_high if mode != "dynamic_breakout_continuation" else breakout_target,
-            atr,
-            minimum=minimum_rr,
-            stop_price=(
-                pullback_stop
-                if mode != "dynamic_breakout_continuation"
-                else breakout_stop
-            ),
-        ),
+        "reward_risk_ok": (
+            selected_candidate or pullback_candidate
+        )["checks"]["reward_risk_ok"],
     }
 
     return {

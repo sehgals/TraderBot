@@ -3,6 +3,8 @@ import datetime
 import unittest
 
 from traderbot.core_strategy_engine.entry_models.features import build_entry_features
+from traderbot.core_strategy_engine.entry_models.breakout import evaluate_breakout
+from traderbot.core_strategy_engine.entry_models.pullback import evaluate_pullback
 
 
 def indicator_bars():
@@ -90,6 +92,95 @@ class EntryFeatureTests(unittest.TestCase):
             "target_price",
         ):
             self.assertNotIn(model_specific_name, features)
+
+    def test_breakout_evaluator_has_only_breakout_specific_checks(self):
+        bars = indicator_bars()
+        for index, bar in enumerate(bars):
+            bar.update(
+                {
+                    "h": 102.0 if index == 54 else 101.0,
+                    "l": 99.0,
+                    "c": 102.0 if index == 54 else 100.0,
+                    "ema9": 101.0 if index == 54 else 99.5,
+                    "ema21": 100.0 if index == 54 else 98.0 + index * 0.02,
+                    "ema50": 98.0,
+                    "atr14": 1.0,
+                    "vwap": 99.0,
+                    "volume_ratio": 2.0 if index == 54 else 1.0,
+                }
+            )
+        market = regime_bars(bars, True)
+        features = build_entry_features(
+            "TEST", bars, market, sector_bars=market
+        )
+
+        candidate = evaluate_breakout(features)
+
+        self.assertEqual(candidate["status"], "active_signal")
+        self.assertEqual(candidate["model_id"], "breakout_continuation")
+        self.assertEqual(candidate["setup_score"], 100)
+        self.assertNotIn("touched_pullback", candidate["checks"])
+        self.assertNotIn("no_chase", candidate["checks"])
+
+    def test_pullback_evaluator_has_only_pullback_specific_checks(self):
+        bars = indicator_bars()
+        for index, bar in enumerate(bars):
+            bar.update(
+                {
+                    "h": 106.0 if 34 <= index < 54 else 101.0,
+                    "l": 99.0,
+                    "c": 100.5 if index == 54 else 100.0,
+                    "ema9": 100.1 if index == 54 else 99.5,
+                    "ema21": 100.0 if index == 54 else 98.0 + index * 0.02,
+                    "ema50": 98.0,
+                    "atr14": 1.0,
+                    "vwap": 99.0,
+                    "volume_ratio": 1.25 if index == 54 else 1.0,
+                }
+            )
+        market = regime_bars(bars, True)
+        features = build_entry_features(
+            "TEST", bars, market, sector_bars=market
+        )
+
+        candidate = evaluate_pullback(
+            features,
+            {"entry_models": {"pullback": {"minimum_reward_risk": 1.0}}},
+        )
+
+        self.assertEqual(candidate["status"], "active_signal")
+        self.assertEqual(candidate["model_id"], "pullback_reclaim")
+        self.assertEqual(candidate["setup_score"], 100)
+        self.assertNotIn("breakout_now", candidate["checks"])
+        self.assertIn("touched_pullback", candidate["checks"])
+
+    def test_model_configuration_does_not_leak_between_evaluators(self):
+        bars = indicator_bars()
+        for index, bar in enumerate(bars):
+            bar.update(
+                {
+                    "h": 102.0 if index == 54 else 101.0,
+                    "l": 99.0,
+                    "c": 102.0 if index == 54 else 100.0,
+                    "ema9": 101.0 if index == 54 else 99.5,
+                    "ema21": 100.0 if index == 54 else 98.0 + index * 0.02,
+                    "ema50": 98.0,
+                    "atr14": 1.0,
+                    "vwap": 99.0,
+                    "volume_ratio": 2.0 if index == 54 else 1.0,
+                }
+            )
+        market = regime_bars(bars, True)
+        features = build_entry_features(
+            "TEST", bars, market, sector_bars=market
+        )
+        config = {"entry_models": {"pullback": {"minimum_rvol": 3.0}}}
+
+        pullback = evaluate_pullback(features, config)
+        breakout = evaluate_breakout(features, config)
+
+        self.assertFalse(pullback["checks"]["volume_ok"])
+        self.assertTrue(breakout["checks"]["volume_ok"])
 
 
 if __name__ == "__main__":
