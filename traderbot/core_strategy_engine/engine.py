@@ -25,6 +25,7 @@ from traderbot.core_strategy_engine.entry_models.candidate import (
     structural_stop_price,
 )
 from traderbot.core_strategy_engine.entry_models.pullback import evaluate_pullback
+from traderbot.core_strategy_engine.lifecycle.coordinator import select_action_intent
 from traderbot.core_strategy_engine.position_health import (
     evaluate_add_eligibility,
     evaluate_position_health,
@@ -2070,6 +2071,107 @@ def submit_position_health_add(client, config, state, position, health, stop_pri
     }
 
 
+def position_action_intents(config, state, position, current_price, health):
+    """Return mutually competing post-fill intents without changing broker state."""
+    intents = []
+    episode_id = (state.get("position_episode") or {}).get(
+        "episode_id", config["symbol"]
+    )
+    qty = position_quantity(position)
+    if qty > 0 and not state.get("adverse_reduction_completed"):
+        details = adverse_reduction_details(
+            config, float(position["avg_entry_price"]), qty
+        )
+        if current_price <= details["trigger_price"]:
+            intents.append(
+                {
+                    "action_id": action_client_order_id(
+                        "hard-reduce", config["symbol"], episode_id
+                    ),
+                    "action": "reduce",
+                    "source": "hard_adverse_reduction",
+                    "priority": 88,
+                    "reason": "hard_reduction_threshold",
+                }
+            )
+
+    settings = position_health_config(config)
+    if not settings.get("shadow_mode", True) and health:
+        action = health.get("recommended_action")
+        if action in ("reduce", "exit"):
+            confirmation = state.get("position_health_confirmation") or {}
+            required = int(
+                settings[
+                    "exit_confirmation_bars"
+                    if action == "exit"
+                    else "reduction_confirmation_bars"
+                ]
+            )
+            if (
+                confirmation.get("action") == action
+                and int(confirmation.get("count", 0)) >= required
+                and not (action == "reduce" and state.get("adverse_reduction_completed"))
+            ):
+                intents.append(
+                    {
+                        "action_id": action_client_order_id(
+                            f"health-{action}", config["symbol"], episode_id
+                        ),
+                        "action": action,
+                        "source": "position_health",
+                        "reason": f"confirmed_health_{action}",
+                    }
+                )
+        if (
+            settings.get("additions_enabled", False)
+            and health.get("data_fresh")
+            and health.get("recommended_action") == "hold"
+        ):
+            intents.append(
+                {
+                    "action_id": action_client_order_id(
+                        "health-add", config["symbol"], episode_id
+                    ),
+                    "action": "add",
+                    "source": "position_health",
+                    "reason": "health_add_candidate",
+                }
+            )
+    return intents
+
+
+def submit_coordinated_position_action(
+    client,
+    config,
+    state,
+    position,
+    health,
+    current_price,
+    stop_price,
+):
+    intents = position_action_intents(
+        config, state, position, current_price, health
+    )
+    selected = select_action_intent(intents)
+    state["position_action_intents"] = intents
+    state["selected_position_action_intent"] = selected
+    if not selected:
+        return None
+    if selected["source"] == "hard_adverse_reduction":
+        return submit_adverse_reduction(
+            client, config, position, current_price, state
+        )
+    if selected["action"] in ("reduce", "exit"):
+        return submit_confirmed_health_action(
+            client, config, state, position, health
+        )
+    if selected["action"] == "add":
+        return submit_position_health_add(
+            client, config, state, position, health, stop_price
+        )
+    return None
+
+
 def update_dynamic_pending_order(client, config, state, order_id, plan):
     order = client.order(order_id)
     if order_is_open(order):
@@ -2813,15 +2915,6 @@ def run_once(client, config, state, clock=None):
         return handle_reentry(client, config, state)
 
     current_price = client.latest_trade_price(symbol)
-    adverse_reduction = submit_adverse_reduction(
-        client,
-        config,
-        position,
-        current_price,
-        state,
-    )
-    if adverse_reduction:
-        return adverse_reduction
 
     context = risk_context(client, config) if risk_context_needed(config) else None
     base_floor = managed_initial_floor_price(
@@ -2878,26 +2971,17 @@ def run_once(client, config, state, clock=None):
         state,
         position_for_health,
     )
-    health_action = submit_confirmed_health_action(
+    position_action = submit_coordinated_position_action(
         client,
         config,
         state,
         position_for_health,
         health,
-    )
-    if health_action:
-        return health_action
-
-    health_add = submit_position_health_add(
-        client,
-        config,
-        state,
-        position_for_health,
-        health,
+        current_price,
         effective_stop_price,
     )
-    if health_add:
-        return health_add
+    if position_action:
+        return position_action
 
     ladder_orders = []
     skipped_ladder_orders = []

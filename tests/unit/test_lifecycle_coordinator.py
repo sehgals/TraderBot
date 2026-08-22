@@ -1,6 +1,7 @@
 import unittest
 
 from traderbot.core_strategy_engine.lifecycle.coordinator import select_action_intent
+from traderbot.core_strategy_engine.engine import position_action_intents
 
 
 class LifecycleCoordinatorTests(unittest.TestCase):
@@ -42,6 +43,61 @@ class LifecycleCoordinatorTests(unittest.TestCase):
 
     def test_no_intents_returns_none(self):
         self.assertIsNone(select_action_intent([]))
+
+    def test_confirmed_health_exit_beats_hard_reduction(self):
+        config = {
+            "symbol": "WAT",
+            "position_health": {
+                "shadow_mode": False,
+                "exit_confirmation_bars": 2,
+            },
+        }
+        state = {
+            "position_episode": {"episode_id": "episode-1"},
+            "position_health_confirmation": {"action": "exit", "count": 2},
+        }
+        health = {
+            "recommended_action": "exit",
+            "data_fresh": True,
+        }
+
+        selected = select_action_intent(
+            position_action_intents(
+                config,
+                state,
+                {"symbol": "WAT", "qty": "10", "avg_entry_price": "100"},
+                90,
+                health,
+            )
+        )
+
+        self.assertEqual(selected["action"], "exit")
+        self.assertEqual(selected["source"], "position_health")
+
+    def test_hard_reduction_beats_health_add(self):
+        config = {
+            "symbol": "WAT",
+            "position_health": {
+                "shadow_mode": False,
+                "additions_enabled": True,
+            },
+        }
+        health = {
+            "recommended_action": "hold",
+            "data_fresh": True,
+        }
+
+        selected = select_action_intent(
+            position_action_intents(
+                config,
+                {"position_episode": {"episode_id": "episode-1"}},
+                {"symbol": "WAT", "qty": "10", "avg_entry_price": "100"},
+                94,
+                health,
+            )
+        )
+
+        self.assertEqual(selected["source"], "hard_adverse_reduction")
 
 
 if __name__ == "__main__":
