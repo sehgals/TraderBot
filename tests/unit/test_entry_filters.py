@@ -83,6 +83,24 @@ class EntryFilterTests(unittest.TestCase):
         )
         self.assertFalse(result["checks"]["corporate_actions_data_available"])
 
+    def test_calendar_requires_explicit_symbol_coverage(self):
+        result = evaluate_entry_filters(
+            self.features(),
+            {"entry_filters": {"earnings": {"enabled": True}}},
+            {
+                "event_calendar": {
+                    "coverage": {
+                        "point_in_time": True,
+                        "start": "2026-01-01",
+                        "end": "2026-12-31",
+                    },
+                    "events": [],
+                }
+            },
+        )
+
+        self.assertFalse(result["checks"]["earnings_data_available"])
+
 
 if __name__ == "__main__":
     unittest.main()

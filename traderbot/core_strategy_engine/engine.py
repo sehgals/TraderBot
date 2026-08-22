@@ -868,13 +868,14 @@ def live_bar_context(client, symbol, config):
                 client.stock_bars(sector_symbol, start, end, timeframe), timeframe, now
             )
         )
-    filter_context = {"evaluated_at": now}
+    filter_context = {}
     filter_settings = config.get("entry_filters") or {}
     spread_settings = filter_settings.get("spread") or {}
     if spread_settings is True or (
         isinstance(spread_settings, dict) and spread_settings.get("enabled", False)
     ):
         filter_context["quote"] = client.latest_quote(symbol)
+    filter_context["evaluated_at"] = datetime.datetime.now(datetime.timezone.utc)
     event_calendar_path = filter_settings.get("event_calendar_path")
     if event_calendar_path:
         filter_context["event_calendar"] = load_json(event_calendar_path, {})

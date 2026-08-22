@@ -25,6 +25,8 @@ def _calendar_covered(calendar, symbol, as_of):
     if not coverage.get("point_in_time"):
         return False
     symbols = {str(item).upper() for item in coverage.get("symbols", [])}
+    if not symbols and not coverage.get("all_symbols"):
+        return False
     if symbols and symbol.upper() not in symbols:
         return False
     start = coverage.get("start")
@@ -160,7 +162,22 @@ def evaluate_entry_filters(features, config=None, context=None):
         ("earnings", {"earnings"}, 2, 1),
         (
             "corporate_actions",
-            {"split", "reverse_split", "merger", "spinoff", "reorganization"},
+            {
+                "split",
+                "forward_split",
+                "reverse_split",
+                "unit_split",
+                "merger",
+                "cash_merger",
+                "stock_merger",
+                "stock_and_cash_merger",
+                "spinoff",
+                "spin_off",
+                "reorganization",
+                "name_change",
+                "symbol_change",
+                "redemption",
+            },
             3,
             1,
         ),
