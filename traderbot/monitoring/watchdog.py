@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOG_DIR = PROJECT_ROOT / "runtime" / "logs"
 LOG_PATH = LOG_DIR / "watcher_monitor.log"
 ALERT_PATH = LOG_DIR / "watcher_monitor_alerts.jsonl"
+RESTART_REQUEST_PATH = PROJECT_ROOT / "runtime" / "state" / "supervisor_restart_request.json"
 WATCHER_SUPERVISOR_TASK = "TraderBot_Watcher_Supervisor"
 PYTHONW_EXE = (
     Path(r"C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python")
@@ -61,7 +62,7 @@ def write_alert(symbol, task_name, message):
         write_monitor_log(f"Windows msg notification failed for {symbol}: {exc}")
 
 
-def get_supervisor_process_count():
+def get_supervisor_process_ids():
     command = [
         "powershell.exe",
         "-NoProfile",
@@ -73,7 +74,7 @@ def get_supervisor_process_count():
             "($_.CommandLine -like '*traderbot.cli.supervisor*' -or "
             "$_.CommandLine -like '*watcher_supervisor.py*') "
             "} | "
-            "Measure-Object).Count"
+            "ForEach-Object { $_.ProcessId }) -join ','"
         ),
     ]
     result = subprocess.run(
@@ -86,11 +87,49 @@ def get_supervisor_process_count():
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip()
         raise RuntimeError(details or "Process check for watcher_supervisor.py failed")
-    return int(result.stdout.strip() or "0")
+    output = result.stdout.strip()
+    return [int(value) for value in output.split(",") if value.strip()]
+
+
+def get_supervisor_process_count():
+    return len(get_supervisor_process_ids())
 
 
 def is_supervisor_running():
     return get_supervisor_process_count() > 0
+
+
+def consume_restart_request():
+    if not RESTART_REQUEST_PATH.exists():
+        return False
+    request = json.loads(RESTART_REQUEST_PATH.read_text(encoding="utf-8"))
+    expected_pid = int(request["expected_pid"])
+    supervisor_pids = get_supervisor_process_ids()
+    if expected_pid not in supervisor_pids:
+        raise RuntimeError(
+            f"restart request PID {expected_pid} is not a named watcher supervisor; "
+            f"found {supervisor_pids}"
+        )
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            f"Stop-Process -Id {expected_pid} -Force",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=NO_WINDOW,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(details or f"failed to stop supervisor PID {expected_pid}")
+    RESTART_REQUEST_PATH.unlink()
+    write_monitor_log(f"Consumed restart request and stopped supervisor PID {expected_pid}.")
+    start_supervisor()
+    write_monitor_log("Restart request completed; started a fresh watcher supervisor.")
+    return True
 
 
 def start_supervisor():
@@ -121,6 +160,13 @@ def start_supervisor():
 
 def main():
     os.chdir(PROJECT_ROOT)
+
+    try:
+        if consume_restart_request():
+            return 0
+    except Exception as exc:
+        write_monitor_log(f"Failed to consume supervisor restart request: {exc}")
+        return 4
 
     try:
         running = is_supervisor_running()
