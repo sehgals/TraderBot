@@ -19,6 +19,7 @@ from traderbot.core_strategy_engine.entry_models.features import (
     market_ok_at,
 )
 from traderbot.core_strategy_engine.entry_models.breakout import evaluate_breakout
+from traderbot.core_strategy_engine.entry_models.arbiter import select_entry_candidate
 from traderbot.core_strategy_engine.entry_models.candidate import (
     reward_risk_ok,
     structural_stop_price,
@@ -890,23 +891,13 @@ def dynamic_entry_plan(
 
     market_ok = features["market_ok"]
     sector_ok = features["sector_ok"]
-    above_exit = features["above_exit"]
-    no_same_day_loss_reentry = features["no_same_day_loss_reentry"]
-    pullback_checks = pullback_candidate["checks"]
-    breakout_checks = breakout_candidate["checks"]
-    no_chase = pullback_checks["no_chase"]
-    trend_base = pullback_checks["trend_ok"]
-    touched_pullback = pullback_checks["touched_pullback"]
-    pullback_signal = pullback_candidate["status"] == "active_signal"
-    breakout_signal = breakout_candidate["status"] == "active_signal"
     market_filter_ignored = False
 
-    mode = None
-    selected_candidate = None
-    if pullback_signal:
-        selected_candidate = pullback_candidate
-    elif breakout_signal:
-        selected_candidate = breakout_candidate
+    arbitration = select_entry_candidate(
+        [pullback_candidate, breakout_candidate]
+    )
+    selected_candidate = arbitration["selected"]
+    classified_candidate = arbitration["classified"] or pullback_candidate
 
     mode = selected_candidate["legacy_mode"] if selected_candidate else None
     limit_price = selected_candidate["limit_price"] if selected_candidate else None
@@ -922,29 +913,18 @@ def dynamic_entry_plan(
         else float(config.get("minimum_entry_reward_risk", 1.5))
     )
 
-    checks = {
-        "market_ok": market_ok,
-        "sector_ok": sector_ok,
-        "above_exit": above_exit,
-        "no_same_day_loss_reentry": no_same_day_loss_reentry,
-        "above_ema9": bar["c"] > bar["ema9"],
-        "ema9_above_ema21": bar["ema9"] > bar["ema21"],
-        "ema21_slope_ok": ema21_slope >= 0.002,
-        "no_chase": no_chase,
-        "pullback_volume_ok": bar["volume_ratio"] >= 1.15,
-        "breakout_volume_ok": bar["volume_ratio"] >= 1.5,
-        "trend_ok": trend_base,
-        "touched_pullback": touched_pullback,
-        "breakout_now": bar["c"] > recent_high,
-        "reward_risk_ok": (
-            selected_candidate or pullback_candidate
-        )["checks"]["reward_risk_ok"],
-    }
-
     return {
         "symbol": symbol,
         "status": "active_signal" if mode else "watch",
         "mode": mode,
+        "model_id": selected_candidate.get("model_id") if selected_candidate else None,
+        "model_version": (
+            selected_candidate.get("model_version") if selected_candidate else None
+        ),
+        "classified_model_id": classified_candidate.get("model_id"),
+        "entry_arbitration_reason": arbitration["reason"],
+        "setup_score": classified_candidate.get("setup_score"),
+        "model_checks": classified_candidate.get("checks"),
         "limit_price": limit_price,
         "last_bar_time": bar["t"].isoformat(),
         "last_price": bar["c"],
@@ -973,7 +953,8 @@ def dynamic_entry_plan(
         "volume_ratio": bar["volume_ratio"],
         "ema21_slope": ema21_slope,
         "price_action": price_action_label(bar, ema21_slope),
-        "blockers": [name for name, ok in checks.items() if not ok],
+        "blockers": classified_candidate.get("blockers", []),
+        "entry_candidates": [pullback_candidate, breakout_candidate],
     }
 
 
@@ -1056,6 +1037,9 @@ def reset_entry_tracking_state(state):
         "managed_entry_order_id",
         "reentry_order_id",
         "reentry_reason",
+        "pending_entry_model_id",
+        "pending_entry_model_version",
+        "pending_entry_candidate_as_of",
     ):
         state.pop(key, None)
 
@@ -2000,6 +1984,33 @@ def submit_position_health_add(client, config, state, position, health, stop_pri
 def update_dynamic_pending_order(client, config, state, order_id, plan):
     order = client.order(order_id)
     if order_is_open(order):
+        plan_model_id = plan.get("model_id")
+        pending_model_id = state.get("pending_entry_model_id")
+        if not pending_model_id and plan.get("status") == "active_signal":
+            pending_model_id = plan_model_id
+            state["pending_entry_model_id"] = plan_model_id
+            state["pending_entry_model_version"] = plan.get("model_version")
+            state["pending_entry_candidate_as_of"] = plan.get("last_bar_time")
+        if plan.get("status") != "active_signal" or not plan_model_id:
+            cancel_symbol_order(client, order_id, config["symbol"])
+            reset_entry_tracking_state(state)
+            return {
+                "status": "dynamic_entry_order_canceled_signal_inactive",
+                "old_order_id": order_id,
+                "pending_model_id": pending_model_id,
+                "classified_model_id": plan.get("classified_model_id"),
+                "dynamic_plan": serializable_plan(plan),
+            }
+        if pending_model_id and pending_model_id != plan_model_id:
+            cancel_symbol_order(client, order_id, config["symbol"])
+            reset_entry_tracking_state(state)
+            return {
+                "status": "dynamic_entry_order_canceled_model_switch",
+                "old_order_id": order_id,
+                "old_model_id": pending_model_id,
+                "new_model_id": plan_model_id,
+                "dynamic_plan": serializable_plan(plan),
+            }
         desired_limit = plan.get("limit_price")
         if (
             config.get("dynamic_replace_open_orders", True)
@@ -2023,8 +2034,7 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
             )
             if desired_qty <= 0:
                 cancel_symbol_order(client, order_id, config["symbol"])
-                state.pop("reentry_order_id", None)
-                state.pop("current_entry_order_id", None)
+                reset_entry_tracking_state(state)
                 return {
                     "status": "dynamic_entry_order_canceled_risk_cap",
                     "old_order_id": order_id,
@@ -2039,8 +2049,7 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
             )
             if adjusted_qty <= 0:
                 cancel_symbol_order(client, order_id, config["symbol"])
-                state.pop("reentry_order_id", None)
-                state.pop("current_entry_order_id", None)
+                reset_entry_tracking_state(state)
                 return {
                     "status": "dynamic_entry_order_canceled_cash_reserve",
                     "old_order_id": order_id,
@@ -2069,6 +2078,9 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                 )
                 state["current_entry_order_id"] = replaced["id"]
                 state["reentry_order_id"] = replaced["id"]
+                state["pending_entry_model_id"] = plan_model_id
+                state["pending_entry_model_version"] = plan.get("model_version")
+                state["pending_entry_candidate_as_of"] = plan.get("last_bar_time")
                 return {
                     "status": "dynamic_entry_order_replaced",
                     "old_order_id": order_id,
@@ -2096,6 +2108,13 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
 
     state.pop("reentry_order_id", None)
     state.pop("current_entry_order_id", None)
+    if order.get("status") != "filled":
+        for key in (
+            "pending_entry_model_id",
+            "pending_entry_model_version",
+            "pending_entry_candidate_as_of",
+        ):
+            state.pop(key, None)
     return None
 
 
@@ -2286,11 +2305,19 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
             "type": "limit",
             "limit_price": dollars(plan["limit_price"]),
             "time_in_force": config.get("dynamic_entry_time_in_force", "day"),
+            "client_order_id": action_client_order_id(
+                "entry",
+                symbol,
+                f"{plan.get('model_id')}:{plan.get('last_bar_time')}",
+            ),
         }
     )
     state["current_entry_order_id"] = order["id"]
     state["reentry_order_id"] = order["id"]
     state["reentry_reason"] = f"{reason_prefix}_{plan['mode']}"
+    state["pending_entry_model_id"] = plan.get("model_id")
+    state["pending_entry_model_version"] = plan.get("model_version")
+    state["pending_entry_candidate_as_of"] = plan.get("last_bar_time")
     state["reentries_today"] = state.get("reentries_today", 0) + 1
     state["reentry_shares_today"] = state.get("reentry_shares_today", 0) + qty
     reset_managed_position_state(state)

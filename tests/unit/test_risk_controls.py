@@ -29,6 +29,7 @@ from traderbot.core_strategy_engine.engine import (
     submit_adverse_reduction,
     structural_stop_price,
     trail_below_current_percent,
+    update_dynamic_pending_order,
     update_stop_order,
 )
 
@@ -112,6 +113,75 @@ class FakeHealthClient(FakeClient):
 
 
 class RiskControlTests(unittest.TestCase):
+    def test_pending_entry_is_canceled_instead_of_switching_models(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "new",
+                    "qty": "5",
+                    "limit_price": "100",
+                }
+            ]
+        )
+        state = {
+            "current_entry_order_id": "entry-1",
+            "reentry_order_id": "entry-1",
+            "pending_entry_model_id": "pullback_reclaim",
+        }
+        plan = {
+            "status": "active_signal",
+            "model_id": "breakout_continuation",
+            "model_version": 1,
+            "mode": "dynamic_breakout_continuation",
+            "last_bar_time": "2026-08-21T19:55:00Z",
+            "limit_price": 101,
+        }
+
+        result = update_dynamic_pending_order(
+            client, {"symbol": "WAT"}, state, "entry-1", plan
+        )
+
+        self.assertEqual(result["status"], "dynamic_entry_order_canceled_model_switch")
+        self.assertEqual(client.canceled, ["entry-1"])
+        self.assertNotIn("current_entry_order_id", state)
+        self.assertNotIn("pending_entry_model_id", state)
+
+    def test_pending_entry_is_canceled_when_originating_signal_is_inactive(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "new",
+                    "qty": "5",
+                    "limit_price": "100",
+                }
+            ]
+        )
+        state = {
+            "current_entry_order_id": "entry-1",
+            "reentry_order_id": "entry-1",
+            "pending_entry_model_id": "pullback_reclaim",
+        }
+        plan = {
+            "status": "watch",
+            "model_id": None,
+            "classified_model_id": "pullback_reclaim",
+        }
+
+        result = update_dynamic_pending_order(
+            client, {"symbol": "WAT"}, state, "entry-1", plan
+        )
+
+        self.assertEqual(result["status"], "dynamic_entry_order_canceled_signal_inactive")
+        self.assertEqual(client.canceled, ["entry-1"])
+        self.assertNotIn("current_entry_order_id", state)
     def test_rvol_compares_matched_time_dollar_volume_across_twenty_sessions(self):
         raw = []
         start = datetime.datetime(2026, 1, 5, 20, 55, tzinfo=datetime.timezone.utc)

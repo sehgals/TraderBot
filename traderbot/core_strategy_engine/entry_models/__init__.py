@@ -6,6 +6,7 @@ from traderbot.core_strategy_engine.entry_models.features import (
     market_ok_at,
 )
 from traderbot.core_strategy_engine.entry_models.breakout import evaluate_breakout
+from traderbot.core_strategy_engine.entry_models.arbiter import select_entry_candidate
 from traderbot.core_strategy_engine.entry_models.candidate import (
     reward_risk_ok,
     structural_stop_price,
@@ -19,5 +20,6 @@ __all__ = [
     "evaluate_pullback",
     "market_ok_at",
     "reward_risk_ok",
+    "select_entry_candidate",
     "structural_stop_price",
 ]
