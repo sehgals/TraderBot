@@ -13,6 +13,11 @@ import urllib.request
 from contextlib import nullcontext
 from zoneinfo import ZoneInfo
 
+from traderbot.core_strategy_engine.entry_models.features import (
+    allowed_ledger_price,
+    build_entry_features,
+    market_ok_at,
+)
 from traderbot.core_strategy_engine.position_health import (
     evaluate_add_eligibility,
     evaluate_position_health,
@@ -787,24 +792,6 @@ def prior_window(bars, index, size):
     return bars[max(0, index - size) : index]
 
 
-def market_ok_at(market_bars, timestamp):
-    prior = [bar for bar in market_bars if bar["t"] <= timestamp]
-    if len(prior) < 6:
-        return True
-    bar = prior[-1]
-    previous = prior[-6]
-    ema21_slope = (bar["ema21"] - previous["ema21"]) / previous["ema21"]
-    return bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and ema21_slope >= 0
-
-
-def allowed_ledger_price(exit_price, realized_pl=0, strong=False):
-    if realized_pl >= 0:
-        premium = 1.025 if strong else 1.01
-    else:
-        premium = 0.985
-    return exit_price * premium
-
-
 def reward_risk_ok(entry_price, target_price, atr, minimum=1.5, stop_price=None):
     stop_price = (
         float(stop_price)
@@ -887,30 +874,30 @@ def dynamic_entry_plan(
     config=None,
 ):
     config = config or {}
-    if len(bars) < 51:
+    features = build_entry_features(
+        symbol,
+        bars,
+        market_bars,
+        exit_trade=exit_trade,
+        ignore_ledger=ignore_ledger,
+        sector_bars=sector_bars,
+        config=config,
+    )
+    if features is None:
         return {"symbol": symbol, "status": "not_enough_bars"}
 
-    index = len(bars) - 1
-    bar = bars[index]
-    previous = bars[index - 1]
-    window = prior_window(bars, index, 20)
-    atr = max(bar["atr14"], 0.01)
-    ema21_slope = (bar["ema21"] - bars[index - 5]["ema21"]) / bars[index - 5]["ema21"]
-    recent_high = max(item["h"] for item in window)
-    recent_low = min(item["l"] for item in window)
+    bar = features["bar"]
+    previous = features["previous_bar"]
+    atr = features["atr14"]
+    ema21_slope = features["ema21_slope_5bars"]
+    recent_high = features["recent_high_20"]
+    recent_low = features["recent_low_20"]
     pullback_zone = max(
         bar["ema21"],
         bar["vwap"],
         recent_low + 0.382 * (recent_high - recent_low),
     )
-    strong_volume = bar["volume_ratio"] >= 1.5
-    ledger_cap = (
-        math.inf
-        if ignore_ledger or not exit_trade
-        else allowed_ledger_price(
-            exit_trade["exit_price"], exit_trade.get("realized_pl", 0), strong=strong_volume
-        )
-    )
+    ledger_cap = features["ledger_cap"]
     pullback_limit = min(pullback_zone + 0.10 * atr, ledger_cap)
     breakout_limit = min(recent_high + 0.10 * atr, ledger_cap)
     pullback_stop = structural_stop_price(
@@ -933,32 +920,22 @@ def dynamic_entry_plan(
     ]
     next_signal_trigger = min(signal_trigger_candidates) if signal_trigger_candidates else None
 
-    market_ok = market_ok_at(market_bars, bar["t"])
-    sector_ok = market_ok_at(sector_bars, bar["t"]) if sector_bars else True
-    regime_ok = (
-        (market_ok or not config.get("dynamic_require_market_regime", True))
-        and (sector_ok or not config.get("dynamic_require_sector_regime", True))
-    )
-    same_day_exit = (
-        exit_trade
-        and exit_trade.get("exit_time")
-        and bar["t"].date() == exit_trade["exit_time"].date()
-    )
-    above_exit = (
-        True
-        if ignore_ledger or not exit_trade
-        else exit_trade.get("realized_pl", 0) < 0 or bar["c"] >= exit_trade["exit_price"]
-    )
-    no_same_day_loss_reentry = not (
-        exit_trade and exit_trade.get("realized_pl", 0) < 0 and same_day_exit
-    )
+    market_ok = features["market_ok"]
+    sector_ok = features["sector_ok"]
+    regime_ok = features["regime_ok"]
+    above_exit = features["above_exit"]
+    no_same_day_loss_reentry = features["no_same_day_loss_reentry"]
     no_chase = bar["c"] <= bar["ema21"] + 0.75 * atr
     trend_base = bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and bar["ema21"] >= bar["ema50"]
 
     touched_pullback = previous["l"] <= pullback_touch_trigger
     reclaimed = bar["c"] > pullback_reclaim_trigger
     reclaim_trend_ok = trend_base and ema21_slope >= 0.002 and no_chase
-    vwap_stability = sum(1 for item in bars[index - 2 : index + 1] if item["c"] > item["vwap"]) >= 2
+    vwap_stability = sum(
+        1
+        for item in features["recent_three_bars"]
+        if item["c"] > item["vwap"]
+    ) >= 2
     pullback_stock_signal = (
         regime_ok
         and
@@ -1071,7 +1048,7 @@ def dynamic_entry_plan(
         "limit_price": limit_price,
         "last_bar_time": bar["t"].isoformat(),
         "last_price": bar["c"],
-        "ledger_ignored": ignore_ledger or not exit_trade,
+        "ledger_ignored": features["ledger_ignored"],
         "market_ok": market_ok,
         "sector_ok": sector_ok,
         "market_filter_ignored": market_filter_ignored,
