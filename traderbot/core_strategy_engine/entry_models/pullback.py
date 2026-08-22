@@ -55,6 +55,7 @@ def evaluate_pullback(features, config=None):
         if item["c"] > item["vwap"]
     ) >= int(settings.get("minimum_vwap_stable_bars", 2))
     checks = {
+        **features["entry_filters"]["checks"],
         "model_enabled": settings.get("enabled", True),
         "market_ok": features["market_ok"]
         or not config.get("dynamic_require_market_regime", True),
@@ -89,6 +90,7 @@ def evaluate_pullback(features, config=None):
         stop_price=stop_price,
         target_price=target_price,
         details={
+            "entry_filter_metrics": features["entry_filters"]["metrics"],
             "minimum_reward_risk": minimum_rr,
             "pullback_zone": pullback_zone,
             "touch_trigger": touch_trigger,

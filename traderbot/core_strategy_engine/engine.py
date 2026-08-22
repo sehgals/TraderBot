@@ -725,6 +725,8 @@ def calculate_indicators(raw_bars):
     session_volume = 0.0
     true_ranges = []
     dollar_volume_by_slot = {}
+    previous_session_close = None
+    session_gap_percent = None
 
     for raw in raw_bars:
         timestamp = parse_alpaca_time(raw["t"])
@@ -734,11 +736,18 @@ def calculate_indicators(raw_bars):
         volume = float(raw["v"])
         typical = (high + low + close) / 3
 
-        bar_date = timestamp.astimezone(datetime.timezone.utc).date()
+        bar_date = timestamp.astimezone(EASTERN).date()
         if session_date != bar_date:
+            if session_date is not None:
+                previous_session_close = prev_close
             session_date = bar_date
             session_pv = 0.0
             session_volume = 0.0
+            session_gap_percent = (
+                (float(raw["o"]) / previous_session_close - 1) * 100
+                if previous_session_close
+                else None
+            )
 
         session_pv += typical * volume
         session_volume += volume
@@ -788,6 +797,10 @@ def calculate_indicators(raw_bars):
                 "volume_ratio": volume_ratio,
                 "relative_dollar_volume": volume_ratio,
                 "rvol_sample_size": rvol_sample_size,
+                "dollar_volume": dollar_volume,
+                "matched_average_dollar_volume": avg_dollar_volume,
+                "dollar_volume_sample_size": rvol_sample_size,
+                "session_gap_percent": session_gap_percent,
                 "rvol_method": "matched_eastern_time_20_session_dollar_volume",
             }
         )
@@ -856,6 +869,7 @@ def dynamic_entry_plan(
     ignore_ledger=False,
     sector_bars=None,
     config=None,
+    filter_context=None,
 ):
     config = config or {}
     features = build_entry_features(
@@ -866,6 +880,7 @@ def dynamic_entry_plan(
         ignore_ledger=ignore_ledger,
         sector_bars=sector_bars,
         config=config,
+        filter_context=filter_context,
     )
     if features is None:
         return {"symbol": symbol, "status": "not_enough_bars"}

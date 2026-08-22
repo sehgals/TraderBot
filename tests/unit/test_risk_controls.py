@@ -264,10 +264,25 @@ class RiskControlTests(unittest.TestCase):
 
         self.assertAlmostEqual(latest["volume_ratio"], 2.0)
         self.assertEqual(latest["rvol_sample_size"], 20)
+        self.assertEqual(latest["matched_average_dollar_volume"], 100_000)
+        self.assertEqual(latest["dollar_volume_sample_size"], 20)
         self.assertEqual(
             latest["rvol_method"],
             "matched_eastern_time_20_session_dollar_volume",
         )
+
+    def test_session_gap_uses_prior_eastern_session_close(self):
+        raw = [
+            {"t": "2026-08-20T19:55:00Z", "o": 99, "h": 101, "l": 99, "c": 100, "v": 10},
+            {"t": "2026-08-21T13:30:00Z", "o": 105, "h": 106, "l": 104, "c": 105, "v": 10},
+            {"t": "2026-08-21T13:35:00Z", "o": 105, "h": 105, "l": 104, "c": 104, "v": 10},
+        ]
+
+        bars = calculate_indicators(raw)
+
+        self.assertIsNone(bars[0]["session_gap_percent"])
+        self.assertEqual(bars[1]["session_gap_percent"], 5.0)
+        self.assertEqual(bars[2]["session_gap_percent"], 5.0)
 
     def test_structural_stop_drives_risk_based_quantity_and_entry_target(self):
         stop = structural_stop_price({}, 100, 2, 90)

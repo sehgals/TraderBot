@@ -43,6 +43,7 @@ def evaluate_breakout(features, config=None):
         >= float(settings.get("minimum_ema21_slope", 0.002))
     )
     checks = {
+        **features["entry_filters"]["checks"],
         "model_enabled": settings.get("enabled", True),
         "market_ok": features["market_ok"]
         or not config.get("dynamic_require_market_regime", True),
@@ -71,6 +72,7 @@ def evaluate_breakout(features, config=None):
         stop_price=stop_price,
         target_price=target_price,
         details={
+            "entry_filter_metrics": features["entry_filters"]["metrics"],
             "minimum_reward_risk": minimum_rr,
             "breakout_trigger": recent_high,
             "next_signal_trigger": recent_high if recent_high >= bar["c"] else None,

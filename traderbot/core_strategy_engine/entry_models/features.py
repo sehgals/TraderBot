@@ -1,5 +1,7 @@
 import math
 
+from traderbot.core_strategy_engine.entry_models.filters import evaluate_entry_filters
+
 
 def market_ok_at(market_bars, timestamp):
     """Return the completed-bar trend regime at ``timestamp``."""
@@ -28,6 +30,7 @@ def build_entry_features(
     ignore_ledger=False,
     sector_bars=None,
     config=None,
+    filter_context=None,
 ):
     """Build the model-neutral facts used to evaluate an entry.
 
@@ -83,7 +86,7 @@ def build_entry_features(
         exit_trade and exit_trade.get("realized_pl", 0) < 0 and same_day_exit
     )
 
-    return {
+    features = {
         "symbol": symbol,
         "as_of": bar["t"],
         "bar": bar,
@@ -105,6 +108,10 @@ def build_entry_features(
         "above_exit": above_exit,
         "no_same_day_loss_reentry": no_same_day_loss_reentry,
     }
+    features["entry_filters"] = evaluate_entry_filters(
+        features, config=config, context=filter_context
+    )
+    return features
 
 
 __all__ = [
