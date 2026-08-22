@@ -163,6 +163,9 @@ Managed strategies support:
 - Dynamic ledger-aware reentry after exits.
 - Dynamic market-action-only entries for new candidate symbols.
 - Shadow-mode Position Health assessments using downside state, 60-minute trend, and remaining reward/risk.
+- Entry RVOL uses matched Eastern-time-of-day dollar volume from up to 20 prior sessions, avoiding the opening/closing-volume bias of a rolling 20-bar average.
+- Dynamic entries require favorable QQQ and sector-benchmark regimes by default.
+- Dynamic entry admission, 0.5%-of-equity sizing, initial protection, and R-based trailing share one structural stop; entries require at least 1.5:1 expected reward/risk.
 
 Dynamic plans write `dynamic_entry_plan` into strategy state with pullback/breakout levels, price-action context, ledger caps, and blockers.
 
@@ -179,6 +182,17 @@ C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\p
 ```
 
 It compares static reentry rules with the dynamic reentry model using Alpaca fills, IEX bars, QQQ market-regime checks, EMA/VWAP/ATR indicators, and ledger-aware price caps.
+
+The risk-control research harness uses a unified portfolio simulation. Signals
+are observed at a completed bar close, day-limit orders become fill-eligible on
+the next symbol bar, and every symbol shares one cash and equity balance. Its
+JSON output includes portfolio return, drawdown, exposure, rejected-order
+counts, per-symbol attribution, and trade-level signal and fill timestamps.
+Live and research paths share the dynamic plan, initial/catastrophic floor,
+hard-reduction, sizing, re-entry ledger, cooldown, and Position Health policy.
+The harness requires matching hourly stock and benchmark data whenever live
+Position Health actions are enabled, so an active production rule cannot be
+silently omitted from a backtest.
 
 ## Runtime Files
 

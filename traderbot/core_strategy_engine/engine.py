@@ -349,8 +349,15 @@ def dynamic_entry_notional(config, plan):
     return float(config.get("dynamic_entry_notional", 5000))
 
 
-def dynamic_entry_quantity(config, plan):
+def dynamic_entry_quantity(config, plan, equity=None):
     limit_price = float(plan["limit_price"])
+    stop_price = float(plan.get("stop_price") or 0)
+    risk_per_share = limit_price - stop_price
+    has_structural_stop = 0 < stop_price < limit_price
+    if equity not in (None, "", 0) and has_structural_stop:
+        risk_percent = float(config.get("risk_per_trade_percent", 0.5))
+        risk_budget = float(equity) * risk_percent / 100
+        return max(0, math.floor(risk_budget / risk_per_share))
     notional = dynamic_entry_notional(config, plan)
     return max(1, math.floor(notional / limit_price))
 
@@ -485,14 +492,43 @@ def risk_context_needed(config):
     )
 
 
+def completed_market_bars(raw_bars, timeframe, now=None):
+    """Exclude bars whose configured interval has not finished yet."""
+    checked_at = now or datetime.datetime.now(datetime.timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=datetime.timezone.utc)
+    checked_at = checked_at.astimezone(datetime.timezone.utc)
+    value = str(timeframe or "5Min").strip().lower()
+    if value.endswith("min"):
+        duration = datetime.timedelta(minutes=max(1, int(value[:-3])))
+    elif value.endswith("hour"):
+        duration = datetime.timedelta(hours=max(1, int(value[:-4])))
+    else:
+        return list(raw_bars)
+    return [
+        bar
+        for bar in raw_bars
+        if parse_alpaca_time(bar.get("t"))
+        and parse_alpaca_time(bar["t"]) + duration <= checked_at
+    ]
+
+
 def risk_context(client, config):
     now = datetime.datetime.now(datetime.timezone.utc)
     lookback_days = config.get("dynamic_lookback_days", 7)
     start = iso_utc(now - datetime.timedelta(days=lookback_days))
     end = iso_utc(now)
     timeframe = config.get("dynamic_timeframe", "5Min")
-    bars = calculate_indicators(client.stock_bars(config["symbol"], start, end, timeframe))
-    market_bars = calculate_indicators(client.stock_bars(MARKET_SYMBOL, start, end, timeframe))
+    bars = calculate_indicators(
+        completed_market_bars(
+            client.stock_bars(config["symbol"], start, end, timeframe), timeframe, now
+        )
+    )
+    market_bars = calculate_indicators(
+        completed_market_bars(
+            client.stock_bars(MARKET_SYMBOL, start, end, timeframe), timeframe, now
+        )
+    )
     return {
         "bars": bars,
         "market_bars": market_bars,
@@ -675,7 +711,7 @@ def calculate_indicators(raw_bars):
     session_pv = 0.0
     session_volume = 0.0
     true_ranges = []
-    volumes = []
+    dollar_volume_by_slot = {}
 
     for raw in raw_bars:
         timestamp = parse_alpaca_time(raw["t"])
@@ -711,11 +747,17 @@ def calculate_indicators(raw_bars):
             true_ranges.pop(0)
         atr = sum(true_ranges) / len(true_ranges)
 
-        volumes.append(volume)
-        if len(volumes) > 20:
-            volumes.pop(0)
-        avg_volume = sum(volumes) / len(volumes) if volumes else 0
-        volume_ratio = volume / avg_volume if avg_volume else 1
+        eastern = timestamp.astimezone(EASTERN)
+        slot = (eastern.hour, eastern.minute)
+        dollar_volume = typical * volume
+        slot_history = dollar_volume_by_slot.setdefault(slot, [])
+        comparison = slot_history[-20:]
+        avg_dollar_volume = (
+            sum(comparison) / len(comparison) if comparison else dollar_volume
+        )
+        volume_ratio = dollar_volume / avg_dollar_volume if avg_dollar_volume else 1
+        rvol_sample_size = len(comparison)
+        slot_history.append(dollar_volume)
 
         bars.append(
             {
@@ -731,6 +773,9 @@ def calculate_indicators(raw_bars):
                 "atr14": atr,
                 "vwap": vwap,
                 "volume_ratio": volume_ratio,
+                "relative_dollar_volume": volume_ratio,
+                "rvol_sample_size": rvol_sample_size,
+                "rvol_method": "matched_eastern_time_20_session_dollar_volume",
             }
         )
         prev_close = close
@@ -760,11 +805,28 @@ def allowed_ledger_price(exit_price, realized_pl=0, strong=False):
     return exit_price * premium
 
 
-def reward_risk_ok(entry_price, target_price, atr, minimum=1.5):
-    stop_price = max(entry_price * 0.98, entry_price - atr)
+def reward_risk_ok(entry_price, target_price, atr, minimum=1.5, stop_price=None):
+    stop_price = (
+        float(stop_price)
+        if stop_price not in (None, "")
+        else max(entry_price * 0.98, entry_price - atr)
+    )
     risk = entry_price - stop_price
     reward = target_price - entry_price
     return risk > 0 and reward / risk >= minimum
+
+
+def structural_stop_price(config, entry_price, atr, setup_low):
+    """Risk stop shared by signal qualification, sizing, and management."""
+    atr_multiple = float(config.get("structural_stop_atr_multiple", 1.5))
+    buffer_atr = float(config.get("structural_stop_buffer_atr", 0.1))
+    max_loss_percent = float(config.get("structural_stop_max_percent", 6.0))
+    raw_stop = min(
+        entry_price - atr_multiple * atr,
+        float(setup_low) - buffer_atr * atr,
+    )
+    capped_stop = max(raw_stop, entry_price * (1 - max_loss_percent / 100))
+    return min(capped_stop, entry_price - max(0.01, 0.1 * atr))
 
 
 def price_action_label(bar, ema21_slope):
@@ -781,16 +843,50 @@ def price_action_label(bar, ema21_slope):
 
 def live_bar_context(client, symbol, config):
     now = datetime.datetime.now(datetime.timezone.utc)
-    lookback_days = config.get("dynamic_lookback_days", 7)
+    lookback_days = max(
+        int(config.get("dynamic_lookback_days", 7)),
+        int(config.get("rvol_lookback_days", 35)),
+    )
     start = iso_utc(now - datetime.timedelta(days=lookback_days))
     end = iso_utc(now)
     timeframe = config.get("dynamic_timeframe", "5Min")
-    bars = calculate_indicators(client.stock_bars(symbol, start, end, timeframe))
-    market_bars = calculate_indicators(client.stock_bars(MARKET_SYMBOL, start, end, timeframe))
-    return bars, market_bars
+    bars = calculate_indicators(
+        completed_market_bars(
+            client.stock_bars(symbol, start, end, timeframe), timeframe, now
+        )
+    )
+    market_bars = calculate_indicators(
+        completed_market_bars(
+            client.stock_bars(MARKET_SYMBOL, start, end, timeframe), timeframe, now
+        )
+    )
+    health_settings = config.get("position_health") or {}
+    sector_symbol = str(
+        (health_settings.get("benchmark_by_symbol") or {}).get(symbol)
+        or health_settings.get("benchmark_symbol")
+        or MARKET_SYMBOL
+    ).upper()
+    if sector_symbol == MARKET_SYMBOL:
+        sector_bars = market_bars
+    else:
+        sector_bars = calculate_indicators(
+            completed_market_bars(
+                client.stock_bars(sector_symbol, start, end, timeframe), timeframe, now
+            )
+        )
+    return bars, market_bars, sector_bars
 
 
-def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger=False):
+def dynamic_entry_plan(
+    symbol,
+    bars,
+    market_bars,
+    exit_trade=None,
+    ignore_ledger=False,
+    sector_bars=None,
+    config=None,
+):
+    config = config or {}
     if len(bars) < 51:
         return {"symbol": symbol, "status": "not_enough_bars"}
 
@@ -817,6 +913,17 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     )
     pullback_limit = min(pullback_zone + 0.10 * atr, ledger_cap)
     breakout_limit = min(recent_high + 0.10 * atr, ledger_cap)
+    pullback_stop = structural_stop_price(
+        config, pullback_limit, atr, min(recent_low, previous["l"])
+    )
+    breakout_stop = structural_stop_price(
+        config, breakout_limit, atr, recent_low
+    )
+    minimum_rr = float(config.get("minimum_entry_reward_risk", 1.5))
+    breakout_target = breakout_limit + max(
+        2.5 * atr,
+        minimum_rr * (breakout_limit - breakout_stop),
+    )
     pullback_touch_trigger = pullback_zone * 1.005
     pullback_reclaim_trigger = max(bar["ema9"], bar["vwap"], previous["c"])
     signal_trigger_candidates = [
@@ -827,6 +934,11 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     next_signal_trigger = min(signal_trigger_candidates) if signal_trigger_candidates else None
 
     market_ok = market_ok_at(market_bars, bar["t"])
+    sector_ok = market_ok_at(sector_bars, bar["t"]) if sector_bars else True
+    regime_ok = (
+        (market_ok or not config.get("dynamic_require_market_regime", True))
+        and (sector_ok or not config.get("dynamic_require_sector_regime", True))
+    )
     same_day_exit = (
         exit_trade
         and exit_trade.get("exit_time")
@@ -848,6 +960,8 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
     reclaim_trend_ok = trend_base and ema21_slope >= 0.002 and no_chase
     vwap_stability = sum(1 for item in bars[index - 2 : index + 1] if item["c"] > item["vwap"]) >= 2
     pullback_stock_signal = (
+        regime_ok
+        and
         above_exit
         and no_same_day_loss_reentry
         and touched_pullback
@@ -856,7 +970,13 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         and vwap_stability
         and bar["volume_ratio"] >= 1.15
         and pullback_limit <= ledger_cap
-        and reward_risk_ok(pullback_limit, recent_high, atr, minimum=1.5)
+        and reward_risk_ok(
+            pullback_limit,
+            recent_high,
+            atr,
+            minimum=minimum_rr,
+            stop_price=pullback_stop,
+        )
     )
     pullback_signal = pullback_stock_signal
 
@@ -868,16 +988,24 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         and ema21_slope >= 0.002
     )
     breakout_stock_signal = (
+        regime_ok
+        and
         above_exit
         and no_same_day_loss_reentry
         and breakout
         and breakout_trend_ok
         and bar["volume_ratio"] >= 1.5
         and breakout_limit <= ledger_cap
-        and reward_risk_ok(breakout_limit, breakout_limit + 2 * atr, atr, minimum=1.5)
+        and reward_risk_ok(
+            breakout_limit,
+            breakout_target,
+            atr,
+            minimum=minimum_rr,
+            stop_price=breakout_stop,
+        )
     )
     breakout_signal = breakout_stock_signal
-    market_filter_ignored = not market_ok and (pullback_stock_signal or breakout_stock_signal)
+    market_filter_ignored = False
 
     mode = None
     limit_price = None
@@ -888,8 +1016,30 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         mode = "dynamic_breakout_continuation"
         limit_price = breakout_limit
 
+    selected_stop = (
+        pullback_stop
+        if mode == "dynamic_pullback_reclaim"
+        else breakout_stop
+        if mode == "dynamic_breakout_continuation"
+        else None
+    )
+    selected_target = (
+        recent_high
+        if mode == "dynamic_pullback_reclaim"
+        else breakout_target
+        if mode == "dynamic_breakout_continuation"
+        else None
+    )
+    selected_risk = limit_price - selected_stop if limit_price and selected_stop else None
+    selected_reward_risk = (
+        (selected_target - limit_price) / selected_risk
+        if selected_target and selected_risk and selected_risk > 0
+        else None
+    )
+
     checks = {
-        "market_ok": market_ok or market_filter_ignored,
+        "market_ok": market_ok,
+        "sector_ok": sector_ok,
         "above_exit": above_exit,
         "no_same_day_loss_reentry": no_same_day_loss_reentry,
         "above_ema9": bar["c"] > bar["ema9"],
@@ -903,9 +1053,14 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         "breakout_now": bar["c"] > recent_high,
         "reward_risk_ok": reward_risk_ok(
             pullback_limit if mode != "dynamic_breakout_continuation" else breakout_limit,
-            recent_high if mode != "dynamic_breakout_continuation" else breakout_limit + 2 * atr,
+            recent_high if mode != "dynamic_breakout_continuation" else breakout_target,
             atr,
-            minimum=1.5,
+            minimum=minimum_rr,
+            stop_price=(
+                pullback_stop
+                if mode != "dynamic_breakout_continuation"
+                else breakout_stop
+            ),
         ),
     }
 
@@ -918,6 +1073,7 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         "last_price": bar["c"],
         "ledger_ignored": ignore_ledger or not exit_trade,
         "market_ok": market_ok,
+        "sector_ok": sector_ok,
         "market_filter_ignored": market_filter_ignored,
         "ledger_cap": ledger_cap,
         "pullback_zone": pullback_zone,
@@ -928,6 +1084,11 @@ def dynamic_entry_plan(symbol, bars, market_bars, exit_trade=None, ignore_ledger
         "breakout_limit": breakout_limit,
         "next_signal_trigger": next_signal_trigger,
         "atr14": atr,
+        "stop_price": selected_stop,
+        "target_price": selected_target,
+        "risk_per_share": selected_risk,
+        "expected_reward_risk": selected_reward_risk,
+        "minimum_entry_reward_risk": minimum_rr,
         "ema9": bar["ema9"],
         "ema21": bar["ema21"],
         "ema50": bar["ema50"],
@@ -1081,12 +1242,22 @@ def record_exit_from_order(state, order):
         state["last_exit_at"] = order.get("filled_at")
     if order.get("filled_qty") or order.get("qty"):
         state["last_exit_qty"] = int(float(order.get("filled_qty") or order.get("qty")))
+    entry_price = state.get("last_exit_entry_price")
+    if (
+        entry_price not in (None, "")
+        and state.get("last_exit_price") not in (None, "")
+        and state.get("last_exit_qty") not in (None, "")
+    ):
+        state["last_trade_pl"] = (
+            float(state["last_exit_price"]) - float(entry_price)
+        ) * float(state["last_exit_qty"])
     state["last_exit_source"] = "tracked_order"
     return {
         "last_exit_order_id": state.get("last_exit_order_id"),
         "last_exit_price": state.get("last_exit_price"),
         "last_exit_at": state.get("last_exit_at"),
         "last_exit_qty": state.get("last_exit_qty"),
+        "last_trade_pl": state.get("last_trade_pl"),
     }
 
 
@@ -1175,6 +1346,9 @@ def reconstruct_exit_from_fills(client, symbol, state):
     entry_price = state.get("entry_fill_price") or state.get("last_position_entry_price")
     if entry_price not in (None, ""):
         state["last_exit_entry_price"] = float(entry_price)
+        state["last_trade_pl"] = (
+            state["last_exit_price"] - state["last_exit_entry_price"]
+        ) * state["last_exit_qty"]
     state["last_exit_source"] = "broker_fill_reconstruction"
     state.pop("exit_reconciliation_error", None)
     return {
@@ -1183,6 +1357,7 @@ def reconstruct_exit_from_fills(client, symbol, state):
         "last_exit_at": state["last_exit_at"],
         "last_exit_qty": state["last_exit_qty"],
         "last_exit_source": state["last_exit_source"],
+        "last_trade_pl": state.get("last_trade_pl"),
     }
 
 
@@ -1392,6 +1567,18 @@ def catastrophic_floor_price(config, entry_price):
     return entry_price * (1 - loss_percent / 100)
 
 
+def managed_initial_floor_price(config, entry_price, context=None, plan=None):
+    """Return the shared live/research floor used before trailing activates."""
+    floors = [
+        initial_floor_price(config, entry_price, context),
+        catastrophic_floor_price(config, entry_price),
+    ]
+    planned_stop = float((plan or {}).get("stop_price") or 0)
+    if 0 < planned_stop < entry_price:
+        floors.append(planned_stop)
+    return max(floors)
+
+
 def adverse_reduction_details(config, entry_price, qty):
     trigger_percent = float(
         risk_setting(
@@ -1553,6 +1740,9 @@ def entry_setup_score(plan):
 
 def initial_entry_target(config, state, entry_price):
     plan = state.get("dynamic_entry_plan") or {}
+    planned_target = float(plan.get("target_price") or 0)
+    if planned_target > entry_price:
+        return planned_target, "entry_structural_target"
     atr = float(plan.get("atr14") or 0)
     if plan.get("mode") == "dynamic_breakout_continuation":
         target = float(plan.get("breakout_limit") or entry_price) + 2 * atr
@@ -1606,6 +1796,9 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "entry_setup_status": plan.get("status"),
         "entry_setup_mode": plan.get("mode"),
         "entry_setup_as_of": plan.get("last_bar_time"),
+        "entry_plan": serializable_plan(plan) if plan else {},
+        "initial_stop_price": plan.get("stop_price"),
+        "initial_risk_per_share": plan.get("risk_per_share"),
         "original_target_price": target_price,
         "target_source": target_source,
         "initial_qty": qty,
@@ -1632,9 +1825,15 @@ def position_health_market_context(client, config):
     start = iso_utc(now - datetime.timedelta(days=int(settings["lookback_days"])))
     end = iso_utc(now)
     timeframe = settings["timeframe"]
-    bars = calculate_indicators(client.stock_bars(symbol, start, end, timeframe))
+    bars = calculate_indicators(
+        completed_market_bars(
+            client.stock_bars(symbol, start, end, timeframe), timeframe, now
+        )
+    )
     market_bars = calculate_indicators(
-        client.stock_bars(benchmark_symbol, start, end, timeframe)
+        completed_market_bars(
+            client.stock_bars(benchmark_symbol, start, end, timeframe), timeframe, now
+        )
     )
     if len(bars) < 51 or len(market_bars) < 51:
         return {
@@ -1931,7 +2130,9 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
             and desired_limit
         ):
             current_qty = int(float(order.get("qty") or 0))
-            desired_qty = dynamic_entry_quantity(config, plan)
+            desired_qty = dynamic_entry_quantity(
+                config, plan, equity=float(client.account().get("equity") or 0)
+            )
             daily_limit = dynamic_entry_share_limit(
                 client,
                 config,
@@ -2154,7 +2355,9 @@ def dynamic_entry_share_limit(client, config, state, limit_price, fallback_qty):
 
 def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     symbol = config["symbol"]
-    requested_qty = dynamic_entry_quantity(config, plan)
+    requested_qty = dynamic_entry_quantity(
+        config, plan, equity=float(client.account().get("equity") or 0)
+    )
     daily_limit = dynamic_entry_share_limit(
         client,
         config,
@@ -2241,9 +2444,17 @@ def reset_entry_day_if_needed(state):
 def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     symbol = config["symbol"]
     reset_entry_day_if_needed(state)
-    bars, market_bars = live_bar_context(client, symbol, config)
+    bars, market_bars, sector_bars = live_bar_context(client, symbol, config)
     ignore_ledger = not exit_trade
-    plan = dynamic_entry_plan(symbol, bars, market_bars, exit_trade, ignore_ledger=ignore_ledger)
+    plan = dynamic_entry_plan(
+        symbol,
+        bars,
+        market_bars,
+        exit_trade,
+        ignore_ledger=ignore_ledger,
+        sector_bars=sector_bars,
+        config=config,
+    )
     state["dynamic_entry_plan"] = serializable_plan(plan)
 
     eligibility = evaluate_flat_entry_eligibility(
@@ -2294,13 +2505,17 @@ def refresh_dynamic_plan_only(client, config, state):
     ):
         return None
 
-    bars, market_bars = live_bar_context(client, config["symbol"], config)
+    bars, market_bars, sector_bars = live_bar_context(
+        client, config["symbol"], config
+    )
     plan = dynamic_entry_plan(
         config["symbol"],
         bars,
         market_bars,
         exit_trade,
         ignore_ledger=not exit_trade,
+        sector_bars=sector_bars,
+        config=config,
     )
     state["dynamic_entry_plan"] = serializable_plan(plan)
     return serializable_plan(plan)
@@ -2616,12 +2831,21 @@ def run_once(client, config, state, clock=None):
         return adverse_reduction
 
     context = risk_context(client, config) if risk_context_needed(config) else None
-    base_floor = max(
-        initial_floor_price(config, fill_price, context),
-        catastrophic_floor_price(config, fill_price),
+    base_floor = managed_initial_floor_price(
+        config,
+        fill_price,
+        context,
+        plan=(state.get("position_episode") or {}).get("entry_plan")
+        or state.get("dynamic_entry_plan"),
     )
-    trail_step = config["trail_trigger_step_percent"] / 100
-    current_rung = int((current_price / fill_price - 1) / trail_step)
+    initial_risk = float(
+        (state.get("position_episode") or {}).get("initial_risk_per_share") or 0
+    )
+    if initial_risk > 0:
+        current_rung = int((current_price - fill_price) / initial_risk)
+    else:
+        trail_step = config["trail_trigger_step_percent"] / 100
+        current_rung = int((current_price / fill_price - 1) / trail_step)
     current_rung = max(0, current_rung)
 
     if current_rung > state["highest_trail_rung"]:
@@ -2629,8 +2853,9 @@ def run_once(client, config, state, clock=None):
 
     if state["highest_trail_rung"] > 0:
         trail_below = trail_below_current_percent(config, state["highest_trail_rung"])
-        candidate_floor = current_price * (
-            1 - trail_below / 100
+        candidate_floor = max(
+            fill_price,
+            current_price * (1 - trail_below / 100),
         )
     else:
         candidate_floor = base_floor

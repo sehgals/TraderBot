@@ -108,15 +108,24 @@ def load_strategy_configs(watchers_path):
         else watchers_file.parent
     )
     supervisor_config = load_json(watchers_path, {})
+    global_position_health = supervisor_config.get("position_health") or {}
     configs = {}
     for watcher in supervisor_config.get("managed_watchers", supervisor_config.get("watchers", [])):
         config_path = project_root / watcher["config"]
         config = load_json(config_path, {})
+        config["position_health"] = {
+            **global_position_health,
+            **(config.get("position_health") or {}),
+        }
         configs[config["symbol"]] = config
     new_defaults = supervisor_config.get("new_watcher_defaults", {})
     for watcher in supervisor_config.get("new_watchers", []):
         config = {**new_defaults, **watcher.get("config_defaults", {})}
         config.setdefault("symbol", watcher["symbol"])
+        config["position_health"] = {
+            **global_position_health,
+            **(config.get("position_health") or {}),
+        }
         configs[config["symbol"]] = config
     return configs
 

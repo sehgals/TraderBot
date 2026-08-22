@@ -9,11 +9,16 @@ from traderbot.core_strategy_engine.engine import (
     apply_order_risk_caps,
     cash_available_share_count,
     cash_protected_quantity,
+    calculate_indicators,
+    completed_market_bars,
+    dynamic_entry_plan,
+    dynamic_entry_quantity,
     effective_managed_stop_price,
     ensure_catastrophic_stop,
     ensure_position_episode,
     evaluate_flat_entry_eligibility,
     initial_floor_price,
+    initial_entry_target,
     position_health_config,
     position_health_market_context,
     reconcile_flat_position_state,
@@ -22,6 +27,7 @@ from traderbot.core_strategy_engine.engine import (
     submit_confirmed_health_action,
     submit_position_health_add,
     submit_adverse_reduction,
+    structural_stop_price,
     trail_below_current_percent,
     update_stop_order,
 )
@@ -106,6 +112,120 @@ class FakeHealthClient(FakeClient):
 
 
 class RiskControlTests(unittest.TestCase):
+    def test_rvol_compares_matched_time_dollar_volume_across_twenty_sessions(self):
+        raw = []
+        start = datetime.datetime(2026, 1, 5, 20, 55, tzinfo=datetime.timezone.utc)
+        for day in range(21):
+            timestamp = start + datetime.timedelta(days=day)
+            raw.append(
+                {
+                    "t": (timestamp - datetime.timedelta(minutes=5)).isoformat(),
+                    "o": 100,
+                    "h": 100,
+                    "l": 100,
+                    "c": 100,
+                    "v": 100_000,
+                }
+            )
+            raw.append(
+                {
+                    "t": timestamp.isoformat(),
+                    "o": 100,
+                    "h": 100,
+                    "l": 100,
+                    "c": 100,
+                    "v": 2_000 if day == 20 else 1_000,
+                }
+            )
+
+        latest = calculate_indicators(raw)[-1]
+
+        self.assertAlmostEqual(latest["volume_ratio"], 2.0)
+        self.assertEqual(latest["rvol_sample_size"], 20)
+        self.assertEqual(
+            latest["rvol_method"],
+            "matched_eastern_time_20_session_dollar_volume",
+        )
+
+    def test_structural_stop_drives_risk_based_quantity_and_entry_target(self):
+        stop = structural_stop_price({}, 100, 2, 90)
+        plan = {"limit_price": 100, "stop_price": stop, "target_price": 110}
+
+        self.assertEqual(stop, 94)
+        self.assertEqual(dynamic_entry_quantity({}, plan, equity=100_000), 83)
+        self.assertEqual(dynamic_entry_quantity({}, plan, equity=1_000), 0)
+        self.assertEqual(
+            initial_entry_target({}, {"dynamic_entry_plan": plan}, 100),
+            (110, "entry_structural_target"),
+        )
+
+    def test_market_and_sector_regimes_are_hard_entry_gates(self):
+        start = datetime.datetime(2026, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)
+        stock_bars = []
+        for index in range(55):
+            is_latest = index == 54
+            stock_bars.append(
+                {
+                    "t": start + datetime.timedelta(minutes=5 * index),
+                    "o": 100,
+                    "h": 102 if is_latest else 101,
+                    "l": 99,
+                    "c": 102 if is_latest else 100,
+                    "v": 1_000,
+                    "ema9": 101 if is_latest else 99.5,
+                    "ema21": 100 if is_latest else 98 + index * 0.02,
+                    "ema50": 98,
+                    "atr14": 1,
+                    "vwap": 99,
+                    "volume_ratio": 2 if is_latest else 1,
+                }
+            )
+
+        def regime_bars(favorable):
+            result = []
+            for index in range(6):
+                result.append(
+                    {
+                        "t": stock_bars[-6 + index]["t"],
+                        "c": 102 if favorable else 99,
+                        "ema21": 100 + index * 0.1,
+                        "vwap": 100,
+                    }
+                )
+            return result
+
+        market_blocked = dynamic_entry_plan(
+            "TEST",
+            stock_bars,
+            regime_bars(False),
+            sector_bars=regime_bars(True),
+        )
+        sector_blocked = dynamic_entry_plan(
+            "TEST",
+            stock_bars,
+            regime_bars(True),
+            sector_bars=regime_bars(False),
+        )
+
+        self.assertEqual(market_blocked["status"], "watch")
+        self.assertIn("market_ok", market_blocked["blockers"])
+        self.assertEqual(sector_blocked["status"], "watch")
+        self.assertIn("sector_ok", sector_blocked["blockers"])
+
+    def test_completed_market_bars_excludes_in_progress_interval(self):
+        raw = [
+            {"t": "2026-08-21T19:50:00Z"},
+            {"t": "2026-08-21T19:55:00Z"},
+        ]
+
+        result = completed_market_bars(
+            raw,
+            "5Min",
+            now=datetime.datetime(2026, 8, 21, 19, 58, tzinfo=datetime.timezone.utc),
+        )
+
+        self.assertEqual(result, raw[:1])
+
     def test_position_health_uses_symbol_sector_benchmark(self):
         client = FakeHealthClient(position={})
         requested_symbols = []
