@@ -61,6 +61,7 @@ def signal_on_bar_60(signal_times, priorities=None):
         ignore_ledger=False,
         sector_bars=None,
         config=None,
+        filter_context=None,
     ):
         latest = symbol_bars[-1]
         if latest["t"] != signal_times[symbol]:

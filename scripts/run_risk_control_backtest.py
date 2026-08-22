@@ -556,6 +556,7 @@ def simulate_portfolio(
     exposure_observations = []
     max_gross_exposure = 0.0
     candidate_counts = collections.defaultdict(collections.Counter)
+    entry_filter_blockers = collections.defaultdict(collections.Counter)
 
     def market_context(timestamp):
         end = bisect.bisect_right(market_times, timestamp)
@@ -972,6 +973,26 @@ def simulate_portfolio(
                 candidate_counts[model_id]["evaluated"] += 1
                 if candidate.get("status") == "active_signal":
                     candidate_counts[model_id]["qualified"] += 1
+            filter_check_names = {
+                "liquidity_data_available",
+                "liquidity_ok",
+                "spread_data_available",
+                "spread_ok",
+                "gap_data_available",
+                "gap_ok",
+                "earnings_data_available",
+                "earnings_ok",
+                "corporate_actions_data_available",
+                "corporate_actions_ok",
+            }
+            blocked_filters = {
+                blocker
+                for candidate in plan.get("entry_candidates") or []
+                for blocker in candidate.get("blockers") or []
+                if blocker in filter_check_names
+            }
+            for blocker in blocked_filters:
+                entry_filter_blockers[symbol][blocker] += 1
             if plan.get("status") == "active_signal":
                 candidate_counts[plan_model_id(plan)]["selected"] += 1
             if symbol in pending_orders:
@@ -1072,6 +1093,10 @@ def simulate_portfolio(
             "execution_model": "signal at bar close; day-limit eligible from next symbol bar",
         },
         "model_attribution": model_attribution(trades, candidate_counts),
+        "entry_filter_blockers": {
+            symbol: dict(counts)
+            for symbol, counts in sorted(entry_filter_blockers.items())
+        },
         "results": results,
         "trades_detail": trades,
     }

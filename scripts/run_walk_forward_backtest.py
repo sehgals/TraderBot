@@ -4,8 +4,12 @@ import copy
 import datetime
 import json
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from scripts.run_risk_control_backtest import (
     ACCOUNT_EQUITY,
@@ -231,6 +235,7 @@ def main():
 
     window_reports = []
     all_trades = []
+    aggregate_filter_blockers = defaultdict(int)
     for number, window in enumerate(windows, 1):
         sliced_symbols = {
             symbol: slice_bars(bars, window["train_start"], window["test_end"])
@@ -259,11 +264,15 @@ def main():
         )
         trades = simulation["trades_detail"]
         all_trades.extend(trades)
+        for counts in simulation["entry_filter_blockers"].values():
+            for blocker, count in counts.items():
+                aggregate_filter_blockers[blocker] += count
         window_reports.append(
             {
                 **{key: iso_utc(value) for key, value in window.items()},
                 "portfolio": simulation["portfolio"],
                 "attribution": attribution_rows(trades, market_bars),
+                "entry_filter_blockers": simulation["entry_filter_blockers"],
             }
         )
         print(
@@ -276,6 +285,17 @@ def main():
         "method": "rolling walk-forward; training interval supplies indicator history only; all trades are out-of-sample test-window entries",
         "symbols": args.symbols,
         "filter_coverage": filter_coverage,
+        "summary": {
+            "windows": len(window_reports),
+            "profitable_windows": sum(
+                window["portfolio"]["net_pnl"] > 0 for window in window_reports
+            ),
+            "trades": len(all_trades),
+            "summed_test_window_pnl": round(
+                sum(float(trade["pnl"]) for trade in all_trades), 2
+            ),
+            "entry_filter_blockers": dict(sorted(aggregate_filter_blockers.items())),
+        },
         "windows": window_reports,
         "aggregate_by_regime_and_risk_profile": attribution_rows(
             all_trades, market_bars
