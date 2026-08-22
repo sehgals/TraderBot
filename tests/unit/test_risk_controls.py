@@ -9,6 +9,7 @@ from traderbot.core_strategy_engine.engine import (
     apply_order_risk_caps,
     cash_available_share_count,
     cash_protected_quantity,
+    cancel_tracked_legacy_ladder_orders,
     calculate_indicators,
     completed_market_bars,
     dynamic_entry_plan,
@@ -19,6 +20,7 @@ from traderbot.core_strategy_engine.engine import (
     evaluate_flat_entry_eligibility,
     initial_floor_price,
     initial_entry_target,
+    observe_ladder_opportunities,
     position_health_config,
     position_health_market_context,
     reconcile_flat_position_state,
@@ -113,6 +115,56 @@ class FakeHealthClient(FakeClient):
 
 
 class RiskControlTests(unittest.TestCase):
+    def test_ladder_trigger_is_observation_only(self):
+        observations, _detail = observe_ladder_opportunities(
+            {
+                "ladder_buy_quantity": 25,
+                "ladder_drop_steps_percent": [2],
+                "max_ladder_count": 1,
+            },
+            {"filled_ladder_steps": []},
+            100,
+            97,
+            None,
+            {"state": "Healthy", "score": 90},
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertTrue(observations[0]["observation_only"])
+        self.assertEqual(
+            observations[0]["status"], "position_health_authority_required"
+        )
+        self.assertEqual(observations[0]["proposed_qty"], 25)
+
+    def test_only_tracked_legacy_ladder_order_is_canceled(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "ladder-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "market",
+                    "status": "new",
+                },
+                {
+                    "id": "manual-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "new",
+                },
+            ]
+        )
+        state = {"ladder_order_ids": {"percent:2": "ladder-1"}}
+
+        canceled = cancel_tracked_legacy_ladder_orders(
+            client, {"symbol": "WAT"}, state
+        )
+
+        self.assertEqual(canceled, ["ladder-1"])
+        self.assertEqual(client.canceled, ["ladder-1"])
+        self.assertNotIn("manual-1", client.canceled)
+        self.assertEqual(state["ladder_order_ids"], {})
     def test_pending_entry_is_canceled_instead_of_switching_models(self):
         client = FakeClient(
             orders=[

@@ -2172,6 +2172,63 @@ def submit_coordinated_position_action(
     return None
 
 
+def cancel_tracked_legacy_ladder_orders(client, config, state):
+    """Cancel only bot-tracked legacy ladder buys, never untracked/manual orders."""
+    tracked = dict(state.get("ladder_order_ids") or {})
+    canceled = []
+    retained = {}
+    for step_key, order_id in tracked.items():
+        try:
+            order = client.order(order_id)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise
+        if (
+            order_is_open(order)
+            and order.get("side") == "buy"
+            and order.get("symbol") == config["symbol"]
+        ):
+            cancel_symbol_order(client, order_id, config["symbol"])
+            canceled.append(order_id)
+        elif order_is_open(order):
+            retained[step_key] = order_id
+    state["ladder_order_ids"] = retained
+    if canceled:
+        state["canceled_legacy_ladder_order_ids"] = sorted(
+            set((state.get("canceled_legacy_ladder_order_ids") or []) + canceled)
+        )
+    return canceled
+
+
+def observe_ladder_opportunities(config, state, fill_price, current_price, context, health):
+    """Retain ladder diagnostics without granting them order authority."""
+    observations = []
+    max_ladder_count, ladder_limit_detail = adaptive_ladder_limit(config, context)
+    if state.get("adverse_reduction_completed"):
+        max_ladder_count = 0
+        ladder_limit_detail = {
+            **ladder_limit_detail,
+            "adverse_reduction_ladder_lockout": True,
+        }
+    for ladder_step in ladder_steps(config, fill_price, context):
+        if current_price > ladder_step["trigger_price"]:
+            continue
+        observations.append(
+            {
+                **ladder_step,
+                "status": "position_health_authority_required",
+                "observation_only": True,
+                "proposed_qty": int(config.get("ladder_buy_quantity", 0)),
+                "position_health_state": (health or {}).get("state"),
+                "position_health_score": (health or {}).get("score"),
+                "ladder_limit": ladder_limit_detail,
+                "max_ladder_count": max_ladder_count,
+            }
+        )
+    return observations, ladder_limit_detail
+
+
 def update_dynamic_pending_order(client, config, state, order_id, plan):
     order = client.order(order_id)
     if order_is_open(order):
@@ -2675,6 +2732,15 @@ def handle_reentry(client, config, state):
         state.pop("reentry_order_id", None)
 
     current_price = client.latest_trade_price(symbol)
+    canceled_legacy_ladders = cancel_tracked_legacy_ladder_orders(
+        client, config, state
+    )
+    if canceled_legacy_ladders:
+        return {
+            "status": "legacy_ladder_orders_canceled",
+            "canceled_order_ids": canceled_legacy_ladders,
+            "position_qty": qty,
+        }
     reason = None
     limit_price = None
 
@@ -2983,137 +3049,9 @@ def run_once(client, config, state, clock=None):
     if position_action:
         return position_action
 
-    ladder_orders = []
-    skipped_ladder_orders = []
-    max_ladder_count, ladder_limit_detail = adaptive_ladder_limit(config, context)
-    if state.get("adverse_reduction_completed"):
-        max_ladder_count = 0
-        ladder_limit_detail = {
-            **ladder_limit_detail,
-            "adverse_reduction_ladder_lockout": True,
-        }
-    for ladder_step in ladder_steps(config, fill_price, context):
-        step_key = ladder_step["key"]
-        legacy_step = ladder_step.get("drop_step_percent")
-        if (
-            step_key in state["filled_ladder_steps"]
-            or legacy_step in state["filled_ladder_steps"]
-            or len(state["filled_ladder_steps"]) >= max_ladder_count
-        ):
-            if len(state["filled_ladder_steps"]) >= max_ladder_count:
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "max_ladder_count_blocked",
-                        "ladder_limit": ladder_limit_detail,
-                    }
-                )
-            continue
-
-        trigger_price = ladder_step["trigger_price"]
-        if current_price <= trigger_price:
-            if (
-                risk_setting(config, "ladder_requires_market_ok", False)
-                and context
-                and not context.get("market_ok", True)
-            ):
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "market_regime_blocked",
-                    }
-                )
-                continue
-
-            requested_qty = int(config["ladder_buy_quantity"])
-            requested_qty, adaptive_qty = adaptive_ladder_quantity(
-                config,
-                requested_qty,
-                state.get("base_position_qty", config.get("entry_quantity", qty)),
-                context,
-            )
-            if requested_qty <= 0:
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "adaptive_ladder_size_blocked",
-                        "adaptive_ladder": adaptive_qty,
-                        "ladder_limit": ladder_limit_detail,
-                    }
-                )
-                continue
-
-            requested_qty, ladder_caps = apply_ladder_risk_caps(
-                client, config, state, requested_qty, current_price, current_qty=qty
-            )
-            if requested_qty <= 0:
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "ladder_risk_cap_blocked",
-                        "adaptive_ladder": adaptive_qty,
-                        "ladder_limit": ladder_limit_detail,
-                        "ladder_caps": ladder_caps,
-                    }
-                )
-                continue
-
-            requested_qty, risk_caps = apply_order_risk_caps(
-                client, config, requested_qty, current_price, current_qty=qty
-            )
-            if requested_qty <= 0:
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "risk_cap_blocked",
-                        "adaptive_ladder": adaptive_qty,
-                        "ladder_limit": ladder_limit_detail,
-                        "ladder_caps": ladder_caps,
-                        "risk_caps": risk_caps,
-                    }
-                )
-                continue
-
-            ladder_qty, sizing = cash_protected_quantity(
-                client, config, requested_qty, current_price
-            )
-            if ladder_qty <= 0:
-                skipped_ladder_orders.append(
-                    {
-                        **ladder_step,
-                        "status": "cash_reserve_blocked",
-                        "sizing": sizing,
-                        "adaptive_ladder": adaptive_qty,
-                        "ladder_limit": ladder_limit_detail,
-                        "ladder_caps": ladder_caps,
-                        "risk_caps": risk_caps,
-                    }
-                )
-                continue
-
-            order = client.submit_order(
-                {
-                    "symbol": symbol,
-                    "qty": str(ladder_qty),
-                    "side": "buy",
-                    "type": "market",
-                    "time_in_force": "day",
-                }
-            )
-            state["filled_ladder_steps"].append(step_key)
-            state["ladder_order_ids"][step_key] = order["id"]
-            state["ladder_filled_qty"] = state.get("ladder_filled_qty", 0) + ladder_qty
-            state["ladder_filled_notional"] = state.get("ladder_filled_notional", 0.0) + ladder_qty * current_price
-            ladder_orders.append(
-                {
-                    "order": order,
-                    "sizing": sizing,
-                    "adaptive_ladder": adaptive_qty,
-                    "ladder_limit": ladder_limit_detail,
-                    "ladder_caps": ladder_caps,
-                    "risk_caps": risk_caps,
-                }
-            )
+    ladder_opportunities, ladder_limit_detail = observe_ladder_opportunities(
+        config, state, fill_price, current_price, context, health
+    )
 
     return {
         "status": "managed",
@@ -3126,13 +3064,14 @@ def run_once(client, config, state, clock=None):
         "highest_trail_rung": state["highest_trail_rung"],
         "updated_stop_order": stop_order["id"] if stop_order else None,
         "position_health": health,
-        "new_ladder_orders": [item["order"]["id"] for item in ladder_orders],
-        "ladder_sizing": [item["sizing"] for item in ladder_orders],
-        "adaptive_ladder": [item["adaptive_ladder"] for item in ladder_orders],
+        "new_ladder_orders": [],
+        "ladder_sizing": [],
+        "adaptive_ladder": [],
         "ladder_limit": ladder_limit_detail,
-        "ladder_caps": [item["ladder_caps"] for item in ladder_orders],
-        "ladder_risk_caps": [item["risk_caps"] for item in ladder_orders],
-        "skipped_ladder_orders": skipped_ladder_orders,
+        "ladder_caps": [],
+        "ladder_risk_caps": [],
+        "ladder_opportunities": ladder_opportunities,
+        "skipped_ladder_orders": ladder_opportunities,
     }
 
 
