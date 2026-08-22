@@ -43,15 +43,22 @@ START = datetime.datetime(2025, 7, 7, 20, 0, tzinfo=datetime.timezone.utc)
 END = datetime.datetime(2026, 7, 7, 20, 0, tzinfo=datetime.timezone.utc)
 
 
-def fetch_bars(symbol, data_url, headers, timeframe=TIMEFRAME):
+def fetch_bars(
+    symbol,
+    data_url,
+    headers,
+    timeframe=TIMEFRAME,
+    start=START,
+    end=END,
+):
     bars = []
     page_token = None
     while True:
         params = {
             "symbols": symbol,
             "timeframe": timeframe,
-            "start": iso_utc(START),
-            "end": iso_utc(END),
+            "start": iso_utc(start),
+            "end": iso_utc(end),
             "adjustment": "raw",
             "feed": "iex",
             "limit": "10000",
@@ -498,6 +505,8 @@ def simulate_portfolio(
     starting_equity=ACCOUNT_EQUITY,
     health_bars_by_symbol=None,
     regime_bars_by_symbol=None,
+    entry_filter_context_at=None,
+    entry_window=None,
 ):
     """Run all symbols on one clock and one cash balance.
 
@@ -933,6 +942,8 @@ def simulate_portfolio(
         for symbol, index, bar in current_events:
             if index < 60 or symbol in positions:
                 continue
+            if entry_window and not (entry_window[0] <= timestamp < entry_window[1]):
+                continue
             config = configs[symbol]
             exit_trade = exit_trades.get(symbol)
             if exit_trade:
@@ -940,14 +951,21 @@ def simulate_portfolio(
                 if (bar["t"] - exit_trade["exit_time"]).total_seconds() < cooldown:
                     blocked[symbol]["reentry_cooldown"] += 1
                     continue
+            plan_args = {
+                "exit_trade": exit_trade,
+                "ignore_ledger": not exit_trade,
+                "sector_bars": sector_context(symbol, timestamp),
+                "config": config,
+            }
+            if entry_filter_context_at:
+                plan_args["filter_context"] = entry_filter_context_at(
+                    symbol, timestamp
+                )
             plan = dynamic_entry_plan(
                 symbol,
                 eligible[symbol][max(0, index - 100) : index + 1],
                 market_context(timestamp),
-                exit_trade=exit_trade,
-                ignore_ledger=not exit_trade,
-                sector_bars=sector_context(symbol, timestamp),
-                config=config,
+                **plan_args,
             )
             for candidate in plan.get("entry_candidates") or []:
                 model_id = candidate.get("model_id") or "unknown"
