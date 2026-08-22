@@ -69,6 +69,9 @@ def signal_on_bar_60(signal_times, priorities=None):
             "symbol": symbol,
             "status": "active_signal",
             "mode": "dynamic_breakout_continuation",
+            "model_id": "breakout_continuation",
+            "model_version": 1,
+            "setup_score": 100,
             "limit_price": 100.0,
             "last_bar_time": latest["t"].isoformat(),
             "volume_ratio": priorities.get(symbol, 2.0),
@@ -133,6 +136,8 @@ def test_simultaneous_orders_share_one_cash_balance():
     quantities = {trade["symbol"]: trade["base_qty"] for trade in result["trades_detail"]}
     assert quantities == {"AAA": 60, "BBB": 40}
     assert result["portfolio"]["max_gross_exposure"] <= 10_000
+    assert result["model_attribution"]["breakout_continuation"]["trades"] == 2
+    assert result["model_attribution"]["breakout_continuation"]["wins"] == 0
 
 
 def test_portfolio_uses_live_catastrophic_floor_and_hard_reduction():
@@ -152,6 +157,32 @@ def test_portfolio_uses_live_catastrophic_floor_and_hard_reduction():
     trade = result["trades_detail"][0]
     assert trade["reductions"][0]["reason"] == "hard_reduction"
     assert trade["reductions"][0]["qty"] == 25
+
+
+def test_legacy_ladder_trigger_is_observation_only_in_backtest():
+    symbol_bars = bars("AAA")
+    symbol_bars[62].update({"o": 97.5, "h": 98.0, "l": 97.5, "c": 97.5})
+    signal_times = {"AAA": symbol_bars[60]["t"]}
+    strategy_config = config("AAA")
+    strategy_config.update(
+        {
+            "ladder_buy_quantity": 10,
+            "ladder_drop_steps_percent": [2],
+            "max_ladder_count": 1,
+        }
+    )
+
+    with patch.object(backtest, "dynamic_entry_plan", signal_on_bar_60(signal_times)):
+        result = backtest.simulate_portfolio(
+            {"AAA": strategy_config},
+            {"AAA": symbol_bars},
+            symbol_bars,
+            starting_equity=10_000,
+        )
+
+    trade = result["trades_detail"][0]
+    assert trade["ladder_fills"] == []
+    assert result["results"][0]["blocked"]["ladder_observation_only"] >= 1
 
 
 def test_active_live_health_policy_requires_matching_hourly_data():

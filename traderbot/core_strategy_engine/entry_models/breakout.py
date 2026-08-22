@@ -43,6 +43,7 @@ def evaluate_breakout(features, config=None):
         >= float(settings.get("minimum_ema21_slope", 0.002))
     )
     checks = {
+        "model_enabled": settings.get("enabled", True),
         "market_ok": features["market_ok"]
         or not config.get("dynamic_require_market_regime", True),
         "sector_ok": features["sector_ok"]

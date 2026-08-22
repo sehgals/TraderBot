@@ -55,6 +55,7 @@ def evaluate_pullback(features, config=None):
         if item["c"] > item["vwap"]
     ) >= int(settings.get("minimum_vwap_stable_bars", 2))
     checks = {
+        "model_enabled": settings.get("enabled", True),
         "market_ok": features["market_ok"]
         or not config.get("dynamic_require_market_regime", True),
         "sector_ok": features["sector_ok"]

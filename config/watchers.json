@@ -458,6 +458,7 @@
   ],
   "max_concurrency": 3,
   "new_watcher_defaults": {
+    "direct_ladder_authority_enabled": false,
     "dynamic_entry_enabled": true,
     "dynamic_entry_notional": 5000,
     "dynamic_entry_time_in_force": "day",
@@ -469,6 +470,19 @@
     "dynamic_replace_min_change_percent": 0.25,
     "dynamic_replace_open_orders": true,
     "dynamic_timeframe": "5Min",
+    "entry_model_architecture_version": 2,
+    "entry_models": {
+      "breakout": {
+        "enabled": true,
+        "minimum_reward_risk": 1.5,
+        "minimum_rvol": 1.5
+      },
+      "pullback": {
+        "enabled": true,
+        "minimum_reward_risk": 1.5,
+        "minimum_rvol": 1.15
+      }
+    },
     "entry_quantity": 1,
     "initial_stop_loss_percent": 20,
     "ladder_buy_quantity": 0,

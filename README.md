@@ -166,6 +166,9 @@ Managed strategies support:
 - Entry RVOL uses matched Eastern-time-of-day dollar volume from up to 20 prior sessions, avoiding the opening/closing-volume bias of a rolling 20-bar average.
 - Dynamic entries require favorable QQQ and sector-benchmark regimes by default.
 - Dynamic entry admission, 0.5%-of-equity sizing, initial protection, and R-based trailing share one structural stop; entries require at least 1.5:1 expected reward/risk.
+- Pullback-reclaim and breakout-continuation entries are evaluated and scored independently, then classified by a deterministic single-entry arbiter.
+- The first fill freezes the originating entry model and risk contract; Position Health owns all later discretionary adds, reductions, and exits.
+- Legacy ladder levels are observation-only and cannot submit post-fill buys.
 
 Dynamic plans write `dynamic_entry_plan` into strategy state with pullback/breakout levels, price-action context, ledger caps, and blockers.
 

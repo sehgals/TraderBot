@@ -117,6 +117,64 @@ def dynamic_qty(config, plan, equity=None):
     return int(config.get("entry_quantity", 1))
 
 
+def plan_model_id(plan):
+    if plan.get("model_id"):
+        return plan["model_id"]
+    return {
+        "dynamic_pullback_reclaim": "pullback_reclaim",
+        "dynamic_breakout_continuation": "breakout_continuation",
+    }.get(plan.get("mode"), "legacy_combined")
+
+
+def model_attribution(trades, candidate_counts=None):
+    candidate_counts = candidate_counts or {}
+    models = sorted(
+        set(candidate_counts)
+        | {trade.get("entry_model_id", "legacy_combined") for trade in trades}
+    )
+    attribution = {}
+    for model_id in models:
+        model_trades = [
+            trade
+            for trade in trades
+            if trade.get("entry_model_id", "legacy_combined") == model_id
+        ]
+        profits = [float(trade.get("pnl") or 0) for trade in model_trades]
+        gross_profit = sum(value for value in profits if value > 0)
+        gross_loss = -sum(value for value in profits if value < 0)
+        realized_r = [
+            float(trade.get("realized_r"))
+            for trade in model_trades
+            if trade.get("realized_r") is not None
+        ]
+        counts = candidate_counts.get(model_id, {})
+        attribution[model_id] = {
+            "candidate_evaluations": int(counts.get("evaluated", 0)),
+            "qualified_signals": int(counts.get("qualified", 0)),
+            "selected_signals": int(counts.get("selected", 0)),
+            "trades": len(model_trades),
+            "wins": sum(1 for value in profits if value > 0),
+            "win_rate_percent": round(
+                100 * sum(1 for value in profits if value > 0) / len(model_trades), 4
+            )
+            if model_trades
+            else 0,
+            "net_pnl": round(sum(profits), 2),
+            "average_pnl": round(sum(profits) / len(profits), 2) if profits else 0,
+            "average_realized_r": round(sum(realized_r) / len(realized_r), 4)
+            if realized_r
+            else None,
+            "profit_factor": round(gross_profit / gross_loss, 4)
+            if gross_loss
+            else None,
+            "health_adds": sum(len(trade.get("adds") or []) for trade in model_trades),
+            "reductions": sum(
+                len(trade.get("reductions") or []) for trade in model_trades
+            ),
+        }
+    return attribution
+
+
 def close_position(trades, open_pos, bar, exit_price, reason, realized_equity, max_open_loss, open_max_capital):
     pnl = (exit_price - open_pos["avg_price"]) * open_pos["qty"]
     open_pos.update(
@@ -396,6 +454,7 @@ def portfolio_result_by_symbol(symbol, config, bars, trades, blocked):
             "shared_cash",
             "reentry_cooldown",
             "replaced_open_order",
+            "ladder_observation_only",
         )
     }
     return {
@@ -487,6 +546,7 @@ def simulate_portfolio(
     max_drawdown_percent = 0.0
     exposure_observations = []
     max_gross_exposure = 0.0
+    candidate_counts = collections.defaultdict(collections.Counter)
 
     def market_context(timestamp):
         end = bisect.bisect_right(market_times, timestamp)
@@ -521,6 +581,13 @@ def simulate_portfolio(
                 else 0,
                 "bars_held": position["bars_seen"] - 1,
             }
+        )
+        initial_risk_dollars = (
+            float(position.get("initial_risk_per_share") or 0)
+            * int(position.get("base_qty") or 0)
+        )
+        position["realized_r"] = (
+            pnl / initial_risk_dollars if initial_risk_dollars > 0 else None
         )
         trades.append(position)
         exit_trades[symbol] = {
@@ -558,30 +625,10 @@ def simulate_portfolio(
             reduction = adverse_reduction_details(
                 config, position["avg_price"], position["qty"]
             )
-            if (
+            hard_reduction_due = (
                 not position.get("adverse_reduction_completed")
                 and bar["c"] <= reduction["trigger_price"]
-            ):
-                reduction_qty = reduction["qty"]
-                if reduction_qty >= position["qty"]:
-                    close_portfolio_position(symbol, bar, bar["c"], "hard_reduction")
-                else:
-                    realized = (bar["c"] - position["avg_price"]) * reduction_qty
-                    cash += bar["c"] * reduction_qty
-                    position["qty"] -= reduction_qty
-                    position["realized_pnl"] += realized
-                    position["adverse_reduction_completed"] = True
-                    position["episode"]["adverse_reduction_completed"] = True
-                    position["reductions"].append(
-                        {
-                            "time": bar["t"].isoformat(),
-                            "price": bar["c"],
-                            "qty": reduction_qty,
-                            "pnl": realized,
-                            "reason": "hard_reduction",
-                        }
-                    )
-                continue
+            )
 
             entry_price = position["initial_entry_price"]
             base_floor = managed_initial_floor_price(
@@ -671,6 +718,7 @@ def simulate_portfolio(
                         confirmed
                         and action == "reduce"
                         and not position.get("adverse_reduction_completed")
+                        and not hard_reduction_due
                     ):
                         reduction_qty = min(
                             position["qty"],
@@ -706,7 +754,7 @@ def simulate_portfolio(
                             )
                         continue
 
-                    if settings.get("additions_enabled", False):
+                    if settings.get("additions_enabled", False) and not hard_reduction_due:
                         equity = portfolio_equity(cash, positions, last_prices)
                         add_eligibility = evaluate_add_eligibility(
                             health,
@@ -753,45 +801,35 @@ def simulate_portfolio(
                                     }
                                 )
 
+            if hard_reduction_due:
+                reduction_qty = reduction["qty"]
+                if reduction_qty >= position["qty"]:
+                    close_portfolio_position(symbol, bar, bar["c"], "hard_reduction")
+                else:
+                    realized = (bar["c"] - position["avg_price"]) * reduction_qty
+                    cash += bar["c"] * reduction_qty
+                    position["qty"] -= reduction_qty
+                    position["realized_pnl"] += realized
+                    position["adverse_reduction_completed"] = True
+                    position["episode"]["adverse_reduction_completed"] = True
+                    position["reductions"].append(
+                        {
+                            "time": bar["t"].isoformat(),
+                            "price": bar["c"],
+                            "qty": reduction_qty,
+                            "pnl": realized,
+                            "reason": "hard_reduction",
+                        }
+                    )
+                continue
+
             context = {
                 "latest_bar": bar,
                 "market_ok": market_ok_at(market_context(timestamp), timestamp),
             }
-            max_ladders, _ = adaptive_ladder_limit(config, context)
             for step in ladder_steps(config, entry_price, context):
-                if step["key"] in position["filled_ladder_steps"]:
-                    continue
-                if len(position["filled_ladder_steps"]) >= max_ladders:
-                    blocked[symbol]["max_ladders"] += 1
-                    continue
-                if bar["c"] > step["trigger_price"]:
-                    continue
-                if risk_setting(config, "ladder_requires_market_ok", False) and not context["market_ok"]:
-                    blocked[symbol]["market_regime"] += 1
-                    continue
-                requested = int(config.get("ladder_buy_quantity", 0) or 0)
-                requested, _ = adaptive_ladder_quantity(
-                    config, requested, position["base_qty"], context
-                )
-                requested = ladder_cap_qty(config, position, requested, bar["c"])
-                equity = portfolio_equity(cash, positions, last_prices)
-                reserve = equity * float(config.get("min_cash_balance_percent", 20)) / 100
-                affordable = math.floor(max(0, cash - reserve) / bar["c"])
-                qty = min(requested, affordable)
-                if qty <= 0:
-                    blocked[symbol]["shared_cash"] += 1
-                    continue
-                cash -= qty * bar["c"]
-                position["avg_price"] = (
-                    position["avg_price"] * position["qty"] + bar["c"] * qty
-                ) / (position["qty"] + qty)
-                position["qty"] += qty
-                position["ladder_qty"] += qty
-                position["ladder_notional"] += qty * bar["c"]
-                position["filled_ladder_steps"].append(step["key"])
-                position["ladder_fills"].append(
-                    {"time": bar["t"].isoformat(), "price": bar["c"], "qty": qty, **step}
-                )
+                if bar["c"] <= step["trigger_price"]:
+                    blocked[symbol]["ladder_observation_only"] += 1
 
         # Orders created by earlier bars compete for shared capital by signal quality.
         executable = []
@@ -840,6 +878,8 @@ def simulate_portfolio(
             )
             episode = {
                 "symbol": symbol,
+                "origin_model_id": plan_model_id(plan),
+                "origin_model_version": int(plan.get("model_version") or 0),
                 "entry_setup_score": entry_setup_score(plan),
                 "entry_setup_status": plan.get("status"),
                 "entry_setup_mode": plan.get("mode"),
@@ -858,11 +898,14 @@ def simulate_portfolio(
                 "signal_time": order["signal_time"].isoformat(),
                 "entry_index": index,
                 "entry_mode": plan.get("mode"),
+                "entry_model_id": plan_model_id(plan),
+                "entry_model_version": int(plan.get("model_version") or 0),
                 "initial_entry_price": fill_price,
                 "avg_price": fill_price,
                 "qty": qty,
                 "base_qty": qty,
                 "initial_notional": qty * fill_price,
+                "initial_risk_per_share": plan.get("risk_per_share"),
                 "floor_price": managed_initial_floor_price(
                     config, fill_price, {"latest_bar": bar}, plan=plan
                 ),
@@ -906,6 +949,13 @@ def simulate_portfolio(
                 sector_bars=sector_context(symbol, timestamp),
                 config=config,
             )
+            for candidate in plan.get("entry_candidates") or []:
+                model_id = candidate.get("model_id") or "unknown"
+                candidate_counts[model_id]["evaluated"] += 1
+                if candidate.get("status") == "active_signal":
+                    candidate_counts[model_id]["qualified"] += 1
+            if plan.get("status") == "active_signal":
+                candidate_counts[plan_model_id(plan)]["selected"] += 1
             if symbol in pending_orders:
                 if (
                     config.get("dynamic_replace_open_orders", True)
@@ -1003,6 +1053,7 @@ def simulate_portfolio(
             "pending_orders_at_end": len(pending_orders),
             "execution_model": "signal at bar close; day-limit eligible from next symbol bar",
         },
+        "model_attribution": model_attribution(trades, candidate_counts),
         "results": results,
         "trades_detail": trades,
     }
@@ -1130,16 +1181,20 @@ def main():
         "portfolio": simulation["portfolio"],
         "live_parity": {
             "shared_dynamic_entry_plan": True,
+            "separate_entry_models": True,
+            "deterministic_entry_arbiter": True,
             "shared_initial_and_catastrophic_floor": True,
             "adverse_reduction": True,
             "ledger_aware_reentry": True,
             "reentry_cooldown": True,
             "position_health_actions": True,
             "position_health_additions": True,
+            "direct_ladder_authority": False,
             "shared_cash_and_symbol_caps": True,
             "known_execution_approximation": "market orders fill at the current completed bar close; stop gaps fill at the worse of stop or bar open",
         },
         "results": results,
+        "model_attribution": simulation["model_attribution"],
         "errors": errors,
         "trades_detail": simulation["trades_detail"],
     }
