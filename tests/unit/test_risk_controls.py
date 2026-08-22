@@ -476,7 +476,64 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(episode["state"], "OPEN_PARTIAL")
         self.assertEqual(episode["entry_setup_score"], 92)
         self.assertEqual(episode["original_target_price"], 408)
+        self.assertEqual(episode["origin_model_id"], "breakout_continuation")
+        self.assertEqual(episode["origin_model_version"], 0)
         self.assertEqual(state["managed_entry_order_id"], "entry-1")
+
+    def test_position_episode_model_contract_is_immutable_after_first_fill(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "4",
+            "avg_entry_price": "100",
+            "current_price": "101",
+        }
+        state = {
+            "current_entry_order_id": "entry-1",
+            "pending_entry_model_id": "breakout_continuation",
+            "pending_entry_model_version": 1,
+            "dynamic_entry_plan": {
+                "status": "active_signal",
+                "mode": "dynamic_breakout_continuation",
+                "model_id": "breakout_continuation",
+                "model_version": 1,
+                "setup_score": 100,
+                "model_checks": {"breakout_now": True},
+                "last_bar_time": "2026-08-11T15:55:00Z",
+                "limit_price": 100,
+                "stop_price": 96,
+                "target_price": 108,
+                "risk_per_share": 4,
+                "expected_reward_risk": 2,
+            },
+        }
+
+        episode = ensure_position_episode(
+            {"symbol": "WAT"},
+            state,
+            position,
+            entry_order={"id": "entry-1", "status": "partially_filled"},
+        )
+        original_hash = episode["entry_candidate_hash"]
+        original_snapshot = dict(episode["entry_candidate_snapshot"])
+        state["dynamic_entry_plan"] = {
+            "status": "active_signal",
+            "mode": "dynamic_pullback_reclaim",
+            "model_id": "pullback_reclaim",
+            "model_version": 1,
+            "setup_score": 77,
+            "target_price": 105,
+        }
+        position.update({"qty": "5", "avg_entry_price": "100.50"})
+
+        refreshed = ensure_position_episode({"symbol": "WAT"}, state, position)
+
+        self.assertEqual(refreshed["origin_model_id"], "breakout_continuation")
+        self.assertEqual(refreshed["origin_model_version"], 1)
+        self.assertEqual(refreshed["entry_setup_score"], 100)
+        self.assertEqual(refreshed["entry_candidate_hash"], original_hash)
+        self.assertEqual(refreshed["entry_candidate_snapshot"], original_snapshot)
+        self.assertEqual(refreshed["current_qty"], 5)
+        self.assertEqual(refreshed["average_entry_price"], 100.5)
 
     def test_health_action_is_inert_in_shadow_mode(self):
         client = FakeClient(

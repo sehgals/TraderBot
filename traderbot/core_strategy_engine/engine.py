@@ -1595,8 +1595,88 @@ def timeframe_minutes(timeframe):
 def entry_setup_score(plan):
     if not plan:
         return None
+    if plan.get("setup_score") is not None:
+        return int(plan["setup_score"])
     blockers = set(plan.get("blockers") or [])
     return round(max(0, 13 - len(blockers)) / 13 * 100)
+
+
+ENTRY_MODE_MODEL_IDS = {
+    "dynamic_pullback_reclaim": "pullback_reclaim",
+    "dynamic_breakout_continuation": "breakout_continuation",
+}
+
+
+def entry_model_identity(state, plan, episode=None):
+    episode = episode or {}
+    explicit_model_id = (
+        episode.get("origin_model_id")
+        or state.get("pending_entry_model_id")
+        or plan.get("model_id")
+    )
+    mode = episode.get("entry_setup_mode") or plan.get("mode")
+    model_id = explicit_model_id or ENTRY_MODE_MODEL_IDS.get(mode) or "legacy_combined"
+    explicit_version = (
+        episode.get("origin_model_version")
+        or state.get("pending_entry_model_version")
+        or plan.get("model_version")
+    )
+    return model_id, int(explicit_version or 0)
+
+
+def selected_entry_candidate_snapshot(state, plan, model_id):
+    candidate = next(
+        (
+            item
+            for item in (plan.get("entry_candidates") or [])
+            if item.get("model_id") == model_id
+        ),
+        None,
+    )
+    source = candidate or {
+        "model_id": model_id,
+        "model_version": plan.get("model_version"),
+        "status": plan.get("status"),
+        "as_of": plan.get("last_bar_time"),
+        "setup_score": plan.get("setup_score"),
+        "checks": plan.get("model_checks") or {},
+        "blockers": plan.get("blockers") or [],
+        "limit_price": plan.get("limit_price"),
+        "stop_price": plan.get("stop_price"),
+        "target_price": plan.get("target_price"),
+        "risk_per_share": plan.get("risk_per_share"),
+        "expected_reward_risk": plan.get("expected_reward_risk"),
+    }
+    return json.loads(json.dumps(source, sort_keys=True, default=str))
+
+
+def candidate_snapshot_hash(snapshot):
+    payload = json.dumps(snapshot or {}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def migrate_position_episode_identity(state, episode):
+    plan = episode.get("entry_plan") or state.get("dynamic_entry_plan") or {}
+    model_id, model_version = entry_model_identity(state, plan, episode=episode)
+    episode.setdefault("origin_model_id", model_id)
+    episode.setdefault("origin_model_version", model_version)
+    if "entry_candidate_snapshot" not in episode:
+        episode["entry_candidate_snapshot"] = selected_entry_candidate_snapshot(
+            state, plan, episode["origin_model_id"]
+        )
+    episode.setdefault(
+        "entry_candidate_hash",
+        candidate_snapshot_hash(episode["entry_candidate_snapshot"]),
+    )
+    episode.setdefault(
+        "entry_model_checks",
+        dict(episode["entry_candidate_snapshot"].get("checks") or {}),
+    )
+    episode.setdefault(
+        "entry_model_blockers",
+        list(episode["entry_candidate_snapshot"].get("blockers") or []),
+    )
+    return episode
 
 
 def initial_entry_target(config, state, entry_price):
@@ -1631,6 +1711,7 @@ def ensure_position_episode(config, state, position, entry_order=None):
     entry_price = float(position.get("avg_entry_price") or 0)
     episode = state.get("position_episode")
     if episode and episode.get("symbol") == config["symbol"]:
+        migrate_position_episode_identity(state, episode)
         episode["current_qty"] = qty
         episode["average_entry_price"] = entry_price
         return episode
@@ -1644,6 +1725,8 @@ def ensure_position_episode(config, state, position, entry_order=None):
     entry_order_id = (entry_order or {}).get("id") or state.get("current_entry_order_id")
     episode_id = f"{config['symbol']}:{entry_order_id or opened_at}"
     plan = state.get("dynamic_entry_plan") or {}
+    model_id, model_version = entry_model_identity(state, plan)
+    candidate_snapshot = selected_entry_candidate_snapshot(state, plan, model_id)
     episode = {
         "episode_id": episode_id,
         "symbol": config["symbol"],
@@ -1658,6 +1741,12 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "entry_setup_mode": plan.get("mode"),
         "entry_setup_as_of": plan.get("last_bar_time"),
         "entry_plan": serializable_plan(plan) if plan else {},
+        "origin_model_id": model_id,
+        "origin_model_version": model_version,
+        "entry_candidate_snapshot": candidate_snapshot,
+        "entry_candidate_hash": candidate_snapshot_hash(candidate_snapshot),
+        "entry_model_checks": dict(candidate_snapshot.get("checks") or {}),
+        "entry_model_blockers": list(candidate_snapshot.get("blockers") or []),
         "initial_stop_price": plan.get("stop_price"),
         "initial_risk_per_share": plan.get("risk_per_share"),
         "original_target_price": target_price,
