@@ -997,7 +997,8 @@ def dynamic_entry_plan(
 
 def serializable_plan(plan):
     cleaned = dict(plan)
-    if math.isinf(cleaned.get("ledger_cap", math.inf)):
+    ledger_cap = cleaned.get("ledger_cap", math.inf)
+    if ledger_cap is None or math.isinf(ledger_cap):
         cleaned["ledger_cap"] = None
     return cleaned
 

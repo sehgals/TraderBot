@@ -547,6 +547,26 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(episode["origin_model_version"], 0)
         self.assertEqual(state["managed_entry_order_id"], "entry-1")
 
+    def test_first_fill_accepts_serialized_plan_with_null_ledger_cap(self):
+        position = {
+            "symbol": "WAT",
+            "qty": "4",
+            "avg_entry_price": "100",
+            "current_price": "101",
+        }
+        state = {
+            "dynamic_entry_plan": {
+                "last_bar_time": "2026-08-11T15:55:00Z",
+                "ledger_cap": None,
+                "target_price": 108,
+            },
+        }
+
+        episode = ensure_position_episode({"symbol": "WAT"}, state, position)
+
+        self.assertIsNone(episode["entry_plan"]["ledger_cap"])
+        self.assertEqual(episode["original_target_price"], 108)
+
     def test_position_episode_model_contract_is_immutable_after_first_fill(self):
         position = {
             "symbol": "WAT",

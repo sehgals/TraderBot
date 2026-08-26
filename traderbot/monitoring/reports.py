@@ -238,13 +238,19 @@ def watcher_position_healths(project_root, watchers_path, client=None, positions
                 **(strategy_config.get("position_health") or {}),
             }
             strategy_config.setdefault("symbol", watcher.get("symbol"))
-            assessment = refresh_position_health(
-                client,
-                strategy_config,
-                state,
-                position,
-                force=True,
-            )
+            try:
+                assessment = refresh_position_health(
+                    client,
+                    strategy_config,
+                    state,
+                    position,
+                    force=True,
+                )
+            except Exception as exc:
+                health[watcher.get("symbol")] = unavailable_position_health(
+                    f"health_refresh_error:{type(exc).__name__}"
+                )
+                continue
         health[watcher.get("symbol")] = report_position_health(assessment)
     return health
 
