@@ -264,6 +264,21 @@ def test_flat_managed_stock_section_explains_current_entry_evaluation():
     assert "### Entry / Re-entry Method" in markdown
 
 
+def test_flat_managed_stocks_are_sorted_by_entry_setup_score_descending():
+    items = [
+        {"symbol": "WEAK", "signal_strength": "Weak", "signal_score": 46},
+        {"symbol": "NONE", "signal_strength": "Unavailable", "signal_score": None},
+        {"symbol": "STRONG", "signal_strength": "Strong", "signal_score": 92},
+        {"symbol": "MODERATE", "signal_strength": "Moderate", "signal_score": 69},
+    ]
+
+    rendered = "\n".join(render_flat_managed_stocks_table(items))
+
+    assert rendered.index("STRONG") < rendered.index("MODERATE")
+    assert rendered.index("MODERATE") < rendered.index("WEAK")
+    assert rendered.index("WEAK") < rendered.index("NONE")
+
+
 def test_flat_managed_stock_evaluations_excludes_open_and_new_watchers(tmp_path):
     config_path = tmp_path / "watchers.json"
     flat_state = tmp_path / "flat.json"

@@ -1156,7 +1156,15 @@ def render_flat_managed_stocks_table(items):
     if not items:
         return ["No managed stocks are currently flat."]
     rows = []
-    for item in items:
+    sorted_items = sorted(
+        items,
+        key=lambda item: (
+            item.get("signal_score") is None,
+            -(item.get("signal_score") or 0),
+            item.get("symbol") or "",
+        ),
+    )
+    for item in sorted_items:
         eligibility = item.get("entry_eligibility") or {}
         eligibility_reasons = eligibility.get("reasons") or []
         if eligibility.get("eligible"):

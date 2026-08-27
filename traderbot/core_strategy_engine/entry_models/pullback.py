@@ -28,10 +28,7 @@ def evaluate_pullback(features, config=None):
     )
     touch_trigger = pullback_zone * 1.005
     reclaim_trigger = max(bar["ema9"], bar["vwap"], previous["c"])
-    limit_price = min(
-        pullback_zone + float(settings.get("limit_buffer_atr", 0.10)) * atr,
-        features["ledger_cap"],
-    )
+    limit_price = pullback_zone + float(settings.get("limit_buffer_atr", 0.10)) * atr
     stop_price = structural_stop_price(
         {**config, **settings},
         limit_price,
@@ -72,6 +69,8 @@ def evaluate_pullback(features, config=None):
         "no_chase": no_chase,
         "vwap_stability": vwap_stability,
         "volume_ok": features["relative_dollar_volume"] >= minimum_rvol,
+        # Preserve the setup-derived price and use the ledger only to decide
+        # eligibility.  Repricing to the cap distorts downstream risk levels.
         "ledger_price_ok": limit_price <= features["ledger_cap"],
         "reward_risk_ok": reward_risk_ok(
             limit_price,

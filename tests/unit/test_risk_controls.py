@@ -1,5 +1,6 @@
 import datetime
 import unittest
+from unittest.mock import patch
 
 from traderbot.core_strategy_engine.engine import (
     adaptive_ladder_limit,
@@ -829,6 +830,85 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(client.submitted[0]["side"], "sell")
         self.assertEqual(client.submitted[0]["type"], "stop")
         self.assertEqual(client.submitted[0]["qty"], "4")
+
+    def test_unfilled_entry_without_position_skips_position_health(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "new",
+                    "qty": "12",
+                    "filled_qty": "0",
+                    "limit_price": "400",
+                }
+            ],
+        )
+        state = {"current_entry_order_id": "entry-1"}
+
+        result = run_once(
+            client,
+            {"symbol": "WAT", "position_health": {"shadow_mode": False}},
+            state,
+            clock={"is_open": True},
+        )
+
+        self.assertEqual(result["status"], "waiting_for_entry_fill")
+        self.assertIsNone(result["position_health"])
+
+    def test_open_dynamic_entry_is_recalculated_and_replaced(self):
+        client = FakeClient(
+            orders=[
+                {
+                    "id": "entry-1",
+                    "symbol": "WAT",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "new",
+                    "qty": "5",
+                    "filled_qty": "0",
+                    "limit_price": "100",
+                    "time_in_force": "day",
+                }
+            ],
+        )
+        state = {
+            "current_entry_order_id": "entry-1",
+            "reentry_order_id": "entry-1",
+            "pending_entry_model_id": "breakout_continuation",
+            "reentry_shares_today": 5,
+        }
+        plan = {
+            "status": "active_signal",
+            "model_id": "breakout_continuation",
+            "model_version": 1,
+            "mode": "dynamic_breakout_continuation",
+            "last_bar_time": "2026-08-27T15:15:00Z",
+            "limit_price": 110,
+            "stop_price": 100,
+        }
+
+        with patch(
+            "traderbot.core_strategy_engine.engine.refresh_dynamic_plan_only",
+            return_value=plan,
+        ):
+            result = run_once(
+                client,
+                {
+                    "symbol": "WAT",
+                    "dynamic_reentry_enabled": True,
+                    "reentry_enabled": True,
+                    "min_cash_balance_percent": 0,
+                },
+                state,
+                clock={"is_open": True},
+            )
+
+        self.assertEqual(result["status"], "dynamic_entry_order_replaced")
+        self.assertEqual(client.replaced[0][0], "entry-1")
+        self.assertEqual(client.replaced[0][1]["limit_price"], "110.00")
 
     def test_catastrophic_stop_adopts_existing_tighter_stop(self):
         client = FakeClient(

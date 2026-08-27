@@ -1866,6 +1866,8 @@ def health_refresh_due(state, settings, now=None):
 
 
 def refresh_position_health(client, config, state, position, force=False):
+    if not position or position_quantity(position) <= 0:
+        return None
     settings = position_health_config(config)
     if not settings.get("enabled", True):
         return None
@@ -2955,10 +2957,17 @@ def run_once(client, config, state, clock=None):
         state.setdefault("ladder_order_ids", {})
 
     if entry_order and entry_order.get("status") != "filled":
-        health = refresh_position_health(client, config, state, position)
+        # An unfilled or expired entry has no holding to assess.  Position
+        # health remains applicable to partial fills, where qty is positive.
+        health = (
+            refresh_position_health(client, config, state, position)
+            if qty > 0
+            else None
+        )
         settings = position_health_config(config)
         should_cancel_remainder = (
-            not settings.get("shadow_mode", True)
+            qty > 0
+            and not settings.get("shadow_mode", True)
             and (
                 health is None
                 or health.get("score") is None
@@ -2974,6 +2983,26 @@ def run_once(client, config, state, clock=None):
                 "catastrophic_stop": catastrophic_stop,
                 "position_health": health,
             }
+        if order_is_open(entry_order) and (
+            config.get("dynamic_entry_enabled")
+            or config.get("dynamic_reentry_enabled")
+        ):
+            plan = refresh_dynamic_plan_only(client, config, state)
+            if plan:
+                pending = update_dynamic_pending_order(
+                    client,
+                    config,
+                    state,
+                    entry_order["id"],
+                    plan,
+                )
+                if pending:
+                    return {
+                        **pending,
+                        "catastrophic_stop": catastrophic_stop,
+                        "position_health": health,
+                        "dynamic_plan": serializable_plan(plan),
+                    }
         if config.get("reentry_enabled") and entry_order.get("status") in (
             "canceled",
             "expired",

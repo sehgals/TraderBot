@@ -20,10 +20,7 @@ def evaluate_breakout(features, config=None):
             config.get("minimum_entry_reward_risk", 1.5),
         )
     )
-    limit_price = min(
-        recent_high + float(settings.get("limit_buffer_atr", 0.10)) * atr,
-        features["ledger_cap"],
-    )
+    limit_price = recent_high + float(settings.get("limit_buffer_atr", 0.10)) * atr
     stop_price = structural_stop_price(
         {**config, **settings},
         limit_price,
@@ -54,6 +51,9 @@ def evaluate_breakout(features, config=None):
         "breakout_now": breakout_now,
         "trend_ok": trend_ok,
         "volume_ok": features["relative_dollar_volume"] >= minimum_rvol,
+        # The ledger is an eligibility ceiling, not an order price.  Clamping a
+        # breakout to an old exit-relative cap can manufacture an order, stop,
+        # and target far below the live setup while making this check tautological.
         "ledger_price_ok": limit_price <= features["ledger_cap"],
         "reward_risk_ok": reward_risk_ok(
             limit_price,
