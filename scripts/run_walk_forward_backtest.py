@@ -19,10 +19,70 @@ from scripts.run_risk_control_backtest import (
     position_health_config,
     simulate_portfolio,
 )
+from traderbot.backtester.baseline import (
+    attribution_by_dimensions,
+    combine_forward_return_reports,
+    dataset_manifest,
+    performance_metrics,
+    source_provenance,
+    stable_hash,
+)
 from traderbot.backtester.reentry_backtest import load_strategy_configs
 
 
 UTC = datetime.timezone.utc
+
+WEIGHT_PROFILES = {
+    "balanced": {
+        "price_action": 25, "stock_trend": 20, "market_sector_regime": 15,
+        "volume_liquidity_quality": 15, "reward_risk_geometry": 15,
+        "relative_strength_execution": 10,
+    },
+    "price_action": {
+        "price_action": 35, "stock_trend": 20, "market_sector_regime": 10,
+        "volume_liquidity_quality": 15, "reward_risk_geometry": 10,
+        "relative_strength_execution": 10,
+    },
+    "trend_regime": {
+        "price_action": 20, "stock_trend": 30, "market_sector_regime": 20,
+        "volume_liquidity_quality": 10, "reward_risk_geometry": 10,
+        "relative_strength_execution": 10,
+    },
+    "reward_risk": {
+        "price_action": 20, "stock_trend": 15, "market_sector_regime": 10,
+        "volume_liquidity_quality": 15, "reward_risk_geometry": 30,
+        "relative_strength_execution": 10,
+    },
+}
+
+
+def configs_with_score_weights(configs, weights):
+    prepared = copy.deepcopy(configs)
+    for config in prepared.values():
+        config["entry_score_weights"] = dict(weights)
+    return prepared
+
+
+def calibration_objective(simulation):
+    """Training-only objective: return, penalized for drawdown and no evidence."""
+    portfolio = simulation["portfolio"]
+    trades = len(simulation.get("trades_detail") or [])
+    if not trades:
+        return -1_000_000.0
+    return round(
+        float(portfolio.get("return_percent") or 0)
+        - float(portfolio.get("max_drawdown_percent") or 0),
+        6,
+    )
+
+
+def select_weight_profile(results):
+    return max(
+        results,
+        key=lambda item: (
+            item["objective"], item["trades"], item["profile"] == "balanced"
+        ),
+    )
 
 
 def parse_time(value):
@@ -162,6 +222,13 @@ def main():
     parser.add_argument("--purge-days", type=int, default=1)
     parser.add_argument("--historical-quotes")
     parser.add_argument("--event-calendar")
+    parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
+    parser.add_argument("--apply-regime-exposure-bands", action="store_true")
+    parser.add_argument(
+        "--calibrate-entry-weights",
+        action="store_true",
+        help="Select a factor-weight profile on each training window only.",
+    )
     args = parser.parse_args()
 
     start = parse_time(args.start)
@@ -236,6 +303,10 @@ def main():
     window_reports = []
     all_trades = []
     aggregate_filter_blockers = defaultdict(int)
+    aggregate_signal_diagnostics = defaultdict(int)
+    forward_return_reports = []
+    stitched_equity_curve = []
+    stitched_equity = ACCOUNT_EQUITY
     for number, window in enumerate(windows, 1):
         sliced_symbols = {
             symbol: slice_bars(bars, window["train_start"], window["test_end"])
@@ -252,8 +323,57 @@ def main():
             symbol: slice_bars(bars, window["train_start"], window["test_end"])
             for symbol, bars in health_bars.items()
         }
+        window_configs = configs
+        calibration = None
+        if args.calibrate_entry_weights:
+            training_results = []
+            training_symbols = {
+                symbol: slice_bars(bars, window["train_start"], window["train_end"])
+                for symbol, bars in bars_by_symbol.items()
+            }
+            training_market = slice_bars(
+                market_bars, window["train_start"], window["train_end"]
+            )
+            training_regime = {
+                symbol: slice_bars(bars, window["train_start"], window["train_end"])
+                for symbol, bars in regime_bars.items()
+            }
+            training_health = {
+                symbol: slice_bars(bars, window["train_start"], window["train_end"])
+                for symbol, bars in health_bars.items()
+            }
+            for profile, weights in WEIGHT_PROFILES.items():
+                training_simulation = simulate_portfolio(
+                    configs_with_score_weights(configs, weights),
+                    training_symbols,
+                    training_market,
+                    starting_equity=ACCOUNT_EQUITY,
+                    health_bars_by_symbol=training_health,
+                    regime_bars_by_symbol=training_regime,
+                    entry_filter_context_at=context.at,
+                    entry_window=(window["train_start"], window["train_end"]),
+                    estimated_slippage_bps=args.estimated_slippage_bps,
+                    apply_regime_exposure_bands=args.apply_regime_exposure_bands,
+                )
+                training_results.append({
+                    "profile": profile,
+                    "weights": weights,
+                    "objective": calibration_objective(training_simulation),
+                    "trades": len(training_simulation.get("trades_detail") or []),
+                    "net_pnl": training_simulation["portfolio"]["net_pnl"],
+                    "return_percent": training_simulation["portfolio"]["return_percent"],
+                    "max_drawdown_percent": training_simulation["portfolio"]["max_drawdown_percent"],
+                })
+            selected = select_weight_profile(training_results)
+            window_configs = configs_with_score_weights(configs, selected["weights"])
+            calibration = {
+                "selection_data_end": iso_utc(window["train_end"]),
+                "selected_profile": selected["profile"],
+                "selected_weights": selected["weights"],
+                "training_results": training_results,
+            }
         simulation = simulate_portfolio(
-            configs,
+            window_configs,
             sliced_symbols,
             sliced_market,
             starting_equity=ACCOUNT_EQUITY,
@@ -261,18 +381,46 @@ def main():
             regime_bars_by_symbol=sliced_regime,
             entry_filter_context_at=context.at,
             entry_window=(window["test_start"], window["test_end"]),
+            estimated_slippage_bps=args.estimated_slippage_bps,
+            apply_regime_exposure_bands=args.apply_regime_exposure_bands,
         )
         trades = simulation["trades_detail"]
         all_trades.extend(trades)
         for counts in simulation["entry_filter_blockers"].values():
             for blocker, count in counts.items():
                 aggregate_filter_blockers[blocker] += count
+        for key in (
+            "candidate_evaluations", "qualified_signals", "selected_signals",
+            "rejected_candidates",
+        ):
+            aggregate_signal_diagnostics[key] += int(
+                simulation["signal_diagnostics"].get(key) or 0
+            )
+        forward_return_reports.append(simulation["rejected_candidate_forward_returns"])
+        window_start_equity = float(simulation["portfolio"]["starting_equity"])
+        for point in simulation["equity_curve"]:
+            stitched_equity_curve.append(
+                {
+                    **point,
+                    "equity": stitched_equity + float(point["equity"]) - window_start_equity,
+                }
+            )
+        stitched_equity += float(simulation["portfolio"]["net_pnl"])
         window_reports.append(
             {
                 **{key: iso_utc(value) for key, value in window.items()},
                 "portfolio": simulation["portfolio"],
+                "baseline_metrics": simulation["baseline_metrics"],
                 "attribution": attribution_rows(trades, market_bars),
+                "attribution_by_regime_sector_model": attribution_by_dimensions(
+                    trades, market_bars, regime_at
+                ),
                 "entry_filter_blockers": simulation["entry_filter_blockers"],
+                "signal_diagnostics": simulation["signal_diagnostics"],
+                "rejected_candidate_forward_returns": simulation[
+                    "rejected_candidate_forward_returns"
+                ],
+                "weight_calibration": calibration,
             }
         )
         print(
@@ -280,10 +428,62 @@ def main():
             f"pnl={simulation['portfolio']['net_pnl']}"
         )
 
+    aggregate_portfolio = {
+        "starting_equity": ACCOUNT_EQUITY,
+        "ending_equity": round(stitched_equity, 2),
+        "net_pnl": round(stitched_equity - ACCOUNT_EQUITY, 2),
+        "return_percent": round((stitched_equity / ACCOUNT_EQUITY - 1) * 100, 4),
+        "max_drawdown_percent": max(
+            (window["portfolio"]["max_drawdown_percent"] for window in window_reports),
+            default=0,
+        ),
+    }
+    aggregate_signal_diagnostics["rejection_rate_percent"] = round(
+        100
+        * aggregate_signal_diagnostics["rejected_candidates"]
+        / aggregate_signal_diagnostics["candidate_evaluations"],
+        4,
+    ) if aggregate_signal_diagnostics["candidate_evaluations"] else 0
     report = {
         "generated_at": iso_utc(datetime.datetime.now(UTC)),
-        "method": "rolling walk-forward; training interval supplies indicator history only; all trades are out-of-sample test-window entries",
+        "method": (
+            "rolling walk-forward; optional factor weights are selected using "
+            "training-window results only, frozen, then evaluated on the purged "
+            "out-of-sample test window"
+        ),
         "symbols": args.symbols,
+        "configuration_snapshot": configs,
+        "provenance": {
+            **source_provenance(ROOT),
+            "data_source": {
+                "provider": "Alpaca",
+                "feed": "iex",
+                "adjustment": "raw",
+            },
+            "historical_quotes_sha256": (
+                stable_hash(quote_payload) if quote_payload is not None else None
+            ),
+            "event_calendar_sha256": (
+                stable_hash(event_calendar) if event_calendar is not None else None
+            ),
+            "config_sha256": stable_hash(configs),
+            "walk_forward_parameters": {
+                "start": iso_utc(start),
+                "end": iso_utc(end),
+                "train_days": args.train_days,
+                "test_days": args.test_days,
+                "purge_days": args.purge_days,
+                "estimated_slippage_bps": args.estimated_slippage_bps,
+                "apply_regime_exposure_bands": args.apply_regime_exposure_bands,
+                "calibrate_entry_weights": args.calibrate_entry_weights,
+                "candidate_weight_profiles": WEIGHT_PROFILES,
+            },
+            "datasets": {
+                "entry_5Min": dataset_manifest(bars_by_symbol, "5Min"),
+                "regime_5Min": dataset_manifest(regime_bars, "5Min"),
+                "position_health_1Hour": dataset_manifest(health_bars, "1Hour"),
+            },
+        },
         "filter_coverage": filter_coverage,
         "summary": {
             "windows": len(window_reports),
@@ -295,10 +495,24 @@ def main():
                 sum(float(trade["pnl"]) for trade in all_trades), 2
             ),
             "entry_filter_blockers": dict(sorted(aggregate_filter_blockers.items())),
+            "signal_diagnostics": dict(aggregate_signal_diagnostics),
         },
+        "aggregate_portfolio": aggregate_portfolio,
+        "aggregate_baseline_metrics": performance_metrics(
+            aggregate_portfolio,
+            all_trades,
+            stitched_equity_curve,
+            estimated_slippage_bps=args.estimated_slippage_bps,
+        ),
         "windows": window_reports,
         "aggregate_by_regime_and_risk_profile": attribution_rows(
             all_trades, market_bars
+        ),
+        "aggregate_by_regime_sector_model": attribution_by_dimensions(
+            all_trades, market_bars, regime_at
+        ),
+        "aggregate_rejected_candidate_forward_returns": combine_forward_return_reports(
+            forward_return_reports
         ),
         "trades": all_trades,
     }

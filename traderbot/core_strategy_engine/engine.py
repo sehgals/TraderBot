@@ -961,7 +961,18 @@ def dynamic_entry_plan(
         "classified_model_id": classified_candidate.get("model_id"),
         "entry_arbitration_reason": arbitration["reason"],
         "setup_score": classified_candidate.get("setup_score"),
+        "soft_check_score": classified_candidate.get("soft_check_score"),
+        "factor_scores": classified_candidate.get("factor_scores"),
+        "factor_weights": classified_candidate.get("factor_weights"),
+        "factor_contributions": classified_candidate.get("factor_contributions"),
+        "overall_check_score": classified_candidate.get("overall_check_score"),
+        "minimum_setup_score": classified_candidate.get("minimum_setup_score"),
+        "setup_score_meets_threshold": classified_candidate.get(
+            "setup_score_meets_threshold"
+        ),
         "model_checks": classified_candidate.get("checks"),
+        "hard_checks": classified_candidate.get("hard_checks"),
+        "soft_checks": classified_candidate.get("soft_checks"),
         "limit_price": limit_price,
         "last_bar_time": bar["t"].isoformat(),
         "last_price": bar["c"],
@@ -991,6 +1002,10 @@ def dynamic_entry_plan(
         "ema21_slope": ema21_slope,
         "price_action": price_action_label(bar, ema21_slope),
         "blockers": classified_candidate.get("blockers", []),
+        "hard_blockers": classified_candidate.get("hard_blockers", []),
+        "soft_blockers": classified_candidate.get("soft_blockers", []),
+        "decision_reasons": classified_candidate.get("decision_reasons", []),
+        "qualification_policy": classified_candidate.get("qualification_policy"),
         "entry_candidates": [pullback_candidate, breakout_candidate],
     }
 
@@ -2489,6 +2504,11 @@ def evaluate_flat_entry_eligibility(config, state, plan=None, now=None, mode=Non
             reasons.append("stale_entry_plan")
         if plan.get("status") != "active_signal":
             reasons.append("entry_signal_inactive")
+        if config.get("portfolio_allocation_required") and (
+            not config.get("portfolio_allocation_authorized")
+            or config.get("portfolio_allocation_as_of") != plan.get("last_bar_time")
+        ):
+            reasons.append("portfolio_allocation_required")
 
     return {
         "eligible": not reasons,

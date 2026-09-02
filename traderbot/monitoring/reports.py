@@ -12,6 +12,10 @@ from traderbot.core_strategy_engine.engine import (
     refresh_position_health,
     save_json,
 )
+from traderbot.core_strategy_engine.entry_models.candidate import (
+    HARD_ENTRY_CHECKS,
+    classify_entry_checks,
+)
 from traderbot.monitoring.supervisor import load_supervisor_config
 
 
@@ -27,7 +31,6 @@ BLOCKED_STATUSES = {
     "dynamic_entry_order_canceled_cash_reserve",
     "reentry_cash_reserve_blocked",
 }
-
 
 def parse_time(value):
     if not value:
@@ -101,7 +104,15 @@ def signal_strength(plan):
     if not plan:
         return {"signal_strength": "Unavailable", "signal_score": None, "signal_as_of": None}
     blockers = set(plan.get("blockers") or [])
-    score = round(max(0, 13 - len(blockers)) / 13 * 100)
+    score = plan.get("setup_score")
+    if score is None and plan.get("model_checks"):
+        checks = plan["model_checks"]
+        score = round(sum(bool(value) for value in checks.values()) / len(checks) * 100)
+    if score is None:
+        # Backward-compatible estimate for legacy state files that did not
+        # persist setup_score or the complete check vector.
+        score = round(max(0, 13 - len(blockers)) / 13 * 100)
+    score = int(round(float(score)))
     if score >= 85:
         label = "Strong"
     elif score >= 65:
@@ -110,12 +121,42 @@ def signal_strength(plan):
         label = "Weak"
     else:
         label = "Very Weak"
+    if plan.get("hard_blockers") is not None:
+        hard_blockers = sorted(plan.get("hard_blockers") or [])
+        soft_blockers = sorted(plan.get("soft_blockers") or [])
+    else:
+        hard_checks, soft_checks = classify_entry_checks(
+            {name: False for name in blockers}
+        )
+        hard_blockers = sorted(hard_checks)
+        soft_blockers = sorted(soft_checks)
+    candidates = []
+    for candidate in (plan.get("entry_candidates") or []):
+        if not candidate.get("model_id"):
+            continue
+        summary = {
+                "model_id": candidate.get("model_id"),
+                "score": candidate.get("setup_score"),
+                "status": candidate.get("status"),
+        }
+        if candidate.get("factor_contributions"):
+            summary.update({
+                "factor_scores": candidate.get("factor_scores") or {},
+                "factor_weights": candidate.get("factor_weights") or {},
+                "factor_contributions": candidate.get("factor_contributions") or {},
+            })
+        candidates.append(summary)
+    candidates.sort(key=lambda item: item["model_id"])
     return {
         "signal_strength": label,
         "signal_score": score,
         "signal_as_of": plan.get("last_bar_time"),
         "signal_status": plan.get("status"),
         "signal_blockers": sorted(blockers),
+        "hard_signal_blockers": hard_blockers,
+        "soft_signal_blockers": soft_blockers,
+        "signal_model": plan.get("model_id") or plan.get("classified_model_id"),
+        "candidate_model_scores": candidates,
     }
 
 
@@ -136,6 +177,9 @@ def flat_managed_stock_evaluations(project_root, watchers_path, positions):
         if as_float(position.get("qty")) != 0
     }
     evaluations = []
+    sector_by_symbol = (
+        (config.get("position_health") or {}).get("benchmark_by_symbol") or {}
+    )
     for watcher in config.get("managed_watchers", config.get("watchers", [])):
         symbol = watcher.get("symbol")
         if not symbol or symbol in held_symbols:
@@ -166,6 +210,7 @@ def flat_managed_stock_evaluations(project_root, watchers_path, positions):
         evaluations.append(
             {
                 "symbol": symbol,
+                "sector": sector_by_symbol.get(symbol, "Unmapped"),
                 **signal_strength(plan),
                 "entry_eligibility": eligibility,
                 "reentry_qualified": reentry_qualification.get("eligible", False),
@@ -278,12 +323,20 @@ def watcher_activity(project_root, watchers_path, report_date):
     buys = []
     cash_blocked = []
     latest_status = {}
+    rejection_events = []
+    seen_rejection_bars = set()
+    supervisor_config = load_json(watchers_path, {})
+    sector_by_symbol = (
+        (supervisor_config.get("position_health") or {}).get("benchmark_by_symbol")
+        or {}
+    )
 
     for watcher in configured_watchers(project_root, watchers_path):
         for record in iter_watcher_log_records(watcher["log_path"], start_at, end_at):
             result = record.get("result") or {}
             symbol = record.get("symbol") or result.get("symbol") or watcher.get("symbol")
             status = result.get("status")
+            plan = result.get("dynamic_plan") or {}
             latest_status[symbol] = {
                 "timestamp": record.get("timestamp"),
                 "status": status,
@@ -304,6 +357,38 @@ def watcher_activity(project_root, watchers_path, report_date):
                 )
             if status in BLOCKED_STATUSES:
                 cash_blocked.append(cash_blocked_detail(record, result))
+            if plan and plan.get("status") != "active_signal":
+                bar_time = plan.get("last_bar_time")
+                event_key = (symbol, bar_time)
+                if event_key not in seen_rejection_bars:
+                    seen_rejection_bars.add(event_key)
+                    timestamp = parse_time(bar_time or record.get("timestamp"))
+                    rejection_events.append(
+                        {
+                            "symbol": symbol,
+                            "sector": sector_by_symbol.get(symbol, "Unmapped"),
+                            "timestamp": bar_time or record.get("timestamp"),
+                            "time_bucket": (
+                                timestamp.astimezone(LOCAL_TZ).strftime("%H:00")
+                                if timestamp
+                                else "Unknown"
+                            ),
+                            "model": plan.get("model_id")
+                            or plan.get("classified_model_id")
+                            or "Unclassified",
+                            "score": plan.get("setup_score"),
+                            "hard_blockers": sorted(
+                                plan.get("hard_blockers")
+                                if plan.get("hard_blockers") is not None
+                                else set(plan.get("blockers") or []) & HARD_ENTRY_CHECKS
+                            ),
+                            "soft_blockers": sorted(
+                                plan.get("soft_blockers")
+                                if plan.get("soft_blockers") is not None
+                                else set(plan.get("blockers") or []) - HARD_ENTRY_CHECKS
+                            ),
+                        }
+                    )
             for skipped in result.get("skipped_ladder_orders", []):
                 if skipped.get("status") == "cash_reserve_blocked":
                     detail = cash_blocked_detail(record, {"status": "ladder_cash_reserve_blocked", "sizing": skipped.get("sizing", {})})
@@ -315,6 +400,48 @@ def watcher_activity(project_root, watchers_path, report_date):
         "bot_buy_orders_submitted": buys,
         "cash_blocked_buy_signals": cash_blocked,
         "latest_watcher_status": latest_status,
+        "entry_rejection_diagnostics": summarize_rejection_events(rejection_events),
+    }
+
+
+def summarize_rejection_events(events):
+    by_reason = defaultdict(lambda: {"count": 0, "symbols": set(), "category": None})
+    by_symbol = defaultdict(int)
+    by_sector = defaultdict(int)
+    by_time = defaultdict(int)
+    for event in events or []:
+        by_symbol[event.get("symbol") or "Unknown"] += 1
+        by_sector[event.get("sector") or "Unmapped"] += 1
+        by_time[event.get("time_bucket") or "Unknown"] += 1
+        for category, field in (("hard", "hard_blockers"), ("soft", "soft_blockers")):
+            for reason in event.get(field) or []:
+                item = by_reason[reason]
+                item["count"] += 1
+                item["symbols"].add(event.get("symbol") or "Unknown")
+                item["category"] = category
+
+    def count_rows(counts, key_name):
+        return [
+            {key_name: key, "count": count}
+            for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+    return {
+        "rejected_completed_bars": len(events or []),
+        "by_reason": [
+            {
+                "reason": reason,
+                "category": item["category"],
+                "count": item["count"],
+                "symbols": sorted(item["symbols"]),
+            }
+            for reason, item in sorted(
+                by_reason.items(), key=lambda pair: (-pair[1]["count"], pair[0])
+            )
+        ],
+        "by_symbol": count_rows(by_symbol, "symbol"),
+        "by_sector": count_rows(by_sector, "sector"),
+        "by_time": count_rows(by_time, "time_bucket"),
     }
 
 
@@ -647,6 +774,59 @@ def portfolio_summary(client, account, reporting_config=None):
     }
 
 
+def portfolio_utilization(account, positions, supervisor_config=None):
+    supervisor_config = supervisor_config or {}
+    portfolio_value = as_float(account.get("portfolio_value"))
+    cash = as_float(account.get("cash"))
+    gross_market_value = sum(abs(as_float(item.get("market_value"))) for item in positions or [])
+    net_market_value = sum(as_float(item.get("market_value")) for item in positions or [])
+    reserve_percent = as_float(
+        (supervisor_config.get("new_watcher_defaults") or {}).get(
+            "min_cash_balance_percent", 20
+        )
+    )
+    reserve_dollars = portfolio_value * reserve_percent / 100 if portfolio_value else 0
+    deployable_cash = max(0, cash - reserve_dollars)
+    max_portfolio_risk_percent = (supervisor_config.get("reporting") or {}).get(
+        "max_portfolio_risk_percent"
+    )
+    open_stop_risk = 0.0
+    for item in positions or []:
+        current = item.get("current_price")
+        stop = item.get("position_health_stop_price")
+        qty = item.get("qty")
+        if current is not None and stop is not None and qty is not None:
+            open_stop_risk += max(0, (float(current) - float(stop)) * abs(float(qty)))
+    risk_budget = (
+        portfolio_value * as_float(max_portfolio_risk_percent) / 100
+        if max_portfolio_risk_percent not in (None, "")
+        else None
+    )
+    return {
+        "open_positions": len(positions or []),
+        "gross_market_value": gross_market_value,
+        "net_market_value": net_market_value,
+        "gross_exposure_percent": (
+            gross_market_value / portfolio_value * 100 if portfolio_value else None
+        ),
+        "net_exposure_percent": (
+            net_market_value / portfolio_value * 100 if portfolio_value else None
+        ),
+        "cash_percent": cash / portfolio_value * 100 if portfolio_value else None,
+        "configured_cash_reserve_percent": reserve_percent,
+        "configured_cash_reserve_dollars": reserve_dollars,
+        "deployable_cash": deployable_cash,
+        "open_stop_risk": open_stop_risk,
+        "open_stop_risk_percent": (
+            open_stop_risk / portfolio_value * 100 if portfolio_value else None
+        ),
+        "max_portfolio_risk_percent": max_portfolio_risk_percent,
+        "unused_risk_budget": (
+            max(0, risk_budget - open_stop_risk) if risk_budget is not None else None
+        ),
+    }
+
+
 def build_report(project_root, watchers_path, report_date, client=None):
     start_at, end_at = day_window(report_date)
     supervisor_config = load_json(watchers_path, {})
@@ -693,6 +873,7 @@ def build_report(project_root, watchers_path, report_date, client=None):
             account_error = f"{type(exc).__name__}: {exc}"
 
     activity = watcher_activity(project_root, watchers_path, report_date)
+    utilization = portfolio_utilization(account_summary, positions, supervisor_config)
     if client:
         activity["bot_buy_orders_submitted"] = enrich_bot_orders_with_broker_status(
             client,
@@ -703,6 +884,7 @@ def build_report(project_root, watchers_path, report_date, client=None):
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "account": account_summary,
         "account_error": account_error,
+        "portfolio_utilization": utilization,
         "current_positions": positions,
         "managed_stocks_not_held": flat_managed_stocks,
         "stocks_bought": bought,
@@ -1181,13 +1363,29 @@ def render_flat_managed_stocks_table(items):
         )
         if "stale_entry_plan" in eligibility_reasons and score is not None:
             signal = f"Historical {signal}"
-        blockers = item.get("signal_blockers") or []
+        candidate_scores = ", ".join(
+            f'{candidate.get("model_id", "unknown").replace("_", " ")}: '
+            f'{number(candidate.get("score"))} ['
+            + "; ".join(
+                f'{name.replace("_", " ")} '
+                f'{number((candidate.get("factor_scores") or {}).get(name))}'
+                f' x {number((candidate.get("factor_weights") or {}).get(name))}%'
+                f' = {number(contribution)}'
+                for name, contribution in (
+                    candidate.get("factor_contributions") or {}
+                ).items()
+            )
+            + "]"
+            for candidate in item.get("candidate_model_scores") or []
+        ) or "n/a"
         rows.append(
             [
                 item.get("symbol") or "n/a",
                 "YES" if item.get("reentry_qualified") else "NO",
                 decision,
                 signal,
+                (item.get("signal_model") or "unclassified").replace("_", " "),
+                candidate_scores,
                 (item.get("entry_mode") or "waiting").replace("_", " "),
                 money(item.get("last_price")),
                 money(item.get("next_signal_trigger")),
@@ -1197,23 +1395,69 @@ def render_flat_managed_stocks_table(items):
                 short_time(item.get("signal_as_of")),
                 duration(eligibility.get("plan_age_seconds")),
                 ", ".join(eligibility_reasons) if eligibility_reasons else "none",
-                ", ".join(blockers) if blockers else "none",
+                ", ".join(item.get("hard_signal_blockers") or []) or "none",
+                ", ".join(item.get("soft_signal_blockers") or []) or "none",
             ]
         )
     return markdown_table(
         [
-            "Symbol", "Re-entry Qualified", "Decision", "Entry Setup", "Mode", "Price", "Next Trigger",
+            "Symbol", "Re-entry Qualified", "Decision", "Entry Setup", "Selected Model",
+            "Model Scores", "Mode", "Price", "Next Trigger",
             "Planned Limit", "Price Action", "Volume Ratio", "As Of", "Plan Age",
-            "Eligibility Reasons", "Signal Blockers",
+            "Eligibility Reasons", "Hard Blockers", "Soft Misses",
         ],
         rows,
         [
-            "left", "left", "left", "left", "left", "right", "right", "right", "left",
-            "right", "right", "right", "left", "left",
+            "left", "left", "left", "left", "left", "left", "left", "right", "right",
+            "right", "left", "right", "right", "right", "left", "left", "left",
         ],
         pad_columns=True,
         minimum_width=6,
     )
+
+
+def render_rejection_diagnostics(diagnostics):
+    diagnostics = diagnostics or {}
+    if not diagnostics.get("rejected_completed_bars"):
+        return ["No rejected completed-bar evaluations found in watcher logs."]
+    lines = [
+        f'- Rejected completed-bar evaluations: {diagnostics["rejected_completed_bars"]}.',
+        "",
+        "### By Reason",
+    ]
+    lines.extend(
+        markdown_table(
+            ["Reason", "Category", "Count", "Symbols"],
+            [
+                [
+                    item.get("reason"),
+                    item.get("category"),
+                    number(item.get("count")),
+                    ", ".join(item.get("symbols") or []),
+                ]
+                for item in diagnostics.get("by_reason") or []
+            ],
+            ["left", "left", "right", "left"],
+            pad_columns=True,
+            minimum_width=6,
+        )
+    )
+    for heading, field, key in (
+        ("By Symbol", "by_symbol", "symbol"),
+        ("By Sector Benchmark", "by_sector", "sector"),
+        ("By Time Of Day", "by_time", "time_bucket"),
+    ):
+        lines.extend(["", f"### {heading}"])
+        lines.extend(
+            markdown_table(
+                [heading.removeprefix("By "), "Count"],
+                [[item.get(key), number(item.get("count"))] for item in diagnostics.get(field) or []],
+                ["left", "right"],
+                pad_columns=True,
+                minimum_width=6,
+            )
+        )
+    return lines
 
 
 def render_markdown(report):
@@ -1224,6 +1468,8 @@ def render_markdown(report):
     bot_buys = report.get("bot_buy_orders_submitted") or []
     cash_blocked = report.get("cash_blocked_buy_signals") or []
     flat_managed_stocks = report.get("managed_stocks_not_held") or []
+    utilization = report.get("portfolio_utilization") or {}
+    rejection_diagnostics = report.get("entry_rejection_diagnostics") or {}
     lines = [
         f"# TraderBot Daily Report - {report['report_date']}",
         "",
@@ -1259,6 +1505,33 @@ def render_markdown(report):
     if report.get("account_error"):
         lines.extend(["", f"Account data error: {report['account_error']}"])
 
+    lines.extend(["", "## Portfolio Utilization"])
+    lines.extend(
+        markdown_table(
+            [
+                "Gross Exposure", "Net Exposure", "Cash", "Deployable Cash",
+                "Cash Reserve", "Open Stop Risk", "Unused Risk Budget",
+            ],
+            [[
+                percent(utilization.get("gross_exposure_percent")),
+                percent(utilization.get("net_exposure_percent")),
+                percent(utilization.get("cash_percent")),
+                money(utilization.get("deployable_cash")),
+                percent(utilization.get("configured_cash_reserve_percent")),
+                money(utilization.get("open_stop_risk")),
+                money(utilization.get("unused_risk_budget")),
+            ]],
+            ["right", "right", "right", "right", "right", "right", "right"],
+            pad_columns=True,
+            minimum_width=6,
+        )
+    )
+    if utilization.get("max_portfolio_risk_percent") in (None, ""):
+        lines.extend([
+            "",
+            "Unused risk budget is n/a because reporting.max_portfolio_risk_percent is not configured.",
+        ])
+
     lines.extend(
         [
             "",
@@ -1289,11 +1562,13 @@ def render_markdown(report):
         ]
     )
     lines.extend(render_flat_managed_stocks_table(flat_managed_stocks))
+    lines.extend(["", "## Entry Rejection Diagnostics"])
+    lines.extend(render_rejection_diagnostics(rejection_diagnostics))
     lines.extend(
         [
             "",
             "### Entry / Re-entry Method",
-            "Bots evaluate completed five-minute bars for market regime, EMA trend and slope, VWAP/pullback or breakout confirmation, volume, chase protection, and exit-ledger price constraints. All required checks must pass before an order is eligible; portfolio risk, cash reserve, cooldown, and daily limits can still block submission afterward.",
+            "Bots evaluate completed five-minute bars under a hard-safety-plus-soft-score policy. Data availability, spread, liquidity, gap/event controls, ledger constraints, stop geometry, same-day loss protection, and the absolute reward/risk floor are mandatory. Market and sector regime, trend, confirmation, volume, chase protection, VWAP stability, and target reward/risk contribute to the setup score; the configured minimum score must pass. Portfolio risk, cash reserve, cooldown, and daily limits can still block submission afterward.",
         ]
     )
     lines.extend(

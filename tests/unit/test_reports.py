@@ -5,6 +5,7 @@ from traderbot.monitoring.reports import (
     enrich_bot_orders_with_broker_status,
     enrich_sold_fills_from_watchers,
     flat_managed_stock_evaluations,
+    portfolio_utilization,
     portfolio_summary,
     render_bot_order_table,
     render_cash_block_table,
@@ -14,6 +15,7 @@ from traderbot.monitoring.reports import (
     render_position_health_table,
     render_positions_table,
     signal_strength,
+    summarize_rejection_events,
 )
 
 
@@ -213,6 +215,76 @@ def test_signal_strength_uses_strategy_blockers():
     assert weak["signal_strength"] == "Weak"
 
 
+def test_signal_strength_uses_persisted_engine_score_and_exposes_models_and_blocker_types():
+    result = signal_strength(
+        {
+            "setup_score": 70,
+            "classified_model_id": "pullback_reclaim",
+            "blockers": ["liquidity_ok", "market_ok", "trend_ok", "volume_ok", "reward_risk_ok", "reclaimed"],
+            "entry_candidates": [
+                {"model_id": "pullback_reclaim", "setup_score": 70, "status": "watch"},
+                {"model_id": "breakout_continuation", "setup_score": 75, "status": "watch"},
+            ],
+        }
+    )
+
+    assert result["signal_score"] == 70
+    assert result["signal_strength"] == "Moderate"
+    assert result["signal_model"] == "pullback_reclaim"
+    assert result["hard_signal_blockers"] == ["liquidity_ok"]
+    assert result["soft_signal_blockers"] == [
+        "market_ok", "reclaimed", "reward_risk_ok", "trend_ok", "volume_ok"
+    ]
+    assert result["candidate_model_scores"] == [
+        {"model_id": "breakout_continuation", "score": 75, "status": "watch"},
+        {"model_id": "pullback_reclaim", "score": 70, "status": "watch"},
+    ]
+
+
+def test_rejection_diagnostics_count_completed_bar_events_by_requested_dimensions():
+    diagnostics = summarize_rejection_events(
+        [
+            {
+                "symbol": "AAA", "sector": "XLK", "time_bucket": "10:00",
+                "hard_blockers": ["liquidity_ok"], "soft_blockers": ["market_ok"],
+            },
+            {
+                "symbol": "BBB", "sector": "XLK", "time_bucket": "10:00",
+                "hard_blockers": [], "soft_blockers": ["market_ok"],
+            },
+        ]
+    )
+
+    assert diagnostics["rejected_completed_bars"] == 2
+    assert diagnostics["by_reason"][0] == {
+        "reason": "market_ok", "category": "soft", "count": 2, "symbols": ["AAA", "BBB"]
+    }
+    assert diagnostics["by_sector"] == [{"sector": "XLK", "count": 2}]
+    assert diagnostics["by_time"] == [{"time_bucket": "10:00", "count": 2}]
+
+
+def test_portfolio_utilization_reports_exposure_cash_capacity_and_stop_risk():
+    result = portfolio_utilization(
+        {"portfolio_value": 50000, "cash": 40000},
+        [
+            {
+                "market_value": 10000, "current_price": 100, "qty": 100,
+                "position_health_stop_price": 95,
+            }
+        ],
+        {
+            "new_watcher_defaults": {"min_cash_balance_percent": 20},
+            "reporting": {"max_portfolio_risk_percent": 2},
+        },
+    )
+
+    assert result["gross_exposure_percent"] == 20
+    assert result["cash_percent"] == 80
+    assert result["deployable_cash"] == 30000
+    assert result["open_stop_risk"] == 500
+    assert result["unused_risk_budget"] == 500
+
+
 def test_report_explains_position_health_method():
     markdown = render_markdown({"report_date": "2026-07-10", "current_positions": []})
 
@@ -236,6 +308,13 @@ def test_flat_managed_stock_section_explains_current_entry_evaluation():
         "volume_ratio": 9.46,
         "signal_as_of": "2026-08-17T19:55:00Z",
         "signal_blockers": ["market_ok", "trend_ok"],
+        "hard_signal_blockers": [],
+        "soft_signal_blockers": ["market_ok", "trend_ok"],
+        "signal_model": "pullback_reclaim",
+        "candidate_model_scores": [
+            {"model_id": "pullback_reclaim", "score": 46, "status": "watch"},
+            {"model_id": "breakout_continuation", "score": 38, "status": "watch"},
+        ],
         "entry_eligibility": {
             "eligible": False,
             "reasons": ["stale_entry_plan"],
@@ -256,6 +335,10 @@ def test_flat_managed_stock_section_explains_current_entry_evaluation():
     assert "Historical Weak (46%)" in rendered
     assert "$61.44" in rendered
     assert "market_ok, trend_ok" in rendered
+    assert "pullback reclaim" in rendered
+    assert "breakout continuation: 38" in rendered
+    assert "Hard Blockers" in rendered
+    assert "Soft Misses" in rendered
     assert "Stale Entry Plan" in rendered
     assert "Re-entry Qualified" in rendered
     assert "NO" in rendered

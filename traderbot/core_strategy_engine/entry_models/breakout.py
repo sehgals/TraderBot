@@ -1,7 +1,10 @@
 from traderbot.core_strategy_engine.entry_models.candidate import (
+    average_check_score,
+    bounded_score,
     build_candidate,
     model_config,
     reward_risk_ok,
+    score_weights,
     structural_stop_price,
 )
 
@@ -18,6 +21,18 @@ def evaluate_breakout(features, config=None):
         settings.get(
             "minimum_reward_risk",
             config.get("minimum_entry_reward_risk", 1.5),
+        )
+    )
+    absolute_minimum_rr = float(
+        settings.get(
+            "absolute_minimum_reward_risk",
+            config.get("absolute_minimum_entry_reward_risk", 1.0),
+        )
+    )
+    minimum_setup_score = int(
+        settings.get(
+            "minimum_setup_score",
+            config.get("minimum_entry_setup_score", 80),
         )
     )
     limit_price = recent_high + float(settings.get("limit_buffer_atr", 0.10)) * atr
@@ -39,6 +54,9 @@ def evaluate_breakout(features, config=None):
         and features["ema21_slope_5bars"]
         >= float(settings.get("minimum_ema21_slope", 0.002))
     )
+    no_chase = bar["c"] <= recent_high + float(
+        settings.get("maximum_chase_atr", 1.0)
+    ) * atr
     checks = {
         **features["entry_filters"]["checks"],
         "model_enabled": settings.get("enabled", True),
@@ -55,6 +73,14 @@ def evaluate_breakout(features, config=None):
         # breakout to an old exit-relative cap can manufacture an order, stop,
         # and target far below the live setup while making this check tautological.
         "ledger_price_ok": limit_price <= features["ledger_cap"],
+        "risk_geometry_valid": 0 < stop_price < limit_price < target_price,
+        "reward_risk_floor_ok": reward_risk_ok(
+            limit_price,
+            target_price,
+            atr,
+            minimum=absolute_minimum_rr,
+            stop_price=stop_price,
+        ),
         "reward_risk_ok": reward_risk_ok(
             limit_price,
             target_price,
@@ -62,6 +88,22 @@ def evaluate_breakout(features, config=None):
             minimum=minimum_rr,
             stop_price=stop_price,
         ),
+    }
+    expected_rr = (
+        (target_price - limit_price) / (limit_price - stop_price)
+        if limit_price > stop_price else 0
+    )
+    factor_scores = {
+        "price_action": average_check_score(breakout_now),
+        "stock_trend": average_check_score(trend_ok),
+        "market_sector_regime": average_check_score(
+            checks["market_ok"], checks["sector_ok"]
+        ),
+        "volume_liquidity_quality": bounded_score(
+            100 * features["relative_dollar_volume"] / minimum_rvol
+        ),
+        "reward_risk_geometry": bounded_score(100 * expected_rr / minimum_rr),
+        "relative_strength_execution": average_check_score(no_chase),
     }
     return build_candidate(
         features=features,
@@ -71,9 +113,13 @@ def evaluate_breakout(features, config=None):
         limit_price=limit_price,
         stop_price=stop_price,
         target_price=target_price,
+        minimum_setup_score=minimum_setup_score,
+        factor_scores=factor_scores,
+        factor_weights=score_weights(config, settings),
         details={
             "entry_filter_metrics": features["entry_filters"]["metrics"],
             "minimum_reward_risk": minimum_rr,
+            "absolute_minimum_reward_risk": absolute_minimum_rr,
             "breakout_trigger": recent_high,
             "next_signal_trigger": recent_high if recent_high >= bar["c"] else None,
         },

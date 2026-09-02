@@ -11,6 +11,9 @@ from pathlib import Path
 
 from traderbot.core_strategy_engine.engine import (
     AlpacaClient,
+    calculate_indicators,
+    completed_market_bars,
+    iso_utc,
     load_env,
     load_json,
     save_json,
@@ -20,6 +23,7 @@ from traderbot.core_strategy_engine.strategies import (
     resolve_strategy,
 )
 from traderbot.broker.execution_gateway import ExecutionGateway
+from traderbot.portfolio_allocator import allocate_candidates, classify_exposure_regime
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -29,6 +33,8 @@ RUNTIME_LOG_DIR = Path("runtime/logs")
 MARGIN_REDUCTION_STATE = RUNTIME_STATE_DIR / "margin_reduction_state.json"
 MARGIN_REDUCTION_LOG = RUNTIME_LOG_DIR / "margin_reduction.jsonl"
 POSITION_HEALTH_ALERT_LOG = RUNTIME_LOG_DIR / "position_health_alerts.jsonl"
+PORTFOLIO_ALLOCATION_STATE = RUNTIME_STATE_DIR / "portfolio_allocation_state.json"
+PORTFOLIO_ALLOCATION_LOG = RUNTIME_LOG_DIR / "portfolio_allocations.jsonl"
 
 
 def utc_now():
@@ -228,7 +234,7 @@ def promote_new_watcher_if_bought(project_root, watchers_config_path, supervisor
     return managed_entry
 
 
-def run_watcher(client, watcher, supervisor_config, clock):
+def run_watcher(client, watcher, supervisor_config, clock, config_overrides=None):
     started = time.monotonic()
     strategy_config = dict(watcher.get("config_defaults", {}))
     if watcher.get("config_path"):
@@ -241,6 +247,10 @@ def run_watcher(client, watcher, supervisor_config, clock):
         **(supervisor_config.get("entry_filters") or {}),
         **(strategy_config.get("entry_filters") or {}),
     }
+    allocator_settings = supervisor_config.get("portfolio_allocator") or {}
+    if allocator_settings.get("enabled", False) and watcher.get("group") == "new":
+        strategy_config["portfolio_allocation_required"] = True
+    strategy_config.update(config_overrides or {})
     if watcher.get("group") == "managed":
         managed_reentry = supervisor_config.get("managed_reentry") or {}
         strategy_config["reentry_observe_only"] = managed_reentry.get(
@@ -288,6 +298,209 @@ def run_watcher(client, watcher, supervisor_config, clock):
     }
     append_jsonl(watcher["log_path"], log_record)
     return {**log_record, "strategy_config": strategy_config}
+
+
+def _float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def allocation_inputs(client, records, supervisor_config, watchers, project_root):
+    settings = supervisor_config.get("portfolio_allocator") or {}
+    account = client.account()
+    equity = max(0.0, _float(account.get("equity")))
+    positions = client.positions()
+    open_buy_orders = [order for order in client.open_orders() if order.get("side") == "buy"]
+    benchmark_by_symbol = (
+        (supervisor_config.get("position_health") or {}).get("benchmark_by_symbol") or {}
+    )
+    factor_by_symbol = settings.get("correlated_factor_by_symbol") or {}
+    symbol_exposure = {}
+    sector_exposure = {}
+    factor_exposure = {}
+    aggregate_risk = 0.0
+    state_by_symbol = {
+        watcher["symbol"]: load_json(watcher["state_path"], {}) for watcher in watchers
+    }
+    for position in positions:
+        symbol = str(position.get("symbol") or "").upper()
+        notional = abs(_float(position.get("market_value"))) or abs(
+            _float(position.get("qty")) * _float(position.get("current_price"))
+        )
+        sector = str(benchmark_by_symbol.get(symbol) or "Unmapped")
+        symbol_exposure[symbol] = symbol_exposure.get(symbol, 0) + notional
+        sector_exposure[sector] = sector_exposure.get(sector, 0) + notional
+        factor = str(factor_by_symbol.get(symbol) or sector)
+        factor_exposure[factor] = factor_exposure.get(factor, 0) + notional
+        state = state_by_symbol.get(symbol, {})
+        price = _float(position.get("current_price"))
+        stop = _float(state.get("active_stop_price"))
+        qty = abs(_float(position.get("qty")))
+        aggregate_risk += qty * max(0.0, price - stop) if stop > 0 else notional * 0.06
+    for order in open_buy_orders:
+        symbol = str(order.get("symbol") or "").upper()
+        notional = _float(order.get("qty")) * _float(order.get("limit_price"))
+        sector = str(benchmark_by_symbol.get(symbol) or "Unmapped")
+        symbol_exposure[symbol] = symbol_exposure.get(symbol, 0) + notional
+        sector_exposure[sector] = sector_exposure.get(sector, 0) + notional
+        factor = str(factor_by_symbol.get(symbol) or sector)
+        factor_exposure[factor] = factor_exposure.get(factor, 0) + notional
+        aggregate_risk += notional * 0.06
+
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    allocation_state = load_json(project_root / PORTFOLIO_ALLOCATION_STATE, {})
+    if allocation_state.get("date") != today:
+        allocation_state = {"date": today, "entries": 0, "turnover": 0.0}
+    candidates = []
+    for record in records:
+        config = record["strategy_config"]
+        if config.get("portfolio_allocation_required") is not True:
+            continue
+        plan = (record.get("result") or {}).get("dynamic_plan") or {}
+        limit_price = _float(plan.get("limit_price"))
+        risk_per_share = _float(plan.get("risk_per_share"))
+        target_notional = _float(config.get("dynamic_entry_notional"), 5000)
+        symbol_cap = equity * _float(
+            settings.get(
+                "maximum_symbol_notional_percent",
+                config.get("max_symbol_notional_percent", 15),
+            )
+        ) / 100
+        notional = min(target_notional, symbol_cap) if symbol_cap > 0 else target_notional
+        candidates.append({
+            "symbol": record["symbol"],
+            "score": plan.get("setup_score"),
+            "expected_reward_risk": plan.get("expected_reward_risk"),
+            "notional": notional,
+            "risk_dollars": notional * risk_per_share / limit_price if limit_price > 0 else 0,
+            "sector": benchmark_by_symbol.get(record["symbol"], "Unmapped"),
+            "factor": factor_by_symbol.get(
+                record["symbol"], benchmark_by_symbol.get(record["symbol"], "Unmapped")
+            ),
+            "hard_safety_passed": not (plan.get("hard_blockers") or []),
+            "candidate_as_of": plan.get("last_bar_time"),
+            "model_id": plan.get("model_id") or plan.get("classified_model_id"),
+        })
+    market_regime = "defensive"
+    regime_data_status = "unavailable_conservative_default"
+    regime_as_of = None
+    candidate_times = [
+        item["candidate_as_of"] for item in candidates if item.get("candidate_as_of")
+    ]
+    if candidate_times:
+        try:
+            decision_at = datetime.datetime.fromisoformat(
+                max(candidate_times).replace("Z", "+00:00")
+            )
+            completed_at = decision_at + datetime.timedelta(minutes=5)
+            start = iso_utc(decision_at - datetime.timedelta(days=7))
+            end = iso_utc(completed_at)
+            raw_market = client.stock_bars("QQQ", start, end, "5Min")
+            market_bars = calculate_indicators(
+                completed_market_bars(raw_market, "5Min", now=completed_at)
+            )
+            market_regime = classify_exposure_regime(market_bars, decision_at)
+            regime_as_of = market_bars[-1]["t"].isoformat() if market_bars else None
+            regime_data_status = "point_in_time_completed_5min_bars"
+        except Exception as exc:
+            regime_data_status = f"unavailable_conservative_default:{type(exc).__name__}"
+    gross_exposure = sum(symbol_exposure.values())
+    portfolio = {
+        "as_of": max(candidate_times) if candidate_times else None,
+        "equity": equity,
+        "cash": _float(account.get("cash")),
+        "position_count": len({
+            str(item.get("symbol") or "").upper()
+            for item in positions + open_buy_orders if item.get("symbol")
+        }),
+        "aggregate_open_risk": aggregate_risk,
+        "daily_entries": allocation_state["entries"],
+        "daily_turnover": allocation_state["turnover"],
+        "symbol_exposure": symbol_exposure,
+        "sector_exposure": sector_exposure,
+        "factor_exposure": factor_exposure,
+        "gross_exposure": gross_exposure,
+        "regime": market_regime,
+        "regime_as_of": regime_as_of,
+        "regime_data_status": regime_data_status,
+    }
+    return candidates, portfolio, allocation_state
+
+
+def run_portfolio_allocator(client, records, supervisor_config, watchers, project_root, clock):
+    settings = supervisor_config.get("portfolio_allocator") or {}
+    if not settings.get("enabled", False):
+        return None, []
+    if not any(
+        record.get("strategy_config", {}).get("portfolio_allocation_required")
+        for record in records
+    ):
+        return None, []
+    candidates, portfolio, state = allocation_inputs(
+        client, records, supervisor_config, watchers, project_root
+    )
+    bar_times = sorted({
+        item.get("candidate_as_of") for item in candidates if item.get("candidate_as_of")
+    })
+    if len(bar_times) != 1 or any(
+        not item.get("candidate_as_of") for item in candidates
+    ):
+        decision = {
+            "as_of": iso_now(), "controls": settings, "ranked": [],
+            "selected": [], "rejected": [], "candidate_bar_times": bar_times,
+            "status": "incomplete_candidate_snapshot",
+            "shadow_mode": settings.get("shadow_mode", True), "executions": [],
+        }
+        append_jsonl(
+            project_root / PORTFOLIO_ALLOCATION_LOG,
+            {"timestamp": iso_now(), "decision": decision, "portfolio": portfolio},
+        )
+        return decision, []
+    bar_key = bar_times[0]
+    if state.get("last_allocated_bar") == bar_key:
+        return {
+            "as_of": iso_now(), "controls": settings, "ranked": [],
+            "selected": [], "rejected": [], "candidate_bar_times": bar_times,
+            "status": "candidate_snapshot_already_allocated",
+            "shadow_mode": settings.get("shadow_mode", True), "executions": [],
+        }, []
+    decision = allocate_candidates(candidates, portfolio, settings)
+    decision["candidate_bar_times"] = bar_times
+    decision["status"] = "allocation_completed"
+    execution_records = []
+    if not settings.get("shadow_mode", True):
+        watcher_by_symbol = {watcher["symbol"]: watcher for watcher in watchers}
+        for selected in decision["selected"]:
+            watcher = watcher_by_symbol.get(selected["symbol"])
+            if not watcher or not selected.get("candidate_as_of"):
+                continue
+            record = run_watcher(
+                client, watcher, supervisor_config, clock,
+                config_overrides={
+                    "portfolio_allocation_authorized": True,
+                    "portfolio_allocation_as_of": selected["candidate_as_of"],
+                },
+            )
+            execution_records.append(record)
+            if record["result"].get("status") == "dynamic_reentry_order_submitted":
+                state["entries"] += 1
+                state["turnover"] = round(state["turnover"] + selected["notional"], 2)
+                save_json(project_root / PORTFOLIO_ALLOCATION_STATE, state)
+    decision["shadow_mode"] = settings.get("shadow_mode", True)
+    decision["executions"] = [
+        {"symbol": record["symbol"], "status": record["result"].get("status")}
+        for record in execution_records
+    ]
+    append_jsonl(
+        project_root / PORTFOLIO_ALLOCATION_LOG,
+        {"timestamp": iso_now(), "decision": decision, "portfolio": portfolio},
+    )
+    save_json(project_root / PORTFOLIO_ALLOCATION_STATE, {
+        **state, "last_allocated_bar": bar_key, "last_decision": decision,
+    })
+    return decision, execution_records
 
 
 def list_watchers(watchers):
@@ -510,6 +723,17 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor:
         while not stop_requested:
             due = due_watchers(watchers)
+            allocator_enabled = (
+                supervisor_config.get("portfolio_allocator") or {}
+            ).get("enabled", False)
+            if allocator_enabled and any(item.get("group") == "new" for item in due):
+                due_symbols = {item["symbol"] for item in due}
+                due.extend(
+                    item for item in watchers
+                    if item.get("group") == "new"
+                    and item.get("enabled")
+                    and item["symbol"] not in due_symbols
+                )
             if not due:
                 if args.once:
                     break
@@ -547,9 +771,11 @@ def main():
                 executor.submit(run_watcher, client, watcher, supervisor_config, clock): watcher
                 for watcher in due
             }
+            batch_records = []
             for future in concurrent.futures.as_completed(futures):
                 watcher = futures[future]
                 record = future.result()
+                batch_records.append(record)
                 result = record["result"]
                 record_position_health_alert(project_root, watcher, result)
                 promoted = promote_new_watcher_if_bought(
@@ -573,6 +799,64 @@ def main():
                         sort_keys=True,
                     ),
                     flush=True,
+                )
+
+            try:
+                allocation, execution_records = run_portfolio_allocator(
+                    client,
+                    batch_records,
+                    supervisor_config,
+                    watchers,
+                    project_root,
+                    clock,
+                )
+                if allocation is not None:
+                    print(
+                        json.dumps(
+                            {
+                                "timestamp": iso_now(),
+                                "status": "portfolio_allocation_completed",
+                                "candidates": len(allocation["ranked"]),
+                                "selected": [
+                                    item["symbol"] for item in allocation["selected"]
+                                ],
+                                "shadow_mode": allocation["shadow_mode"],
+                                "executions": allocation["executions"],
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    for record in execution_records:
+                        result = record["result"]
+                        watcher = next(
+                            item for item in watchers
+                            if item["symbol"] == record["symbol"]
+                        )
+                        promoted = promote_new_watcher_if_bought(
+                            project_root,
+                            watchers_config_path,
+                            supervisor_config,
+                            watcher,
+                            record["strategy_config"],
+                            result,
+                        )
+                        if promoted:
+                            print(json.dumps({
+                                "timestamp": iso_now(),
+                                "symbol": record["symbol"],
+                                "promoted_to_managed": True,
+                            }, sort_keys=True), flush=True)
+            except Exception as exc:
+                append_jsonl(
+                    project_root / PORTFOLIO_ALLOCATION_LOG,
+                    {
+                        "timestamp": iso_now(),
+                        "status": "portfolio_allocation_error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
                 )
 
             if args.once:

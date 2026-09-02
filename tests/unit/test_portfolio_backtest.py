@@ -66,7 +66,7 @@ def signal_on_bar_60(signal_times, priorities=None):
         latest = symbol_bars[-1]
         if latest["t"] != signal_times[symbol]:
             return {"symbol": symbol, "status": "watch", "last_bar_time": latest["t"].isoformat()}
-        return {
+        plan = {
             "symbol": symbol,
             "status": "active_signal",
             "mode": "dynamic_breakout_continuation",
@@ -78,6 +78,15 @@ def signal_on_bar_60(signal_times, priorities=None):
             "volume_ratio": priorities.get(symbol, 2.0),
             "market_filter_ignored": False,
         }
+        plan["entry_candidates"] = [
+            {
+                "model_id": "breakout_continuation",
+                "status": "active_signal",
+                "setup_score": 100,
+                "blockers": [],
+            }
+        ]
+        return plan
 
     return fake_plan
 
@@ -115,6 +124,11 @@ def test_first_eligible_fill_is_on_next_bar():
     trade = result["trades_detail"][0]
     assert trade["signal_time"] == symbol_bars[60]["t"].isoformat()
     assert trade["entry_time"] == symbol_bars[61]["t"].isoformat()
+    assert result["signal_diagnostics"]["candidate_evaluations"] == 1
+    assert result["signal_diagnostics"]["qualified_signals"] == 1
+    assert result["signal_diagnostics"]["rejection_rate_percent"] == 0
+    assert result["baseline_metrics"]["trades"] == 1
+    assert result["equity_curve"]
 
 
 def test_simultaneous_orders_share_one_cash_balance():
@@ -139,6 +153,27 @@ def test_simultaneous_orders_share_one_cash_balance():
     assert result["portfolio"]["max_gross_exposure"] <= 10_000
     assert result["model_attribution"]["breakout_continuation"]["trades"] == 2
     assert result["model_attribution"]["breakout_continuation"]["wins"] == 0
+
+
+def test_regime_exposure_band_is_opt_in_and_only_blocks_new_orders():
+    symbol_bars = bars("AAA")
+    signal_times = {"AAA": symbol_bars[60]["t"]}
+    with (
+        patch.object(backtest, "dynamic_entry_plan", signal_on_bar_60(signal_times)),
+        patch.object(backtest, "historical_regime_at", return_value="bear"),
+    ):
+        unbanded = backtest.simulate_portfolio(
+            {"AAA": config("AAA", 5000)}, {"AAA": symbol_bars}, symbol_bars,
+            starting_equity=10_000,
+        )
+        banded = backtest.simulate_portfolio(
+            {"AAA": config("AAA", 5000)}, {"AAA": symbol_bars}, symbol_bars,
+            starting_equity=10_000, apply_regime_exposure_bands=True,
+        )
+
+    assert unbanded["portfolio"]["trades"] == 1
+    assert banded["portfolio"]["trades"] == 0
+    assert banded["results"][0]["blocked"]["regime_exposure_ceiling"] == 1
 
 
 def test_portfolio_uses_live_catastrophic_floor_and_hard_reduction():

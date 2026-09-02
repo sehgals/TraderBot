@@ -110,10 +110,12 @@ def load_strategy_configs(watchers_path):
     supervisor_config = load_json(watchers_path, {})
     global_position_health = supervisor_config.get("position_health") or {}
     global_entry_filters = supervisor_config.get("entry_filters") or {}
+    global_portfolio_allocator = supervisor_config.get("portfolio_allocator") or {}
+    managed_defaults = supervisor_config.get("managed_watcher_defaults", {})
     configs = {}
     for watcher in supervisor_config.get("managed_watchers", supervisor_config.get("watchers", [])):
         config_path = project_root / watcher["config"]
-        config = load_json(config_path, {})
+        config = {**managed_defaults, **load_json(config_path, {})}
         config["position_health"] = {
             **global_position_health,
             **(config.get("position_health") or {}),
@@ -121,6 +123,10 @@ def load_strategy_configs(watchers_path):
         config["entry_filters"] = {
             **global_entry_filters,
             **(config.get("entry_filters") or {}),
+        }
+        config["portfolio_allocator"] = {
+            **global_portfolio_allocator,
+            **(config.get("portfolio_allocator") or {}),
         }
         configs[config["symbol"]] = config
     new_defaults = supervisor_config.get("new_watcher_defaults", {})
@@ -134,6 +140,10 @@ def load_strategy_configs(watchers_path):
         config["entry_filters"] = {
             **global_entry_filters,
             **(config.get("entry_filters") or {}),
+        }
+        config["portfolio_allocator"] = {
+            **global_portfolio_allocator,
+            **(config.get("portfolio_allocator") or {}),
         }
         configs[config["symbol"]] = config
     return configs

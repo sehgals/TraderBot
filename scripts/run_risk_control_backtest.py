@@ -7,14 +7,26 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from traderbot.backtester.reentry_backtest import load_strategy_configs
+from traderbot.backtester.baseline import (
+    attribution_by_dimensions,
+    dataset_manifest,
+    finalize_forward_returns,
+    new_forward_return_accumulator,
+    performance_metrics,
+    record_rejected_candidate,
+    source_provenance,
+    stable_hash,
+)
 from traderbot.core_strategy_engine.engine import (
     adaptive_ladder_limit,
     adaptive_ladder_quantity,
@@ -35,12 +47,105 @@ from traderbot.core_strategy_engine.engine import (
     risk_setting,
     trail_below_current_percent,
 )
+from traderbot.portfolio_allocator import regime_exposure_band
 
 
 TIMEFRAME = "5Min"
 ACCOUNT_EQUITY = 100000.0
 START = datetime.datetime(2025, 7, 7, 20, 0, tzinfo=datetime.timezone.utc)
 END = datetime.datetime(2026, 7, 7, 20, 0, tzinfo=datetime.timezone.utc)
+DEFAULT_RATE_LIMIT_RETRIES = 8
+DEFAULT_BACKOFF_BASE_SECONDS = 2.0
+DEFAULT_BACKOFF_MAX_SECONDS = 60.0
+DEFAULT_REQUEST_PACE_SECONDS = 0.25
+
+
+def historical_regime_at(market_bars, timestamp):
+    times = [bar["t"] for bar in market_bars]
+    index = bisect.bisect_right(times, timestamp) - 1
+    if index < 5:
+        return "unknown"
+    bar = market_bars[index]
+    previous = market_bars[index - 5]
+    slope = (bar["ema21"] - previous["ema21"]) / previous["ema21"]
+    if bar["c"] > bar["ema21"] > bar["ema50"] and slope >= 0:
+        return "bull"
+    if bar["c"] < bar["ema21"] < bar["ema50"] and slope < 0:
+        return "bear"
+    return "mixed"
+
+
+def parse_backtest_time(value):
+    parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def month_windows(start, end):
+    if start >= end:
+        raise ValueError("historical bar start must be before end")
+    cursor = start
+    while cursor < end:
+        if cursor.month == 12:
+            next_month = cursor.replace(
+                year=cursor.year + 1, month=1, day=1,
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+        else:
+            next_month = cursor.replace(
+                month=cursor.month + 1, day=1,
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+        chunk_end = min(end, next_month)
+        yield cursor, chunk_end
+        cursor = chunk_end
+
+
+def retry_after_seconds(error, now=None):
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+            current = now or datetime.datetime.now(datetime.timezone.utc)
+            return max(0.0, (retry_at - current).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def request_json_with_backoff(
+    request,
+    *,
+    timeout=30,
+    max_rate_limit_retries=DEFAULT_RATE_LIMIT_RETRIES,
+    backoff_base_seconds=DEFAULT_BACKOFF_BASE_SECONDS,
+    backoff_max_seconds=DEFAULT_BACKOFF_MAX_SECONDS,
+):
+    for attempt in range(max_rate_limit_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt >= max_rate_limit_retries:
+                raise
+            server_delay = retry_after_seconds(exc)
+            delay = (
+                server_delay
+                if server_delay is not None
+                else min(
+                    backoff_max_seconds,
+                    backoff_base_seconds * (2 ** attempt),
+                )
+            )
+            time.sleep(min(backoff_max_seconds, max(0.0, delay)))
+    raise RuntimeError("rate-limit retry loop exhausted")
 
 
 def fetch_bars(
@@ -50,32 +155,57 @@ def fetch_bars(
     timeframe=TIMEFRAME,
     start=START,
     end=END,
+    *,
+    max_rate_limit_retries=DEFAULT_RATE_LIMIT_RETRIES,
+    backoff_base_seconds=DEFAULT_BACKOFF_BASE_SECONDS,
+    backoff_max_seconds=DEFAULT_BACKOFF_MAX_SECONDS,
+    request_pace_seconds=DEFAULT_REQUEST_PACE_SECONDS,
 ):
-    bars = []
-    page_token = None
-    while True:
-        params = {
-            "symbols": symbol,
-            "timeframe": timeframe,
-            "start": iso_utc(start),
-            "end": iso_utc(end),
-            "adjustment": "raw",
-            "feed": "iex",
-            "limit": "10000",
-        }
-        if page_token:
-            params["page_token"] = page_token
-        request = urllib.request.Request(
-            f"{data_url}/stocks/bars?{urllib.parse.urlencode(params)}",
-            headers=headers,
+    bars_by_timestamp = {}
+    for chunk_start, chunk_end in month_windows(start, end):
+        page_token = None
+        chunk_count = 0
+        while True:
+            params = {
+                "symbols": symbol,
+                "timeframe": timeframe,
+                "start": iso_utc(chunk_start),
+                "end": iso_utc(chunk_end),
+                "adjustment": "raw",
+                "feed": "iex",
+                "limit": "10000",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            request = urllib.request.Request(
+                f"{data_url}/stocks/bars?{urllib.parse.urlencode(params)}",
+                headers=headers,
+            )
+            payload = request_json_with_backoff(
+                request,
+                max_rate_limit_retries=max_rate_limit_retries,
+                backoff_base_seconds=backoff_base_seconds,
+                backoff_max_seconds=backoff_max_seconds,
+            )
+            page = payload.get("bars", {}).get(symbol, [])
+            chunk_count += len(page)
+            for bar in page:
+                timestamp = bar.get("t")
+                if timestamp:
+                    bars_by_timestamp[timestamp] = bar
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+            if request_pace_seconds > 0:
+                time.sleep(request_pace_seconds)
+        print(
+            f"FETCH {symbol} {timeframe} "
+            f"{chunk_start.date()}..{chunk_end.date()}: {chunk_count} bars"
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        bars.extend(payload.get("bars", {}).get(symbol, []))
-        page_token = payload.get("next_page_token")
-        if not page_token:
-            return calculate_indicators(bars)
-        time.sleep(0.05)
+        if chunk_end < end and request_pace_seconds > 0:
+            time.sleep(request_pace_seconds)
+    raw_bars = [bars_by_timestamp[key] for key in sorted(bars_by_timestamp)]
+    return calculate_indicators(raw_bars)
 
 
 def cap_qty(config, desired_qty, price, current_qty):
@@ -159,6 +289,20 @@ def model_attribution(trades, candidate_counts=None):
             "candidate_evaluations": int(counts.get("evaluated", 0)),
             "qualified_signals": int(counts.get("qualified", 0)),
             "selected_signals": int(counts.get("selected", 0)),
+            "rejection_rate_percent": round(
+                100
+                * (int(counts.get("evaluated", 0)) - int(counts.get("qualified", 0)))
+                / int(counts.get("evaluated", 0)),
+                4,
+            )
+            if counts.get("evaluated")
+            else 0,
+            "selection_rate_percent": round(
+                100 * int(counts.get("selected", 0)) / int(counts.get("evaluated", 0)),
+                4,
+            )
+            if counts.get("evaluated")
+            else 0,
             "trades": len(model_trades),
             "wins": sum(1 for value in profits if value > 0),
             "win_rate_percent": round(
@@ -455,6 +599,7 @@ def portfolio_result_by_symbol(symbol, config, bars, trades, blocked):
         for key in (
             "risk_cap",
             "market_regime",
+            "regime_exposure_ceiling",
             "max_ladders",
             "unfilled_limit",
             "expired_day_order",
@@ -507,6 +652,9 @@ def simulate_portfolio(
     regime_bars_by_symbol=None,
     entry_filter_context_at=None,
     entry_window=None,
+    estimated_slippage_bps=5.0,
+    forward_return_horizons=(1, 3, 6, 12),
+    apply_regime_exposure_bands=False,
 ):
     """Run all symbols on one clock and one cash balance.
 
@@ -554,9 +702,13 @@ def simulate_portfolio(
     max_drawdown = 0.0
     max_drawdown_percent = 0.0
     exposure_observations = []
+    equity_curve = []
     max_gross_exposure = 0.0
     candidate_counts = collections.defaultdict(collections.Counter)
     entry_filter_blockers = collections.defaultdict(collections.Counter)
+    rejected_forward_returns = new_forward_return_accumulator(
+        forward_return_horizons
+    )
 
     def market_context(timestamp):
         end = bisect.bisect_right(market_times, timestamp)
@@ -925,6 +1077,11 @@ def simulate_portfolio(
                 "filled_ladder_steps": [],
                 "ladder_fills": [],
                 "profile": config.get("risk_profile"),
+                "sector_benchmark": str(
+                    (position_health_config(config).get("benchmark_by_symbol") or {}).get(symbol)
+                    or position_health_config(config).get("benchmark_symbol")
+                    or "QQQ"
+                ).upper(),
                 "bars_seen": 1,
                 "max_unrealized_loss": 0.0,
                 "max_capital": qty * fill_price,
@@ -973,6 +1130,14 @@ def simulate_portfolio(
                 candidate_counts[model_id]["evaluated"] += 1
                 if candidate.get("status") == "active_signal":
                     candidate_counts[model_id]["qualified"] += 1
+                else:
+                    record_rejected_candidate(
+                        rejected_forward_returns,
+                        candidate,
+                        symbol,
+                        eligible[symbol],
+                        index,
+                    )
             filter_check_names = {
                 "liquidity_data_available",
                 "liquidity_ok",
@@ -1033,17 +1198,40 @@ def simulate_portfolio(
                 continue
             if plan.get("status") != "active_signal":
                 continue
+            desired_qty = dynamic_qty(
+                config,
+                plan,
+                equity=portfolio_equity(cash, positions, last_prices),
+            )
+            if apply_regime_exposure_bands:
+                equity_now = portfolio_equity(cash, positions, last_prices)
+                gross_now = sum(
+                    position["qty"] * last_prices.get(held, position["avg_price"])
+                    for held, position in positions.items()
+                )
+                reserved = sum(
+                    order["desired_qty"] * order["limit_price"]
+                    for order in pending_orders.values()
+                )
+                regime = historical_regime_at(market_bars, timestamp)
+                regime = {
+                    "bull": "favorable", "mixed": "neutral",
+                    "bear": "defensive", "unknown": "defensive",
+                }[regime]
+                band = regime_exposure_band(
+                    regime, config.get("portfolio_allocator") or {}
+                )
+                projected = gross_now + reserved + desired_qty * float(plan["limit_price"])
+                if equity_now <= 0 or projected > equity_now * band["maximum_percent"] / 100:
+                    blocked[symbol]["regime_exposure_ceiling"] += 1
+                    continue
             pending_orders[symbol] = {
                 "symbol": symbol,
                 "signal_time": bar["t"],
                 "session_date": bar["t"].date(),
                 "created_index": index,
                 "limit_price": float(plan["limit_price"]),
-                "desired_qty": dynamic_qty(
-                    config,
-                    plan,
-                    equity=portfolio_equity(cash, positions, last_prices),
-                ),
+                "desired_qty": desired_qty,
                 "priority": float(plan.get("volume_ratio") or 0),
                 "plan": plan,
             }
@@ -1054,7 +1242,21 @@ def simulate_portfolio(
             position["qty"] * last_prices.get(symbol, position["avg_price"])
             for symbol, position in positions.items()
         )
-        exposure_observations.append(gross_exposure / equity if equity > 0 else 0)
+        if not entry_window or entry_window[0] <= timestamp < entry_window[1]:
+            exposure_observations.append(gross_exposure / equity if equity > 0 else 0)
+            equity_curve.append(
+                {
+                    "timestamp": timestamp.isoformat(),
+                    "equity": round(equity, 6),
+                    "cash": round(cash, 6),
+                    "gross_exposure": round(gross_exposure, 6),
+                    "gross_exposure_percent": (
+                        round(gross_exposure / equity * 100, 6) if equity > 0 else 0
+                    ),
+                    "cash_percent": round(cash / equity * 100, 6) if equity > 0 else 0,
+                    "open_positions": len(positions),
+                }
+            )
         max_gross_exposure = max(max_gross_exposure, gross_exposure)
         equity_peak = max(equity_peak, equity)
         max_drawdown = max(max_drawdown, equity_peak - equity)
@@ -1074,8 +1276,7 @@ def simulate_portfolio(
         )
         for symbol in sorted(eligible)
     ]
-    return {
-        "portfolio": {
+    portfolio = {
             "starting_equity": round(float(starting_equity), 2),
             "ending_equity": round(ending_equity, 2),
             "net_pnl": round(ending_equity - starting_equity, 2),
@@ -1091,8 +1292,45 @@ def simulate_portfolio(
             "trades": len(trades),
             "pending_orders_at_end": len(pending_orders),
             "execution_model": "signal at bar close; day-limit eligible from next symbol bar",
-        },
+        }
+    total_candidate_evaluations = sum(
+        counts.get("evaluated", 0) for counts in candidate_counts.values()
+    )
+    total_qualified_signals = sum(
+        counts.get("qualified", 0) for counts in candidate_counts.values()
+    )
+    total_selected_signals = sum(
+        counts.get("selected", 0) for counts in candidate_counts.values()
+    )
+    return {
+        "portfolio": portfolio,
+        "baseline_metrics": performance_metrics(
+            portfolio,
+            trades,
+            equity_curve,
+            estimated_slippage_bps=estimated_slippage_bps,
+        ),
+        "equity_curve": equity_curve,
+        "rejected_candidate_forward_returns": finalize_forward_returns(
+            rejected_forward_returns
+        ),
         "model_attribution": model_attribution(trades, candidate_counts),
+        "signal_diagnostics": {
+            "candidate_evaluations": total_candidate_evaluations,
+            "qualified_signals": total_qualified_signals,
+            "selected_signals": total_selected_signals,
+            "rejected_candidates": (
+                total_candidate_evaluations - total_qualified_signals
+            ),
+            "rejection_rate_percent": round(
+                100
+                * (total_candidate_evaluations - total_qualified_signals)
+                / total_candidate_evaluations,
+                4,
+            )
+            if total_candidate_evaluations
+            else 0,
+        },
         "entry_filter_blockers": {
             symbol: dict(counts)
             for symbol, counts in sorted(entry_filter_blockers.items())
@@ -1119,7 +1357,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--start", default=iso_utc(START))
+    parser.add_argument("--end", default=iso_utc(END))
+    parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
+    parser.add_argument("--apply-regime-exposure-bands", action="store_true")
     args = parser.parse_args()
+    start = parse_backtest_time(args.start)
+    end = parse_backtest_time(args.end)
+    if start >= end:
+        parser.error("--start must be earlier than --end")
 
     load_env()
     data_url = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets/v2").rstrip("/")
@@ -1144,12 +1390,16 @@ def main():
     configs["SPY"] = {**base_index_config, "symbol": "SPY"}
     configs["QQQ"] = {**base_index_config, "symbol": "QQQ"}
 
-    market_bars = fetch_bars("QQQ", data_url, headers)
+    market_bars = fetch_bars("QQQ", data_url, headers, start=start, end=end)
     bars_by_symbol = {}
     errors = []
     for index, symbol in enumerate(args.symbols, 1):
         try:
-            bars = market_bars if symbol == "QQQ" else fetch_bars(symbol, data_url, headers)
+            bars = (
+                market_bars
+                if symbol == "QQQ"
+                else fetch_bars(symbol, data_url, headers, start=start, end=end)
+            )
             if symbol not in configs:
                 raise KeyError(f"no strategy config for {symbol}")
             bars_by_symbol[symbol] = bars
@@ -1175,7 +1425,9 @@ def main():
             health_symbols.add(benchmark)
     regime_bars_by_symbol = {"QQQ": market_bars}
     for index, symbol in enumerate(sorted(regime_symbols - {"QQQ"}), 1):
-        regime_bars_by_symbol[symbol] = fetch_bars(symbol, data_url, headers)
+        regime_bars_by_symbol[symbol] = fetch_bars(
+            symbol, data_url, headers, start=start, end=end
+        )
         print(
             f"REGIME {index}/{max(1, len(regime_symbols - {'QQQ'}))} {symbol}: "
             f"bars={len(regime_bars_by_symbol[symbol])}"
@@ -1184,7 +1436,12 @@ def main():
     for index, symbol in enumerate(sorted(health_symbols), 1):
         try:
             health_bars_by_symbol[symbol] = fetch_bars(
-                symbol, data_url, headers, timeframe="1Hour"
+                symbol,
+                data_url,
+                headers,
+                timeframe="1Hour",
+                start=start,
+                end=end,
             )
             print(
                 f"HEALTH {index}/{len(health_symbols)} {symbol}: "
@@ -1205,6 +1462,8 @@ def main():
         market_bars,
         health_bars_by_symbol=health_bars_by_symbol,
         regime_bars_by_symbol=regime_bars_by_symbol,
+        estimated_slippage_bps=args.estimated_slippage_bps,
+        apply_regime_exposure_bands=args.apply_regime_exposure_bands,
     )
     results = simulation["results"] + errors
     print(
@@ -1216,12 +1475,38 @@ def main():
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "start": iso_utc(START),
-        "end": iso_utc(END),
+        "start": iso_utc(start),
+        "end": iso_utc(end),
         "timeframe": TIMEFRAME,
         "account_equity_assumption": ACCOUNT_EQUITY,
-        "model": "unified cash portfolio; signals at bar close; next-bar-or-later day-limit fills; managed stop floor; no commissions/slippage; final open positions marked at last close",
+        "regime_exposure_bands_applied": args.apply_regime_exposure_bands,
+        "configuration_snapshot": {
+            symbol: configs[symbol] for symbol in sorted(bars_by_symbol)
+        },
+        "provenance": {
+            **source_provenance(ROOT),
+            "data_source": {
+                "provider": "Alpaca",
+                "feed": "iex",
+                "adjustment": "raw",
+            },
+            "config_sha256": stable_hash(
+                {symbol: configs[symbol] for symbol in sorted(bars_by_symbol)}
+            ),
+            "datasets": {
+                "entry_5Min": dataset_manifest(bars_by_symbol, TIMEFRAME),
+                "regime_5Min": dataset_manifest(regime_bars_by_symbol, TIMEFRAME),
+                "position_health_1Hour": dataset_manifest(
+                    health_bars_by_symbol, "1Hour"
+                ),
+            },
+        },
+        "model": "unified cash portfolio; signals at bar close; next-bar-or-later day-limit fills; managed stop floor; simulated fills exclude commissions/slippage; baseline metrics apply the configured turnover-based slippage sensitivity; final open positions marked at last close",
         "portfolio": simulation["portfolio"],
+        "baseline_metrics": simulation["baseline_metrics"],
+        "rejected_candidate_forward_returns": simulation[
+            "rejected_candidate_forward_returns"
+        ],
         "live_parity": {
             "shared_dynamic_entry_plan": True,
             "separate_entry_models": True,
@@ -1238,8 +1523,14 @@ def main():
         },
         "results": results,
         "model_attribution": simulation["model_attribution"],
+        "signal_diagnostics": simulation["signal_diagnostics"],
+        "attribution_by_regime_sector_model": attribution_by_dimensions(
+            simulation["trades_detail"], market_bars, historical_regime_at
+        ),
+        "entry_filter_blockers": simulation["entry_filter_blockers"],
         "errors": errors,
         "trades_detail": simulation["trades_detail"],
+        "equity_curve": simulation["equity_curve"],
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

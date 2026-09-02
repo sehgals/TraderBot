@@ -297,7 +297,7 @@ class RiskControlTests(unittest.TestCase):
             (110, "entry_structural_target"),
         )
 
-    def test_market_and_sector_regimes_are_hard_entry_gates(self):
+    def test_market_and_sector_regimes_are_soft_scored_entry_features(self):
         start = datetime.datetime(2026, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)
         stock_bars = []
         for index in range(55):
@@ -345,10 +345,23 @@ class RiskControlTests(unittest.TestCase):
             sector_bars=regime_bars(False),
         )
 
-        self.assertEqual(market_blocked["status"], "watch")
+        self.assertEqual(market_blocked["status"], "active_signal")
         self.assertIn("market_ok", market_blocked["blockers"])
-        self.assertEqual(sector_blocked["status"], "watch")
+        self.assertIn("market_ok", market_blocked["soft_blockers"])
+        self.assertNotIn("market_ok", market_blocked["hard_blockers"])
+        self.assertEqual(sector_blocked["status"], "active_signal")
         self.assertIn("sector_ok", sector_blocked["blockers"])
+        self.assertIn("sector_ok", sector_blocked["soft_blockers"])
+
+        stricter = dynamic_entry_plan(
+            "TEST",
+            stock_bars,
+            regime_bars(False),
+            sector_bars=regime_bars(True),
+            config={"minimum_entry_setup_score": 95},
+        )
+        self.assertEqual(stricter["status"], "watch")
+        self.assertIn("setup_score_below_minimum", stricter["decision_reasons"])
 
     def test_completed_market_bars_excludes_in_progress_interval(self):
         raw = [

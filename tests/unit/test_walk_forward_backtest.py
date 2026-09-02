@@ -2,7 +2,10 @@ import datetime
 
 from scripts.run_walk_forward_backtest import (
     attribution_rows,
+    calibration_objective,
+    configs_with_score_weights,
     prepare_filter_configs,
+    select_weight_profile,
     walk_forward_windows,
 )
 
@@ -52,7 +55,6 @@ def test_attribution_crosses_regime_and_risk_profile():
             "pnl": 25,
         }
     ]
-
     assert attribution_rows(trades, market) == [
         {
             "regime": "bull",
@@ -64,3 +66,26 @@ def test_attribution_crosses_regime_and_risk_profile():
             "profit_factor": None,
         }
     ]
+
+
+def test_weight_calibration_selects_training_objective_and_does_not_mutate_config():
+    configs = {"PANW": {"minimum_entry_setup_score": 80}}
+    weighted = configs_with_score_weights(configs, {"price_action": 40})
+    selected = select_weight_profile([
+        {"profile": "balanced", "objective": 1.0, "trades": 2},
+        {"profile": "reward_risk", "objective": 2.0, "trades": 1},
+    ])
+
+    assert selected["profile"] == "reward_risk"
+    assert weighted["PANW"]["entry_score_weights"] == {"price_action": 40}
+    assert "entry_score_weights" not in configs["PANW"]
+
+
+def test_calibration_objective_penalizes_drawdown_and_no_trade_profiles():
+    simulation = {
+        "portfolio": {"return_percent": 4, "max_drawdown_percent": 1.5},
+        "trades_detail": [{"pnl": 1}],
+    }
+    assert calibration_objective(simulation) == 2.5
+    simulation["trades_detail"] = []
+    assert calibration_objective(simulation) == -1_000_000

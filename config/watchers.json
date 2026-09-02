@@ -7,6 +7,36 @@
     "poll_seconds": 300,
     "target_margin_dollars": 0
   },
+  "portfolio_allocator": {
+    "enabled": true,
+    "shadow_mode": true,
+    "maximum_simultaneous_positions": 12,
+    "maximum_aggregate_open_risk_percent": 6,
+    "maximum_sector_exposure_percent": 30,
+    "maximum_correlated_factor_exposure_percent": 35,
+    "maximum_symbol_notional_percent": 15,
+    "maximum_daily_entries": 4,
+    "maximum_daily_turnover_percent": 25,
+    "minimum_cash_reserve_percent": 20,
+    "minimum_score": 80,
+    "minimum_score_separation": 2,
+    "sector_penalty": 0.25,
+    "correlated_factor_penalty": 0.15,
+    "regime_exposure_bands": {
+      "defensive": {
+        "minimum_percent": 0,
+        "maximum_percent": 25
+      },
+      "neutral": {
+        "minimum_percent": 25,
+        "maximum_percent": 55
+      },
+      "favorable": {
+        "minimum_percent": 50,
+        "maximum_percent": 80
+      }
+    }
+  },
   "default_error_poll_seconds": 30,
   "default_market_closed_poll_seconds": 900,
   "default_poll_seconds": 30,
@@ -486,6 +516,18 @@
       "missing_data_policy": "block"
     }
   },
+  "managed_watcher_defaults": {
+    "absolute_minimum_entry_reward_risk": 1.0,
+    "entry_score_weights": {
+      "price_action": 25,
+      "stock_trend": 20,
+      "market_sector_regime": 15,
+      "volume_liquidity_quality": 15,
+      "reward_risk_geometry": 15,
+      "relative_strength_execution": 10
+    },
+    "minimum_entry_setup_score": 80
+  },
   "max_concurrency": 3,
   "new_watcher_defaults": {
     "direct_ladder_authority_enabled": false,
@@ -501,6 +543,14 @@
     "dynamic_replace_open_orders": true,
     "dynamic_timeframe": "5Min",
     "entry_model_architecture_version": 2,
+    "entry_score_weights": {
+      "price_action": 25,
+      "stock_trend": 20,
+      "market_sector_regime": 15,
+      "volume_liquidity_quality": 15,
+      "reward_risk_geometry": 15,
+      "relative_strength_execution": 10
+    },
     "entry_models": {
       "breakout": {
         "enabled": true,
@@ -520,6 +570,8 @@
     "market_closed_poll_seconds": 900,
     "max_ladder_count": 0,
     "max_symbol_notional_percent": 15,
+    "absolute_minimum_entry_reward_risk": 1.0,
+    "minimum_entry_setup_score": 80,
     "minimum_entry_reward_risk": 1.5,
     "min_cash_balance_percent": 20,
     "poll_seconds": 60,
