@@ -149,6 +149,25 @@ def load_strategy_configs(watchers_path):
     return configs
 
 
+def isolate_entry_model_configs(configs, model_name):
+    isolated = {symbol: dict(config) for symbol, config in configs.items()}
+    known = {
+        "pullback", "breakout", "relative_strength", "low_volatility_trend",
+        "post_earnings_drift", "trend_mean_reversion", "defensive_etf",
+    }
+    if model_name not in known:
+        raise ValueError(f"unknown entry model: {model_name}")
+    for symbol, config in isolated.items():
+        models = {
+            name: dict(settings or {})
+            for name, settings in (config.get("entry_models") or {}).items()
+        }
+        for name in known:
+            models.setdefault(name, {})["enabled"] = name == model_name
+        config["entry_models"] = models
+    return isolated
+
+
 def default_strategy_config(symbol):
     return {
         "symbol": symbol,

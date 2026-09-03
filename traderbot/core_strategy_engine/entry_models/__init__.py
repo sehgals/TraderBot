@@ -12,12 +12,14 @@ from traderbot.core_strategy_engine.entry_models.candidate import (
     structural_stop_price,
 )
 from traderbot.core_strategy_engine.entry_models.pullback import evaluate_pullback
+from traderbot.core_strategy_engine.entry_models.signal_families import evaluate_signal_families
 
 __all__ = [
     "allowed_ledger_price",
     "build_entry_features",
     "evaluate_breakout",
     "evaluate_pullback",
+    "evaluate_signal_families",
     "market_ok_at",
     "reward_risk_ok",
     "select_entry_candidate",

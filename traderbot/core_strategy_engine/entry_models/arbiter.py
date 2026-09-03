@@ -50,16 +50,26 @@ def select_entry_candidate(candidates):
         classified = None
         reason = "unclassified"
 
-    if classified:
-        selected = (
-            classified if classified.get("status") == "active_signal" else None
-        )
+    active = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") == "active_signal"
+    ]
+    if classified and classified.get("status") == "active_signal":
+        selected = classified
     else:
-        active = [
-            candidate
-            for candidate in candidates
-            if candidate.get("status") == "active_signal"
-        ]
+        if breakout_territory:
+            active = [
+                candidate for candidate in active
+                if candidate.get("model_id") not in {
+                    "pullback_reclaim", "breakout_continuation"
+                }
+            ]
+        elif classified is pullback:
+            active = [
+                candidate for candidate in active
+                if candidate.get("model_id") != "pullback_reclaim"
+            ]
         selected = sorted(active, key=_candidate_rank)[0] if active else None
         if selected:
             reason = "deterministic_rank"

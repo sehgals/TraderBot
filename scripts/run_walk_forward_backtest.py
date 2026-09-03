@@ -27,7 +27,10 @@ from traderbot.backtester.baseline import (
     source_provenance,
     stable_hash,
 )
-from traderbot.backtester.reentry_backtest import load_strategy_configs
+from traderbot.backtester.reentry_backtest import (
+    isolate_entry_model_configs,
+    load_strategy_configs,
+)
 
 
 UTC = datetime.timezone.utc
@@ -224,6 +227,7 @@ def main():
     parser.add_argument("--event-calendar")
     parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
     parser.add_argument("--apply-regime-exposure-bands", action="store_true")
+    parser.add_argument("--only-entry-model")
     parser.add_argument(
         "--calibrate-entry-weights",
         action="store_true",
@@ -248,6 +252,8 @@ def main():
         "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
     }
     configs = load_strategy_configs("config/watchers.json")
+    if args.only_entry_model:
+        configs = isolate_entry_model_configs(configs, args.only_entry_model)
     configs = {symbol: configs[symbol] for symbol in args.symbols}
     quote_payload = load_optional(args.historical_quotes)
     event_calendar = load_optional(args.event_calendar)
@@ -475,6 +481,7 @@ def main():
                 "purge_days": args.purge_days,
                 "estimated_slippage_bps": args.estimated_slippage_bps,
                 "apply_regime_exposure_bands": args.apply_regime_exposure_bands,
+                "isolated_entry_model": args.only_entry_model,
                 "calibrate_entry_weights": args.calibrate_entry_weights,
                 "candidate_weight_profiles": WEIGHT_PROFILES,
             },

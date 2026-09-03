@@ -24,6 +24,7 @@ from traderbot.core_strategy_engine.strategies import (
 )
 from traderbot.broker.execution_gateway import ExecutionGateway
 from traderbot.portfolio_allocator import allocate_candidates, classify_exposure_regime
+from traderbot.shadow_deployment import apply_promotion_stage, update_shadow_ledger
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -249,7 +250,13 @@ def run_watcher(client, watcher, supervisor_config, clock, config_overrides=None
     }
     allocator_settings = supervisor_config.get("portfolio_allocator") or {}
     if allocator_settings.get("enabled", False) and watcher.get("group") == "new":
-        strategy_config["portfolio_allocation_required"] = True
+        strategy_config["portfolio_allocation_observed"] = True
+        promotion_stage = allocator_settings.get(
+            "promotion_stage",
+            "shadow" if allocator_settings.get("shadow_mode", True) else "full",
+        )
+        if promotion_stage != "shadow":
+            strategy_config["portfolio_allocation_required"] = True
     strategy_config.update(config_overrides or {})
     if watcher.get("group") == "managed":
         managed_reentry = supervisor_config.get("managed_reentry") or {}
@@ -312,7 +319,16 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
     account = client.account()
     equity = max(0.0, _float(account.get("equity")))
     positions = client.positions()
-    open_buy_orders = [order for order in client.open_orders() if order.get("side") == "buy"]
+    incumbent_order_ids = {
+        str(record.get("result", {}).get("reentry_order_id"))
+        for record in records
+        if record.get("result", {}).get("status") == "dynamic_reentry_order_submitted"
+        and record.get("result", {}).get("reentry_order_id")
+    }
+    open_buy_orders = [
+        order for order in client.open_orders()
+        if order.get("side") == "buy" and str(order.get("id")) not in incumbent_order_ids
+    ]
     benchmark_by_symbol = (
         (supervisor_config.get("position_health") or {}).get("benchmark_by_symbol") or {}
     )
@@ -356,7 +372,10 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
     candidates = []
     for record in records:
         config = record["strategy_config"]
-        if config.get("portfolio_allocation_required") is not True:
+        if not (
+            config.get("portfolio_allocation_observed")
+            or config.get("portfolio_allocation_required")
+        ):
             continue
         plan = (record.get("result") or {}).get("dynamic_plan") or {}
         limit_price = _float(plan.get("limit_price"))
@@ -382,6 +401,9 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
             "hard_safety_passed": not (plan.get("hard_blockers") or []),
             "candidate_as_of": plan.get("last_bar_time"),
             "model_id": plan.get("model_id") or plan.get("classified_model_id"),
+            "fallback_only": plan.get("fallback_only", False),
+            "limit_price": limit_price,
+            "last_price": plan.get("last_price"),
         })
     market_regime = "defensive"
     regime_data_status = "unavailable_conservative_default"
@@ -434,7 +456,8 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
     if not settings.get("enabled", False):
         return None, []
     if not any(
-        record.get("strategy_config", {}).get("portfolio_allocation_required")
+        record.get("strategy_config", {}).get("portfolio_allocation_observed")
+        or record.get("strategy_config", {}).get("portfolio_allocation_required")
         for record in records
     ):
         return None, []
@@ -467,10 +490,14 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
             "shadow_mode": settings.get("shadow_mode", True), "executions": [],
         }, []
     decision = allocate_candidates(candidates, portfolio, settings)
+    decision = apply_promotion_stage(decision, settings)
     decision["candidate_bar_times"] = bar_times
     decision["status"] = "allocation_completed"
     execution_records = []
-    if not settings.get("shadow_mode", True):
+    promotion_stage = settings.get(
+        "promotion_stage", "shadow" if settings.get("shadow_mode", True) else "full"
+    )
+    if promotion_stage != "shadow":
         watcher_by_symbol = {watcher["symbol"]: watcher for watcher in watchers}
         for selected in decision["selected"]:
             watcher = watcher_by_symbol.get(selected["symbol"])
@@ -481,14 +508,27 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
                 config_overrides={
                     "portfolio_allocation_authorized": True,
                     "portfolio_allocation_as_of": selected["candidate_as_of"],
+                    "dynamic_entry_notional": min(
+                        selected["notional"],
+                        float(settings.get("small_notional_dollars", 1000)),
+                    ) if promotion_stage == "small_notional" else selected["notional"],
                 },
             )
             execution_records.append(record)
             if record["result"].get("status") == "dynamic_reentry_order_submitted":
                 state["entries"] += 1
                 state["turnover"] = round(state["turnover"] + selected["notional"], 2)
+                stage_entries = state.setdefault("stage_live_entries", {})
+                stage_entries[promotion_stage] = stage_entries.get(promotion_stage, 0) + 1
                 save_json(project_root / PORTFOLIO_ALLOCATION_STATE, state)
-    decision["shadow_mode"] = settings.get("shadow_mode", True)
+    decision["shadow_mode"] = promotion_stage == "shadow"
+    decision["promotion_stage"] = promotion_stage
+    decision["incumbent_executions"] = [
+        {"symbol": record["symbol"], "status": record["result"].get("status")}
+        for record in records
+        if record["result"].get("status") == "dynamic_reentry_order_submitted"
+    ]
+    decision["shadow_summary"] = update_shadow_ledger(state, decision, settings)
     decision["executions"] = [
         {"symbol": record["symbol"], "status": record["result"].get("status")}
         for record in execution_records

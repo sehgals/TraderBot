@@ -92,6 +92,9 @@ def build_entry_features(
         "bar": bar,
         "previous_bar": previous,
         "prior_20_bars": prior_20_bars,
+        "bars": bars,
+        "market_bars": market_bars,
+        "sector_bars": sector_bars or market_bars,
         "recent_three_bars": bars[index - 2 : index + 1],
         "atr14": atr,
         "ema21_slope_5bars": ema21_slope,
@@ -107,6 +110,7 @@ def build_entry_features(
         "same_day_exit": same_day_exit,
         "above_exit": above_exit,
         "no_same_day_loss_reentry": no_same_day_loss_reentry,
+        "event_calendar": (filter_context or {}).get("event_calendar"),
     }
     features["entry_filters"] = evaluate_entry_filters(
         features, config=config, context=filter_context

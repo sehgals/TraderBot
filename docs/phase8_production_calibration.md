@@ -1,12 +1,31 @@
-# Phase 8: Production calibration lifecycle
+# Phase 8: Shadow deployment and controlled promotion
 
 ## Objective
 
-Convert Phase 4's research-only weight calibration into a controlled offline
-production lifecycle. The live trading process must never train or automatically
-consume an unvalidated calibration result.
+Validate revised scoring, allocation, exposure bands, and signal families beside
+the incumbent production behavior without allowing the proposal to risk capital.
+Promotion is explicit and staged. Phase 4 calibration remains offline and must
+never be consumed automatically by the live process.
 
-## Implementation scope
+## Implemented shadow behavior
+
+- `promotion_stage: shadow` leaves incumbent entry behavior active.
+- The proposed allocator records ranked selections and rejected alternatives but
+  cannot authorize broker orders.
+- A persistent ledger records hypothetical limit orders, later-bar fills,
+  configured slippage, current marks, hypothetical P&L, incumbent entries,
+  unique sessions, and signal counts.
+- Promotion eligibility requires at least 20 sessions or 30 proposed signals and
+  at least one hypothetical fill. Safety violations block promotion.
+- Stages advance only one step at a time: `shadow`, `small_notional`,
+  `partial_allocation`, then `full`.
+- Small-notional deployment caps each approved order at $1,000. Partial deployment
+  deterministically authorizes 50% of selected allocations. Full uses approved
+  portfolio limits.
+- `scripts/promote_portfolio_allocator.py` performs an explicit, atomic config and
+  state update after gates pass. A supervisor-task restart is still required.
+
+## Calibration lifecycle scope retained for Phase 8
 
 1. Add a weekly or monthly rolling-date calibration runner that operates after
    the market closes and uses only completed trading days.

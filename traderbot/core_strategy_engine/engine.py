@@ -25,6 +25,9 @@ from traderbot.core_strategy_engine.entry_models.candidate import (
     structural_stop_price,
 )
 from traderbot.core_strategy_engine.entry_models.pullback import evaluate_pullback
+from traderbot.core_strategy_engine.entry_models.signal_families import (
+    evaluate_signal_families,
+)
 from traderbot.core_strategy_engine.lifecycle.coordinator import select_action_intent
 from traderbot.core_strategy_engine.position_health import (
     evaluate_add_eligibility,
@@ -378,7 +381,10 @@ def dynamic_entry_quantity(config, plan, equity=None):
     risk_per_share = limit_price - stop_price
     has_structural_stop = 0 < stop_price < limit_price
     if equity not in (None, "", 0) and has_structural_stop:
-        risk_percent = float(config.get("risk_per_trade_percent", 0.5))
+        risk_percent = float(
+            plan.get("risk_budget_percent")
+            or config.get("risk_per_trade_percent", 0.5)
+        )
         risk_budget = float(equity) * risk_percent / 100
         return max(0, math.floor(risk_budget / risk_per_share))
     notional = dynamic_entry_notional(config, plan)
@@ -913,6 +919,8 @@ def dynamic_entry_plan(
     ledger_cap = features["ledger_cap"]
     pullback_candidate = evaluate_pullback(features, config)
     breakout_candidate = evaluate_breakout(features, config)
+    family_candidates = evaluate_signal_families(features, config)
+    entry_candidates = [pullback_candidate, breakout_candidate, *family_candidates]
     pullback_zone = pullback_candidate["pullback_zone"]
     pullback_touch_trigger = pullback_candidate["touch_trigger"]
     pullback_reclaim_trigger = pullback_candidate["reclaim_trigger"]
@@ -930,11 +938,10 @@ def dynamic_entry_plan(
     sector_ok = features["sector_ok"]
     market_filter_ignored = False
 
-    arbitration = select_entry_candidate(
-        [pullback_candidate, breakout_candidate]
-    )
+    arbitration = select_entry_candidate(entry_candidates)
     selected_candidate = arbitration["selected"]
-    classified_candidate = arbitration["classified"] or pullback_candidate
+    territorial_candidate = arbitration["classified"] or pullback_candidate
+    classified_candidate = selected_candidate or territorial_candidate
 
     mode = selected_candidate["legacy_mode"] if selected_candidate else None
     limit_price = selected_candidate["limit_price"] if selected_candidate else None
@@ -958,7 +965,7 @@ def dynamic_entry_plan(
         "model_version": (
             selected_candidate.get("model_version") if selected_candidate else None
         ),
-        "classified_model_id": classified_candidate.get("model_id"),
+        "classified_model_id": territorial_candidate.get("model_id"),
         "entry_arbitration_reason": arbitration["reason"],
         "setup_score": classified_candidate.get("setup_score"),
         "soft_check_score": classified_candidate.get("soft_check_score"),
@@ -994,6 +1001,9 @@ def dynamic_entry_plan(
         "risk_per_share": selected_risk,
         "expected_reward_risk": selected_reward_risk,
         "minimum_entry_reward_risk": minimum_rr,
+        "risk_budget_percent": classified_candidate.get("risk_budget_percent"),
+        "signal_family": classified_candidate.get("signal_family"),
+        "fallback_only": classified_candidate.get("fallback_only", False),
         "ema9": bar["ema9"],
         "ema21": bar["ema21"],
         "ema50": bar["ema50"],
@@ -1006,7 +1016,7 @@ def dynamic_entry_plan(
         "soft_blockers": classified_candidate.get("soft_blockers", []),
         "decision_reasons": classified_candidate.get("decision_reasons", []),
         "qualification_policy": classified_candidate.get("qualification_policy"),
-        "entry_candidates": [pullback_candidate, breakout_candidate],
+        "entry_candidates": entry_candidates,
     }
 
 

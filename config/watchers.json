@@ -9,7 +9,13 @@
   },
   "portfolio_allocator": {
     "enabled": true,
-    "shadow_mode": true,
+    "promotion_stage": "full",
+    "shadow_slippage_bps": 5,
+    "minimum_shadow_sessions": 20,
+    "minimum_shadow_signals": 30,
+    "small_notional_dollars": 1000,
+    "partial_allocation_fraction": 0.5,
+    "minimum_stage_live_entries": 5,
     "maximum_simultaneous_positions": 12,
     "maximum_aggregate_open_risk_percent": 6,
     "maximum_sector_exposure_percent": 30,
@@ -561,6 +567,37 @@
         "enabled": true,
         "minimum_reward_risk": 1.5,
         "minimum_rvol": 1.15
+      },
+      "relative_strength": {
+        "enabled": false,
+        "risk_budget_percent": 0.25,
+        "minimum_relative_return": 0.02
+      },
+      "low_volatility_trend": {
+        "enabled": false,
+        "risk_budget_percent": 0.2,
+        "maximum_atr_percent": 2.0
+      },
+      "post_earnings_drift": {
+        "enabled": false,
+        "risk_budget_percent": 0.2,
+        "minimum_surprise_percent": 2.0,
+        "maximum_days_after_earnings": 10
+      },
+      "trend_mean_reversion": {
+        "enabled": false,
+        "risk_budget_percent": 0.2,
+        "maximum_pullback_atr": 1.5
+      },
+      "defensive_etf": {
+        "enabled": false,
+        "risk_budget_percent": 0.15,
+        "symbols": [
+          "SPY",
+          "QQQ",
+          "VTI",
+          "USMV"
+        ]
       }
     },
     "entry_quantity": 1,

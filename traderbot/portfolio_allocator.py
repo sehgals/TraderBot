@@ -120,7 +120,7 @@ def allocate_candidates(candidates, portfolio, settings=None):
 
     ranked.sort(
         key=lambda item: (
-            -item["rank_value"], -item["score"],
+            bool(item.get("fallback_only")), -item["rank_value"], -item["score"],
             -_number(item.get("expected_reward_risk")), item["symbol"],
         )
     )
@@ -129,6 +129,8 @@ def allocate_candidates(candidates, portfolio, settings=None):
         reasons = []
         notional = item["notional"]
         risk = item["risk_dollars"]
+        if item.get("fallback_only") and selected:
+            reasons.append("fallback_not_needed")
         if positions + len(selected) >= int(controls["maximum_simultaneous_positions"]):
             reasons.append("maximum_simultaneous_positions")
         if daily_entries + len(selected) >= int(controls["maximum_daily_entries"]):

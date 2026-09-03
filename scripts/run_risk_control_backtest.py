@@ -16,7 +16,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from traderbot.backtester.reentry_backtest import load_strategy_configs
+from traderbot.backtester.reentry_backtest import (
+    isolate_entry_model_configs,
+    load_strategy_configs,
+)
 from traderbot.backtester.baseline import (
     attribution_by_dimensions,
     dataset_manifest,
@@ -242,7 +245,10 @@ def dynamic_qty(config, plan, equity=None):
     risk_per_share = limit_price - stop_price
     has_structural_stop = 0 < stop_price < limit_price
     if equity not in (None, "", 0) and has_structural_stop:
-        risk_budget = float(equity) * float(config.get("risk_per_trade_percent", 0.5)) / 100
+        risk_budget = float(equity) * float(
+            plan.get("risk_budget_percent")
+            or config.get("risk_per_trade_percent", 0.5)
+        ) / 100
         return max(0, math.floor(risk_budget / risk_per_share))
     notional_key = (
         "dynamic_market_filter_ignored_notional"
@@ -1361,6 +1367,7 @@ def main():
     parser.add_argument("--end", default=iso_utc(END))
     parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
     parser.add_argument("--apply-regime-exposure-bands", action="store_true")
+    parser.add_argument("--only-entry-model")
     args = parser.parse_args()
     start = parse_backtest_time(args.start)
     end = parse_backtest_time(args.end)
@@ -1374,6 +1381,8 @@ def main():
         "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
     }
     configs = load_strategy_configs("config/watchers.json")
+    if args.only_entry_model:
+        configs = isolate_entry_model_configs(configs, args.only_entry_model)
     base_index_config = {
         "risk_profile": "index_etf",
         "entry_quantity": 100,
@@ -1480,6 +1489,7 @@ def main():
         "timeframe": TIMEFRAME,
         "account_equity_assumption": ACCOUNT_EQUITY,
         "regime_exposure_bands_applied": args.apply_regime_exposure_bands,
+        "isolated_entry_model": args.only_entry_model,
         "configuration_snapshot": {
             symbol: configs[symbol] for symbol in sorted(bars_by_symbol)
         },

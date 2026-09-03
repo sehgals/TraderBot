@@ -874,6 +874,9 @@ def build_report(project_root, watchers_path, report_date, client=None):
 
     activity = watcher_activity(project_root, watchers_path, report_date)
     utilization = portfolio_utilization(account_summary, positions, supervisor_config)
+    allocation_state = load_json(
+        project_root / "runtime" / "state" / "portfolio_allocation_state.json", {}
+    )
     if client:
         activity["bot_buy_orders_submitted"] = enrich_bot_orders_with_broker_status(
             client,
@@ -885,6 +888,12 @@ def build_report(project_root, watchers_path, report_date, client=None):
         "account": account_summary,
         "account_error": account_error,
         "portfolio_utilization": utilization,
+        "shadow_deployment": {
+            "promotion_stage": (
+                supervisor_config.get("portfolio_allocator") or {}
+            ).get("promotion_stage", "disabled"),
+            **(allocation_state.get("shadow_ledger") or {}),
+        },
         "current_positions": positions,
         "managed_stocks_not_held": flat_managed_stocks,
         "stocks_bought": bought,
@@ -1531,6 +1540,27 @@ def render_markdown(report):
             "",
             "Unused risk budget is n/a because reporting.max_portfolio_risk_percent is not configured.",
         ])
+
+    shadow = report.get("shadow_deployment") or {}
+    lines.extend(["", "## Shadow Deployment"])
+    lines.extend(markdown_table(
+        [
+            "Stage", "Sessions", "Signals", "Open Hypothetical",
+            "Hypothetical Fills", "Rejected Alternatives", "Incumbent Entries",
+            "Estimated Slippage", "Hypothetical Unrealized P&L",
+        ],
+        [[
+            shadow.get("promotion_stage", "disabled"),
+            shadow.get("session_count", 0), shadow.get("signals", 0),
+            shadow.get("open_orders", 0), shadow.get("filled_orders", 0),
+            shadow.get("rejected_alternatives", 0),
+            shadow.get("incumbent_entries", 0), money(shadow.get("estimated_slippage", 0)),
+            money(shadow.get("hypothetical_unrealized_pnl", 0)),
+        ]],
+        ["left", "right", "right", "right", "right", "right", "right", "right", "right"],
+        pad_columns=True,
+        minimum_width=6,
+    ))
 
     lines.extend(
         [
