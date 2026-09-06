@@ -170,6 +170,59 @@ def test_context_freshness_keeps_final_hourly_bar_available_after_close():
     )
 
 
+def test_closed_session_health_survives_weekend_and_holiday():
+    for day in (5, 6, 7):
+        now = datetime.datetime(2026, 9, day, 22, tzinfo=datetime.timezone.utc)
+        result = evaluate_position_health(
+            position(), episode(),
+            context(as_of="2026-09-04T19:00:00Z", session_close="2026-09-04T16:00:00-04:00"),
+            protection(), now=now,
+        )
+        assert result["data_fresh"]
+        assert result["state"] == "Healthy"
+
+
+def test_closed_session_requires_final_interval_and_handles_early_close():
+    now = datetime.datetime(2026, 11, 28, 18, tzinfo=datetime.timezone.utc)
+    close = "2026-11-27T13:00:00-05:00"
+    assert context_is_fresh("2026-11-27T17:00:00Z", 60, 2, now, close)
+    assert not context_is_fresh("2026-11-27T16:00:00Z", 60, 2, now, close)
+    assert not context_is_fresh("2026-11-26T17:00:00Z", 60, 2, now, close)
+
+
+def test_session_calendar_keeps_friday_close_until_tuesday_open():
+    from traderbot.core_strategy_engine.engine import position_health_session_close
+
+    class Client:
+        def calendar(self, start, end):
+            return [
+                {"date": "2026-09-04", "open": "09:30", "close": "16:00"},
+                {"date": "2026-09-08", "open": "09:30", "close": "16:00"},
+            ]
+
+    for stamp in ("2026-09-06T18:00:00Z", "2026-09-07T18:00:00Z", "2026-09-08T13:00:00Z"):
+        now = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        assert position_health_session_close(Client(), now) == "2026-09-04T16:00:00-04:00"
+    now = datetime.datetime(2026, 9, 8, 14, tzinfo=datetime.timezone.utc)
+    assert position_health_session_close(Client(), now) is None
+
+
+def test_closed_market_bar_request_excludes_bar_starting_at_close():
+    from unittest.mock import Mock, patch
+    from traderbot.core_strategy_engine.engine import position_health_market_context
+
+    client = Mock()
+    client.stock_bars.return_value = []
+    with patch(
+        "traderbot.core_strategy_engine.engine.position_health_session_close",
+        return_value="2026-09-04T16:00:00-04:00",
+    ):
+        position_health_market_context(client, {"symbol": "ORCL"})
+    for call in client.stock_bars.call_args_list:
+        end = datetime.datetime.fromisoformat(call.args[2].replace("Z", "+00:00"))
+        assert end == datetime.datetime(2026, 9, 4, 19, 59, 59, tzinfo=datetime.timezone.utc)
+
+
 def test_context_freshness_does_not_extend_an_older_intraday_bar_after_close():
     after_close = datetime.datetime(2026, 8, 13, 22, 18, tzinfo=datetime.timezone.utc)
 

@@ -82,7 +82,7 @@ def parse_time(value):
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def context_is_fresh(as_of, timeframe_minutes, max_age_bars, now=None):
+def context_is_fresh(as_of, timeframe_minutes, max_age_bars, now=None, session_close=None):
     timestamp = parse_time(as_of)
     if not timestamp:
         return False
@@ -90,6 +90,13 @@ def context_is_fresh(as_of, timeframe_minutes, max_age_bars, now=None):
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=datetime.timezone.utc)
     checked_at = checked_at.astimezone(datetime.timezone.utc)
+    if timestamp > checked_at:
+        return False
+    if session_close:
+        close = parse_time(session_close)
+        # During a market closure, require the final interval of the latest
+        # completed session, rather than counting overnight/weekend hours.
+        return close - datetime.timedelta(minutes=timeframe_minutes) <= timestamp < close
     allowance = datetime.timedelta(minutes=timeframe_minutes * max_age_bars + 5)
     if checked_at - timestamp <= allowance:
         return True
@@ -143,6 +150,7 @@ def evaluate_position_health(
         timeframe_minutes,
         int(settings["max_data_age_bars"]),
         now=now,
+        session_close=context.get("session_close"),
     )
     required_bar_fields = ("c", "ema9", "ema21", "ema50", "ema21_slope")
     data_complete = bool(

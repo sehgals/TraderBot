@@ -1826,6 +1826,30 @@ def ensure_position_episode(config, state, position, entry_order=None):
     return episode
 
 
+def position_health_session_close(client, now):
+    """Return the latest session close only while the regular market is closed."""
+    if not callable(getattr(client, "calendar", None)):
+        return None
+    local_now = now.astimezone(ZoneInfo("America/New_York"))
+    sessions = client.calendar(
+        (local_now.date() - datetime.timedelta(days=14)).isoformat(),
+        local_now.date().isoformat(),
+    )
+    latest_close = None
+    for session in sorted(sessions, key=lambda item: item["date"]):
+        opened = datetime.datetime.fromisoformat(
+            f'{session["date"]}T{session["open"]}'
+        ).replace(tzinfo=local_now.tzinfo)
+        closed = datetime.datetime.fromisoformat(
+            f'{session["date"]}T{session["close"]}'
+        ).replace(tzinfo=local_now.tzinfo)
+        if opened <= local_now < closed:
+            return None
+        if closed <= local_now:
+            latest_close = closed
+    return latest_close.isoformat() if latest_close else None
+
+
 def position_health_market_context(client, config):
     settings = position_health_config(config)
     symbol = config["symbol"]
@@ -1835,8 +1859,13 @@ def position_health_market_context(client, config):
         or MARKET_SYMBOL
     ).upper()
     now = datetime.datetime.now(datetime.timezone.utc)
+    session_close = position_health_session_close(client, now)
     start = iso_utc(now - datetime.timedelta(days=int(settings["lookback_days"])))
-    end = iso_utc(now)
+    # The broker's end bound is inclusive; omit the bar starting at the close.
+    end = (
+        iso_utc(parse_alpaca_time(session_close) - datetime.timedelta(seconds=1))
+        if session_close else iso_utc(now)
+    )
     timeframe = settings["timeframe"]
     bars = calculate_indicators(
         completed_market_bars(
@@ -1873,6 +1902,7 @@ def position_health_market_context(client, config):
     as_of = latest["t"].isoformat()
     return {
         "as_of": as_of,
+        "session_close": session_close,
         "bar_id": f"{symbol}:{timeframe}:{as_of}",
         "timeframe_minutes": timeframe_minutes(timeframe),
         "latest_bar": latest,
