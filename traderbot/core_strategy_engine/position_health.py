@@ -361,3 +361,25 @@ __all__ = [
     "reward_risk_score",
     "trend_health",
 ]
+
+
+def assessment_bar_status(as_of, now, session_close=None, grace_minutes=5):
+    """Dashboard freshness for start-stamped, clock-aligned hourly bars."""
+    bar = parse_time(as_of)
+    checked = parse_time(now)
+    if not bar:
+        return "Assessment missing", None
+    end = bar + datetime.timedelta(hours=1)
+    if session_close:
+        close = parse_time(session_close)
+        if close - datetime.timedelta(hours=1) <= bar < close:
+            return "Latest completed bar", min(end, close).isoformat()
+        return "Assessment overdue", end.isoformat()
+    expected = checked.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
+    if bar > expected:
+        return "Assessment unavailable", end.isoformat()
+    if bar == expected:
+        return "Latest completed bar", end.isoformat()
+    if bar == expected - datetime.timedelta(hours=1) and checked.minute < grace_minutes:
+        return "Waiting for newer bar", end.isoformat()
+    return "Assessment overdue", end.isoformat()

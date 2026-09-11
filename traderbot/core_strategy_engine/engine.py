@@ -1052,6 +1052,7 @@ def reset_managed_position_state(state):
         "position_episode",
         "position_health",
         "position_health_last_evaluated_at",
+        "position_health_last_checked_at",
         "position_health_confirmation",
     ):
         state.pop(key, None)
@@ -1915,11 +1916,11 @@ def position_health_market_context(client, config):
 
 
 def health_refresh_due(state, settings, now=None):
-    previous = parse_alpaca_time(state.get("position_health_last_evaluated_at"))
+    previous = parse_alpaca_time(state.get("position_health_last_checked_at") or state.get("position_health_last_evaluated_at"))
     if previous is None or not state.get("position_health"):
         return True
     checked_at = now or datetime.datetime.now(datetime.timezone.utc)
-    return (checked_at - previous).total_seconds() >= int(settings["refresh_seconds"])
+    return (checked_at - previous).total_seconds() >= min(int(settings["refresh_seconds"]), 180)
 
 
 def refresh_position_health(client, config, state, position, force=False):
@@ -1968,7 +1969,10 @@ def refresh_position_health(client, config, state, position, force=False):
             | {f"health_context_error:{type(exc).__name__}"}
         )
 
+    state["position_health_last_checked_at"] = iso_utc(now)
     previous = state.get("position_health") or {}
+    if not force and assessment == previous:
+        return previous
     confirmation = state.get("position_health_confirmation") or {}
     if assessment.get("bar_id") and assessment.get("bar_id") != previous.get("bar_id"):
         action = assessment.get("recommended_action")

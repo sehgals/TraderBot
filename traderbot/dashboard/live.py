@@ -212,7 +212,7 @@ class LiveStore:
                 position.update(position_health_source=source, position_health_evaluated_at=evaluated.isoformat())
 
     def snapshot(self):
-        from traderbot.core_strategy_engine.position_health import context_is_fresh
+        from traderbot.core_strategy_engine.position_health import assessment_bar_status
         with self.lock:
             data = copy.deepcopy(self.data)
         now = self.clock()
@@ -221,9 +221,16 @@ class LiveStore:
             status["stale"] = bool(status["error"] or not as_of or (now - as_of).total_seconds() > 60)
         for p in data["positions"]:
             bar = timestamp(p.get("position_health_as_of"))
-            p["position_health_current"] = bool(p.get("position_health_data_complete") and p.get("position_health_data_fresh") and
-                bar and context_is_fresh(bar, 60, 2, now=now,
-                    session_close=data["session_close"] if not data["connection"]["calendar"]["stale"] else None))
+            status, bar_end = assessment_bar_status(bar, now,
+                session_close=data["session_close"] if not data["connection"]["calendar"]["stale"] else None)
+            if bar and not p.get("position_health_data_complete"):
+                status = "Assessment incomplete"
+            elif bar and not p.get("position_health_data_fresh"):
+                status = "Assessment unavailable"
+            p["position_health_freshness"] = status
+            p["position_health_bar_end"] = bar_end
+            p["position_health_current"] = bool(p.get("position_health_data_complete") and
+                p.get("position_health_data_fresh") and status == "Latest completed bar")
         data["generated_at"] = now.isoformat()
         data["operations"] = self.operations.snapshot(p["symbol"] for p in data["positions"])
         return data
