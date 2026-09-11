@@ -972,6 +972,8 @@ def dynamic_entry_plan(
         "factor_scores": classified_candidate.get("factor_scores"),
         "factor_weights": classified_candidate.get("factor_weights"),
         "factor_contributions": classified_candidate.get("factor_contributions"),
+        "trend_assessment": classified_candidate.get("trend_assessment"),
+        "breakout_assessment": classified_candidate.get("breakout_assessment"),
         "overall_check_score": classified_candidate.get("overall_check_score"),
         "minimum_setup_score": classified_candidate.get("minimum_setup_score"),
         "setup_score_meets_threshold": classified_candidate.get(

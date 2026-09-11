@@ -43,6 +43,18 @@ def regime_bars(stock_bars, favorable):
 
 
 class EntryFeatureTests(unittest.TestCase):
+    def test_trend_uses_actual_ema_change_and_unfloored_atr(self):
+        bars = indicator_bars()
+        bars[-1]['atr14'] = 0.005
+        features = build_entry_features('TEST', bars, regime_bars(bars, True))
+        self.assertAlmostEqual(features['ema21_change_5bars'], 0.075)
+        self.assertEqual(features['trend_atr14'], 0.005)
+        candidate = evaluate_breakout(features)
+        slope = candidate['trend_assessment']['components'][-1]
+        self.assertAlmostEqual(slope['observed'], 15)
+        self.assertEqual(slope['unit'], 'atr')
+        self.assertTrue(slope['passed'])
+
     def test_requires_enough_completed_indicator_bars(self):
         bars = indicator_bars()
 
@@ -118,7 +130,7 @@ class EntryFeatureTests(unittest.TestCase):
 
         self.assertEqual(candidate["status"], "active_signal")
         self.assertEqual(candidate["model_id"], "breakout_continuation")
-        self.assertEqual(candidate["setup_score"], 100)
+        self.assertEqual(candidate["setup_score"], 95)
         self.assertNotIn("touched_pullback", candidate["checks"])
         self.assertNotIn("no_chase", candidate["checks"])
 

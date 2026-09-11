@@ -1,6 +1,9 @@
 HARD_ENTRY_CHECKS = frozenset(
     {
         "above_exit",
+        "breakout_confirmed",
+        "breakout_atr_available",
+        "breakout_chase_ok",
         "corporate_actions_data_available",
         "corporate_actions_ok",
         "earnings_data_available",

@@ -29,6 +29,22 @@ class OperationsTests(unittest.TestCase):
         return {'timestamp': (NOW-dt.timedelta(minutes=minutes)).isoformat(), 'failures': 0,
                 'next_run_seconds': 900, 'result': {'status': 'market_closed_sleeping'}, **overrides}
 
+    def test_candidate_trend_breakdown_and_old_assessments(self):
+        self.assertIsNone(self.ops.collect(set())['candidates'][0]['trend_assessment'])
+        state = json.loads(self.state.read_text())
+        assessment = {'points': 12, 'maximum_points': 20,
+                      'as_of': '2026-09-04T19:00:00Z',
+                      'components': [{'label': 'Price above VWAP', 'observed': 102,
+                                      'threshold': 100, 'passed': True, 'points': 4}]}
+        state['dynamic_entry_plan']['trend_assessment'] = assessment
+        breakout = {'distance_atr': .75, 'price_action_points': 25, 'overextension_points': 7.5}
+        state['dynamic_entry_plan']['breakout_assessment'] = breakout
+        self.state.write_text(json.dumps(state))
+        row = self.ops.collect(set())['candidates'][0]
+        self.assertEqual(row['trend_assessment'], assessment)
+        self.assertEqual(row['breakout_assessment'], breakout)
+        self.assertEqual(row['score'], 85)
+
     def write(self, records):
         self.log.write_text(''.join(json.dumps(r)+'\n' for r in records))
 

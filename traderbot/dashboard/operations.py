@@ -154,7 +154,8 @@ class Operations:
             plan = state.get("dynamic_entry_plan")
             if enabled and symbol not in held and isinstance(plan, dict) and plan:
                 blockers = plan.get("blockers")
-                candidates.append({"symbol": symbol, "score": number(plan.get("setup_score")),
+                candidates.append({"breakout_assessment": plan.get("breakout_assessment") if isinstance(plan.get("breakout_assessment"), dict) else None,"symbol": symbol, "score": number(plan.get("setup_score")),
+                    "trend_assessment": plan.get("trend_assessment") if isinstance(plan.get("trend_assessment"), dict) else None,
                     "status": label(plan.get("status")), "model": label(plan.get("model_id") or plan.get("classified_model_id")),
                     "as_of": parsed(plan.get("last_bar_time")).isoformat() if parsed(plan.get("last_bar_time")) else None,
                     "source_status": "Retained / source unavailable" if state_issue or config_issue else "Recorded assessment",

@@ -8,6 +8,24 @@ const stamp = v => v ? new Date(v).toLocaleString('en-US', {month:'short',day:'n
 const human = v => String(v || 'Unknown').replaceAll('_',' ');
 function pill(text, tone='neutral') { return h('span',{className:`pill ${tone}`},text); }
 function table(headers, rows, empty) {return h('div',{className:'table-wrap',tabIndex:0,role:'region','aria-label':`${headers.join(', ')} table; scroll horizontally for more columns`},h('table',null,h('thead',null,h('tr',null,...headers.map(x=>h('th',{key:x,scope:'col'},x)))),h('tbody',null,...(rows.length ? rows.map((row,i)=>h('tr',{key:i},...row.map((cell,j)=>h('td',{key:j},cell)))) : [h('tr',{key:'empty'},h('td',{colSpan:headers.length,className:'empty'},empty))]))));}
+function TrendDetails({assessment:a}) {
+ if (!a || !Array.isArray(a.components)) return h('small',null,'Trend breakdown not recorded');
+ const value=(v,unit)=>v==null?'Unavailable':unit==='atr'?`${Number(v).toFixed(4)} ATR`:unit==='ratio'?`${(v*100).toFixed(4)}%`:Number(v).toFixed(4);
+ return h('details',null,h('summary',null,`Trend: ${a.points}/${a.maximum_points}`),
+  h('small',null,`Assessed ${stamp(a.as_of)}`),
+  table(['Condition','Observed','Required','Result','Points'],a.components.map(r=>[
+   r.label,value(r.observed,r.unit),`${r.operator} ${value(r.threshold,r.unit)}`,
+   r.available===false?'Unavailable':r.passed?'Pass':'Fail',`${r.points}/${r.maximum_points}`]),'No trend components recorded'));
+}
+function BreakoutDetails({assessment:a}) {
+ if (!a) return null;
+ const n=v=>v==null?'Unavailable':Number(v).toFixed(4);
+ return h('details',null,h('summary',null,'Breakout score details'),
+ h('p',null,`Resistance ${n(a.resistance)} | Close ${n(a.close)} | Previous-bar ATR ${n(a.atr14)}`),
+ h('p',null,`Distance ${n(a.distance_atr)} ATR | Full credit at ${a.full_score_atr} ATR | Chase limit ${a.maximum_chase_atr} ATR`),
+ h('p',null,`Price action ${a.price_action_points}/${a.price_action_maximum} | Overextension ${a.overextension_points}/${a.overextension_maximum}`),
+ h('p',null,(a.blockers||[]).map(human).join(', ')||'Breakout gates passed'),h('small',null,`Assessed ${stamp(a.as_of)}`));
+}
 function OperationsView({data}) {
  const [symbol,setSymbol]=React.useState(''),[attention,setAttention]=React.useState(false);
  const [showAll,setShowAll]=React.useState(false);
@@ -22,7 +40,7 @@ function OperationsView({data}) {
    table(['Symbol','Activity status','Last activity','Next expected'],data.watchers.filter(matches).filter(w=>!attention||!['Within schedule','Disabled'].includes(w.status)).slice(0,limit).map(w=>[w.symbol,pill(w.status,w.status==='Within schedule'?'green':w.status==='Disabled'?'neutral':'amber'),stamp(w.last_activity),stamp(w.next_expected)]),'No watchers match, or watcher configuration is unavailable.'),
    data.issues.length>0&&h('details',null,h('summary',null,`${data.issues.length} source issues`),...data.issues.map((issue,i)=>h('p',{key:i},`${issue.source}: ${issue.message}`)))),
   h('section',{className:'panel'},h('h2',null,'Entry candidates'),h('p',{className:'muted'},'Recorded setup assessments for configured candidates not currently held. Scores do not imply an order will be placed.'),
-   table(['Symbol','Score','Model','Status','Assessment time','Source'],data.candidates.filter(matches).slice(0,limit).map(c=>[c.symbol,c.score??'—',human(c.model),h('div',null,human(c.status),h('details',null,h('summary',null,'Blockers'),h('p',null,c.blockers.map(human).join(', ')||'No recorded blockers'))),stamp(c.as_of),c.source_status]),'No candidate assessments match this filter.')),
+   table(['Symbol','Score','Model','Status','Assessment time','Source'],data.candidates.filter(matches).slice(0,limit).map(c=>[c.symbol,h('div',null,c.score??'Unavailable',h(TrendDetails,{assessment:c.trend_assessment}),h(BreakoutDetails,{assessment:c.breakout_assessment})),human(c.model),h('div',null,human(c.status),h('details',null,h('summary',null,'Blockers'),h('p',null,c.blockers.map(human).join(', ')||'No recorded blockers'))),stamp(c.as_of),c.source_status]),'No candidate assessments match this filter.')),
   h('section',{className:'panel'},h('h2',null,'Alert history'),table(['Time','Symbol','Source','Event','Detail'],data.alerts.filter(matches).slice(0,limit).map(a=>[stamp(a.timestamp),a.symbol,a.source,pill(human(a.kind),'amber'),human(a.detail)]),'No alerts in the recent log window. Missing sources are listed above.')),
   h('section',{className:'panel'},h('h2',null,'Recent watcher activity'),table(['Time','Symbol','Event','Failures','Next run'],data.activity.filter(matches).slice(0,limit).map(a=>[stamp(a.timestamp),a.symbol,human(a.status),a.failures??'—',a.next_run_seconds==null?'—':`${a.next_run_seconds}s`]),'No activity in the recent log window.'))
  );
