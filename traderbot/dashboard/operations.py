@@ -153,8 +153,19 @@ class Operations:
                 issues.append({"source": symbol + " state", "message": state_issue})
             plan = state.get("dynamic_entry_plan")
             if enabled and symbol not in held and isinstance(plan, dict) and plan:
-                blockers = plan.get("blockers")
-                candidates.append({"breakout_assessment": plan.get("breakout_assessment") if isinstance(plan.get("breakout_assessment"), dict) else None,"symbol": symbol, "score": number(plan.get("setup_score")),
+                blockers = plan.get("hard_blockers") or plan.get("decision_reasons") or []
+                threshold = number(plan.get("minimum_setup_score")) or 80
+                score = number(plan.get("setup_score"))
+                eligibility = state.get("flat_entry_eligibility") or {}
+                decision_label = "Score below threshold" if score is None or score < threshold else "Score qualified - blocked" if blockers or eligibility.get("eligible") is False else "Score qualified - awaiting execution"
+                metrics = plan.get("entry_filter_metrics") or {}
+                diagnostics = {
+                    "metrics": metrics, "reentry_policy": plan.get("reentry_policy"),
+                    "ledger_cap": number(plan.get("ledger_cap")),
+                    "eligibility_reasons": eligibility.get("reasons", []),
+                    "submission_validation": state.get("entry_submission_validation") or plan.get("submission_validation"),
+                }
+                candidates.append({"decision_label": decision_label, "diagnostics": diagnostics, "minimum_score": threshold, "breakout_assessment": plan.get("breakout_assessment") if isinstance(plan.get("breakout_assessment"), dict) else None,"symbol": symbol, "score": number(plan.get("setup_score")),
                     "trend_assessment": plan.get("trend_assessment") if isinstance(plan.get("trend_assessment"), dict) else None,
                     "status": label(plan.get("status")), "model": label(plan.get("model_id") or plan.get("classified_model_id")),
                     "as_of": parsed(plan.get("last_bar_time")).isoformat() if parsed(plan.get("last_bar_time")) else None,

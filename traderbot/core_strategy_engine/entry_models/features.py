@@ -1,4 +1,5 @@
 import math
+from traderbot.core_strategy_engine.entry_models.entry_safety import reentry_policy, EASTERN
 
 from traderbot.core_strategy_engine.entry_models.filters import evaluate_entry_filters
 
@@ -55,7 +56,8 @@ def build_entry_features(
     recent_high = max(item["h"] for item in prior_20_bars)
     recent_low = min(item["l"] for item in prior_20_bars)
     strong_volume = bar["volume_ratio"] >= 1.5
-    ledger_ignored = bool(ignore_ledger or not exit_trade)
+    policy = reentry_policy(exit_trade, bar["t"], (filter_context or {}).get("sessions"))
+    ledger_ignored = bool(ignore_ledger or not exit_trade or policy["cap_expired"])
     ledger_cap = (
         math.inf
         if ledger_ignored
@@ -74,14 +76,9 @@ def build_entry_features(
     same_day_exit = bool(
         exit_trade
         and exit_trade.get("exit_time")
-        and bar["t"].date() == exit_trade["exit_time"].date()
+        and bar["t"].astimezone(EASTERN).date() == exit_trade["exit_time"].astimezone(EASTERN).date()
     )
-    above_exit = (
-        True
-        if ledger_ignored
-        else exit_trade.get("realized_pl", 0) < 0
-        or bar["c"] >= exit_trade["exit_price"]
-    )
+    above_exit = True  # Current setup geometry replaces the old exit-price floor.
     no_same_day_loss_reentry = not (
         exit_trade and exit_trade.get("realized_pl", 0) < 0 and same_day_exit
     )
@@ -109,6 +106,7 @@ def build_entry_features(
         "sector_ok": sector_ok,
         "regime_ok": regime_ok,
         "ledger_ignored": ledger_ignored,
+        "reentry_policy": policy,
         "ledger_cap": ledger_cap,
         "same_day_exit": same_day_exit,
         "above_exit": above_exit,

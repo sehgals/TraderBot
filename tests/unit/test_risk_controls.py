@@ -887,6 +887,7 @@ class RiskControlTests(unittest.TestCase):
                 }
             ],
         )
+        client.latest_quote = lambda symbol: {"bid_price":110,"ask_price":110.1,"timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat()}
         state = {
             "current_entry_order_id": "entry-1",
             "reentry_order_id": "entry-1",
@@ -898,7 +899,8 @@ class RiskControlTests(unittest.TestCase):
             "model_id": "breakout_continuation",
             "model_version": 1,
             "mode": "dynamic_breakout_continuation",
-            "last_bar_time": "2026-08-27T15:15:00Z",
+            "last_bar_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "target_price": 130,
             "limit_price": 110,
             "stop_price": 100,
         }

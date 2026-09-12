@@ -106,10 +106,10 @@ def test_supervisor_shadow_allocation_is_once_per_completed_bar(tmp_path):
     }
     config = {"portfolio_allocator": {"enabled": True, "shadow_mode": True}}
     first, executions = supervisor.run_portfolio_allocator(
-        BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {}
+        BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {"timestamp":"2026-09-02T14:35:00+00:00"}
     )
     second, _ = supervisor.run_portfolio_allocator(
-        BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {}
+        BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {"timestamp":"2026-09-02T14:35:00+00:00"}
     )
     assert [item["symbol"] for item in first["selected"]] == ["AAA"]
     assert executions == []
@@ -128,7 +128,7 @@ def test_supervisor_live_allocation_issues_bar_bound_authorization(tmp_path):
     }
     with patch.object(supervisor, "run_watcher", return_value=submitted) as runner:
         decision, executions = supervisor.run_portfolio_allocator(
-            BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {}
+            BrokerSnapshot(), [allocation_record()], config, [watcher], tmp_path, {"timestamp":"2026-09-02T14:35:00+00:00"}
         )
 
     overrides = runner.call_args.kwargs["config_overrides"]

@@ -15,11 +15,12 @@ def test_latest_quote_normalizes_alpaca_fields():
 
     quote = client.latest_quote("IBM")
 
-    assert quote == {
+    assert {k:quote[k] for k in ("bid_price", "ask_price", "timestamp")} == {
         "bid_price": 100.0,
         "ask_price": 100.2,
         "timestamp": "2026-08-20T15:00:00Z",
     }
+    assert quote["feed"] == "iex"
     assert requested == [("GET", "/stocks/IBM/quotes/latest?feed=iex")]
 
 

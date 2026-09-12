@@ -1,4 +1,6 @@
 import datetime
+import math
+from traderbot.core_strategy_engine.entry_models.entry_safety import quote_diagnostics
 
 
 PROFILE_LIQUIDITY_DEFAULTS = {
@@ -81,12 +83,14 @@ def evaluate_entry_filters(features, config=None, context=None):
     if liquidity.get("enabled", False):
         minimum = float(
             liquidity.get(
-                "minimum_average_dollar_volume",
-                PROFILE_LIQUIDITY_DEFAULTS.get(config.get("risk_profile"), 250_000),
+                "minimum_intraday_dollar_volume", liquidity.get("minimum_average_dollar_volume",
+                PROFILE_LIQUIDITY_DEFAULTS.get(config.get("risk_profile"), 250_000)),
             )
         )
         sample_size = int(bar.get("dollar_volume_sample_size") or 0)
         average = bar.get("matched_average_dollar_volume")
+        if not isinstance(average, (float, int)) or not math.isfinite(average) or average < 0:
+            average = None
         enough_samples = sample_size >= int(liquidity.get("minimum_sample_size", 5))
         checks["liquidity_data_available"] = average is not None and enough_samples
         checks["liquidity_ok"] = bool(
@@ -95,38 +99,34 @@ def evaluate_entry_filters(features, config=None, context=None):
         metrics.update(
             {
                 "average_dollar_volume": average,
+                "matched_intraday_average_dollar_volume": average,
+                "liquidity_feed": context.get("feed", "unknown"),
+                "liquidity_coverage": "single_exchange" if context.get("feed") == "iex" else "feed_specific",
+                "liquidity_timeframe": context.get("timeframe", config.get("dynamic_timeframe", "5Min")),
                 "dollar_volume_sample_size": sample_size,
                 "minimum_average_dollar_volume": minimum,
             }
         )
 
+    daily = context.get("daily_liquidity") or {}
+    metrics.update(daily)
+    daily_min = liquidity.get("minimum_daily_dollar_volume")
+    if liquidity.get("enabled", False) and daily_min is not None:
+        average = daily.get("average_daily_dollar_volume")
+        available = isinstance(average, (int, float)) and math.isfinite(average) and daily.get("daily_sample_size", 0) >= int(liquidity.get("minimum_daily_sample_size", 5))
+        checks["daily_liquidity_data_available"] = available
+        checks["daily_liquidity_ok"] = available and average >= float(daily_min)
+        metrics["minimum_daily_dollar_volume"] = float(daily_min)
+
     spread = _settings(config, "spread")
     if spread.get("enabled", False):
         quote = context.get("quote") or {}
-        bid = quote.get("bid_price")
-        ask = quote.get("ask_price")
+        diagnostics = quote_diagnostics(quote, context.get("evaluated_at") or as_of, spread)
+        valid = diagnostics["valid"]
+        spread_percent = diagnostics["quoted_spread_percent"] if valid else None
         quote_time = quote.get("timestamp")
-        evaluated_at = context.get("evaluated_at") or as_of
-        fresh = False
-        if quote_time:
-            quote_at = datetime.datetime.fromisoformat(
-                str(quote_time).replace("Z", "+00:00")
-            )
-            if quote_at.tzinfo is None:
-                quote_at = quote_at.replace(tzinfo=datetime.timezone.utc)
-            if evaluated_at.tzinfo is None:
-                evaluated_at = evaluated_at.replace(tzinfo=datetime.timezone.utc)
-            age = (evaluated_at - quote_at).total_seconds()
-            fresh = -5 <= age <= float(spread.get("maximum_quote_age_seconds", 60))
-        valid = bid not in (None, "") and ask not in (None, "") and fresh
-        spread_percent = None
-        if valid:
-            bid = float(bid)
-            ask = float(ask)
-            midpoint = (bid + ask) / 2
-            valid = bid > 0 and ask >= bid and midpoint > 0
-            if valid:
-                spread_percent = (ask - bid) / midpoint * 100
+        metrics.update(diagnostics)
+        metrics["quote_attempts"] = context.get("quote_attempts", [])
         checks["spread_data_available"] = valid or _missing_passes(spread)
         checks["spread_ok"] = (
             spread_percent is not None

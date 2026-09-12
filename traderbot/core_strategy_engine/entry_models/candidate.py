@@ -13,6 +13,8 @@ HARD_ENTRY_CHECKS = frozenset(
         "ledger_price_ok",
         "liquidity_data_available",
         "liquidity_ok",
+        "daily_liquidity_data_available",
+        "daily_liquidity_ok",
         "model_enabled",
         "post_earnings_data_available",
         "positive_earnings_surprise",

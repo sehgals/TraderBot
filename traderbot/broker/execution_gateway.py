@@ -58,7 +58,14 @@ class ExecutionGateway:
                         f"sell order blocked: requested {requested_qty} share(s) for {symbol}, "
                         f"broker position has {held_qty}"
                     )
-            return self.client.submit_order(payload)
+            try:
+                return self.client.submit_order(payload)
+            except Exception:
+                if client_order_id and hasattr(self.client, "order_by_client_order_id"):
+                    existing = self.client.order_by_client_order_id(client_order_id)
+                    if existing:
+                        return existing
+                raise
 
     def replace_order(self, order_id, payload):
         symbol = payload.get("symbol")

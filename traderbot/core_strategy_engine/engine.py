@@ -1,3 +1,4 @@
+from traderbot.core_strategy_engine.entry_models.entry_safety import checked_quote, quote_diagnostics
 import argparse
 import datetime
 import hashlib
@@ -144,6 +145,8 @@ def save_json(path, data):
 
 class AlpacaClient:
     def __init__(self):
+        self.market_data_feed = os.environ.get("ALPACA_DATA_FEED", "iex")
+        self._entry_context_cache = {}
         self.trade_base_url = os.environ["ALPACA_BASE_URL"].rstrip("/")
         self.data_base_url = os.environ.get(
             "ALPACA_DATA_URL", "https://data.alpaca.markets/v2"
@@ -265,15 +268,19 @@ class AlpacaClient:
             raise
 
     def latest_trade_price(self, symbol):
-        query = urllib.parse.urlencode({"feed": "iex"})
+        query = urllib.parse.urlencode({"feed": getattr(self, "market_data_feed", "iex")})
         response = self.data("GET", f"/stocks/{symbol}/trades/latest?{query}")
         return float(response["trade"]["p"])
 
     def latest_quote(self, symbol):
-        query = urllib.parse.urlencode({"feed": "iex"})
+        query = urllib.parse.urlencode({"feed": getattr(self, "market_data_feed", "iex")})
         response = self.data("GET", f"/stocks/{symbol}/quotes/latest?{query}") or {}
         quote = response.get("quote") or {}
         return {
+            "feed": getattr(self, "market_data_feed", "iex"),
+            "bid_size": quote.get("bs"), "ask_size": quote.get("as"),
+            "bid_exchange": quote.get("bx"), "ask_exchange": quote.get("ax"),
+            "conditions": quote.get("c", []),
             "bid_price": quote.get("bp"),
             "ask_price": quote.get("ap"),
             "timestamp": quote.get("t"),
@@ -289,7 +296,7 @@ class AlpacaClient:
                 "start": start,
                 "end": end,
                 "adjustment": "raw",
-                "feed": "iex",
+                "feed": getattr(self, "market_data_feed", "iex"),
                 "limit": "10000",
             }
             if page_token:
@@ -546,7 +553,9 @@ def risk_context(client, config):
     now = datetime.datetime.now(datetime.timezone.utc)
     lookback_days = config.get("dynamic_lookback_days", 7)
     start = iso_utc(now - datetime.timedelta(days=lookback_days))
-    end = iso_utc(now)
+    cutoff = parse_alpaca_time(config.get("entry_snapshot_end")) or now
+    cutoff = min(cutoff, now)
+    end = iso_utc(cutoff)
     timeframe = config.get("dynamic_timeframe", "5Min")
     bars = calculate_indicators(
         completed_market_bars(
@@ -555,7 +564,7 @@ def risk_context(client, config):
     )
     market_bars = calculate_indicators(
         completed_market_bars(
-            client.stock_bars(MARKET_SYMBOL, start, end, timeframe), timeframe, now
+            client.stock_bars(MARKET_SYMBOL, start, end, timeframe), timeframe, cutoff
         )
     )
     return {
@@ -841,18 +850,20 @@ def price_action_label(bar, ema21_slope):
     return "neutral"
 
 
-def live_bar_context(client, symbol, config):
+def live_bar_context(client, symbol, config, exit_trade=None):
     now = datetime.datetime.now(datetime.timezone.utc)
     lookback_days = max(
         int(config.get("dynamic_lookback_days", 7)),
         int(config.get("rvol_lookback_days", 35)),
     )
     start = iso_utc(now - datetime.timedelta(days=lookback_days))
-    end = iso_utc(now)
+    cutoff = parse_alpaca_time(config.get("entry_snapshot_end")) or now
+    cutoff = min(cutoff, now)
+    end = iso_utc(cutoff)
     timeframe = config.get("dynamic_timeframe", "5Min")
     bars = calculate_indicators(
         completed_market_bars(
-            client.stock_bars(symbol, start, end, timeframe), timeframe, now
+            client.stock_bars(symbol, start, end, timeframe), timeframe, cutoff
         )
     )
     market_bars = calculate_indicators(
@@ -871,16 +882,42 @@ def live_bar_context(client, symbol, config):
     else:
         sector_bars = calculate_indicators(
             completed_market_bars(
-                client.stock_bars(sector_symbol, start, end, timeframe), timeframe, now
+                client.stock_bars(sector_symbol, start, end, timeframe), timeframe, cutoff
             )
         )
-    filter_context = {}
+    filter_context = {"feed": getattr(client, "market_data_feed", "unknown"), "timeframe": timeframe}
+    cache = getattr(client, "_entry_context_cache", {})
+    today = now.astimezone(EASTERN).date()
+    calendar_start = min(today - datetime.timedelta(days=45),
+                         exit_trade["exit_time"].astimezone(EASTERN).date() if exit_trade and exit_trade.get("exit_time") else today)
+    calendar_key = ("calendar", str(calendar_start), str(today))
+    try:
+        if calendar_key not in cache:
+            cache[calendar_key] = client.calendar(str(calendar_start), str(today + datetime.timedelta(days=10)))
+        filter_context["sessions"] = cache[calendar_key]
+    except Exception:
+        filter_context["sessions"] = []
+    daily_key = ("daily", symbol, str(today))
+    try:
+        if daily_key not in cache:
+            raw_daily = client.stock_bars(symbol, start, end, "1Day")
+            samples = [float(b['c']) * float(b['v']) for b in raw_daily
+                       if parse_alpaca_time(b['t']).astimezone(EASTERN).date() < today]
+            samples = [v for v in samples if math.isfinite(v) and v >= 0][-20:]
+            cache[daily_key] = {"average_daily_dollar_volume": sum(samples)/len(samples) if samples else None,
+                                "daily_sample_size": len(samples), "daily_volume_method": "completed_daily_close_times_volume"}
+        filter_context["daily_liquidity"] = cache[daily_key]
+    except Exception:
+        filter_context["daily_liquidity"] = {"average_daily_dollar_volume": None, "daily_sample_size": 0}
+    if hasattr(client, "_entry_context_cache"):
+        # Keep only the current day's entries.
+        client._entry_context_cache = {k:v for k,v in cache.items() if k[-1] == str(today)}
     filter_settings = config.get("entry_filters") or {}
     spread_settings = filter_settings.get("spread") or {}
     if spread_settings is True or (
         isinstance(spread_settings, dict) and spread_settings.get("enabled", False)
     ):
-        filter_context["quote"] = client.latest_quote(symbol)
+        filter_context["quote"], filter_context["quote_attempts"] = checked_quote(client, symbol, spread_settings if isinstance(spread_settings, dict) else {})
     filter_context["evaluated_at"] = datetime.datetime.now(datetime.timezone.utc)
     event_calendar_path = filter_settings.get("event_calendar_path")
     if event_calendar_path:
@@ -986,6 +1023,8 @@ def dynamic_entry_plan(
         "last_bar_time": bar["t"].isoformat(),
         "last_price": bar["c"],
         "ledger_ignored": features["ledger_ignored"],
+        "reentry_policy": features.get("reentry_policy"),
+        "entry_filter_metrics": classified_candidate.get("entry_filter_metrics", {}),
         "market_ok": market_ok,
         "sector_ok": sector_ok,
         "market_filter_ignored": market_filter_ignored,
@@ -2416,6 +2455,12 @@ def update_dynamic_pending_order(client, config, state, order_id, plan):
                 or current_limit <= 0
                 or abs(desired_limit / current_limit - 1) >= min_change
             ):
+                validation = validate_entry_submission(client, config, plan)
+                state["entry_submission_validation"] = validation
+                if not validation["passed"]:
+                    cancel_symbol_order(client, order_id, config["symbol"])
+                    reset_entry_tracking_state(state)
+                    return {"status": "dynamic_entry_order_canceled_preflight", "validation": validation}
                 replaced = client.replace_order(
                     order_id,
                     {
@@ -2602,6 +2647,42 @@ def dynamic_entry_share_limit(client, config, state, limit_price, fallback_qty):
     }
 
 
+def validate_entry_submission(client, config, plan):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    reasons = []
+    at = parse_alpaca_time(plan.get("last_bar_time"))
+    if not at or at > now or not dynamic_plan_is_fresh(config, at, now):
+        reasons.append("stale_entry_plan")
+    if plan.get("status") != "active_signal" or plan.get("hard_blockers"):
+        reasons.append("entry_signal_inactive")
+    settings = (config.get("entry_filters") or {}).get("spread") or {}
+    settings = settings if isinstance(settings, dict) else {}
+    quote, attempts = checked_quote(client, config["symbol"], settings)
+    diagnostics = attempts[-1]
+    reasons.extend(diagnostics["reasons"])
+    entry = float(dollars(plan.get("limit_price") or 0))
+    stop = float(plan.get("stop_price") or 0)
+    target = float(plan.get("target_price") or 0)
+    rr = (target-entry)/(entry-stop) if entry > stop else 0
+    if not (all(math.isfinite(v) for v in (entry, stop, target)) and 0 < stop < entry < target):
+        reasons.append("risk_geometry_invalid")
+    cap = plan.get("ledger_cap")
+    if cap is not None and entry > float(cap):
+        reasons.append("ledger_price_ok")
+    if rr < max(1.0, float(config.get("absolute_minimum_entry_reward_risk", 1.0))):
+        reasons.append("reward_risk_floor_ok")
+    assessment = plan.get("breakout_assessment") or {}
+    if plan.get("model_id") == "breakout_continuation" and diagnostics['valid'] and assessment:
+        baseline = assessment.get("atr14") or 0
+        if baseline <= 0 or (diagnostics['ask_price']-assessment['resistance'])/baseline > assessment['maximum_chase_atr']:
+            reasons.append("execution_chase_limit")
+    result = {"passed": not reasons, "reasons": sorted(set(reasons)), "quote": diagnostics,
+              "quote_attempts": attempts, "rounded_limit_price": entry, "reward_risk": rr,
+              "checked_at": iso_utc(now)}
+    plan["submission_validation"] = result
+    return result
+
+
 def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     symbol = config["symbol"]
     requested_qty = dynamic_entry_quantity(
@@ -2650,6 +2731,11 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
             "dynamic_plan": serializable_plan(plan),
         }
 
+    validation = validate_entry_submission(client, config, plan)
+    state["entry_submission_validation"] = validation
+    if not validation["passed"]:
+        return {"status": "dynamic_entry_preflight_blocked", "validation": validation,
+                "dynamic_plan": serializable_plan(plan)}
     order = client.submit_order(
         {
             "symbol": symbol,
@@ -2690,7 +2776,7 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
 
 
 def reset_entry_day_if_needed(state):
-    today_key = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    today_key = datetime.datetime.now(EASTERN).date().isoformat()
     if state.get("reentry_day") != today_key:
         state["reentry_day"] = today_key
         state["reentries_today"] = 0
@@ -2702,7 +2788,7 @@ def handle_dynamic_flat_entry(client, config, state, exit_trade=None):
     symbol = config["symbol"]
     reset_entry_day_if_needed(state)
     bars, market_bars, sector_bars, filter_context = live_bar_context(
-        client, symbol, config
+        client, symbol, config, exit_trade=exit_trade
     )
     ignore_ledger = not exit_trade
     plan = dynamic_entry_plan(
@@ -2766,7 +2852,7 @@ def refresh_dynamic_plan_only(client, config, state):
         return None
 
     bars, market_bars, sector_bars, filter_context = live_bar_context(
-        client, config["symbol"], config
+        client, config["symbol"], config, exit_trade=exit_trade
     )
     plan = dynamic_entry_plan(
         config["symbol"],

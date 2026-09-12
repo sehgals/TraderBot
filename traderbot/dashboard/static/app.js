@@ -27,6 +27,18 @@ function BreakoutDetails({assessment:a}) {
  h('p',null,`Price action ${a.price_action_points}/${a.price_action_maximum} | Overextension ${a.overextension_points}/${a.overextension_maximum}`),
  h('p',null,(a.blockers||[]).map(human).join(', ')||'Breakout gates passed'),h('small',null,`Assessed ${stamp(a.as_of)}`));
 }
+function EntryDiagnostics({candidate:c}) {
+ const d=c.diagnostics||{},m=d.metrics||{},policy=d.reentry_policy||{};
+ const n=v=>v==null?'Unavailable':Number(v).toLocaleString('en-US',{maximumFractionDigits:4});
+ return h('details',null,h('summary',null,'Entry checks'),
+ h('p',null,`Feed: ${m.feed||m.liquidity_feed||'Unknown'} | Coverage: ${human(m.liquidity_coverage)}`),
+ h('p',null,`Spread ${n(m.quoted_spread_percent)}% / maximum ${n(m.maximum_spread_percent)}% | Quote age at check ${n(m.quote_age_seconds)}s | Quote ${stamp(m.quote_timestamp)}`),
+ h('p',null,`Bid ${n(m.bid_price)} / Ask ${n(m.ask_price)} | ${(m.reasons||[]).map(human).join(', ')}`),
+ h('p',null,`Matched intraday dollar volume ${n(m.matched_intraday_average_dollar_volume)} / minimum ${n(m.minimum_average_dollar_volume)} | ${m.liquidity_timeframe||'Unknown timeframe'} | ${n(m.dollar_volume_sample_size)} samples`),
+ h('p',null,`Average daily dollar volume ${n(m.average_daily_dollar_volume)} | ${n(m.daily_sample_size)} completed sessions | Minimum ${m.minimum_daily_dollar_volume==null?'Not configured':n(m.minimum_daily_dollar_volume)}`),
+ h('p',null,`Reentry: ${human(policy.reason)} | Restriction expiry ${stamp(policy.expires_at)} | Price cap ${n(d.ledger_cap)}`),
+ h('p',null,[...(c.blockers||[]),...(d.eligibility_reasons||[]),...((d.submission_validation||{}).reasons||[])].map(human).join(', ')||'No recorded blockers'));
+}
 function OperationsView({data}) {
  const [symbol,setSymbol]=React.useState(''),[attention,setAttention]=React.useState(false);
  const [showAll,setShowAll]=React.useState(false);
@@ -41,7 +53,7 @@ function OperationsView({data}) {
    table(['Symbol','Activity status','Last activity','Next expected'],data.watchers.filter(matches).filter(w=>!attention||!['Within schedule','Disabled'].includes(w.status)).slice(0,limit).map(w=>[w.symbol,pill(w.status,w.status==='Within schedule'?'green':w.status==='Disabled'?'neutral':'amber'),stamp(w.last_activity),stamp(w.next_expected)]),'No watchers match, or watcher configuration is unavailable.'),
    data.issues.length>0&&h('details',null,h('summary',null,`${data.issues.length} source issues`),...data.issues.map((issue,i)=>h('p',{key:i},`${issue.source}: ${issue.message}`)))),
   h('section',{className:'panel'},h('h2',null,'Entry candidates'),h('p',{className:'muted'},'Recorded setup assessments for configured candidates not currently held. Scores do not imply an order will be placed.'),
-   table(['Symbol','Score','Model','Status','Assessment time','Source'],data.candidates.filter(matches).slice(0,limit).map(c=>[c.symbol,h('div',null,c.score??'Unavailable',h(TrendDetails,{assessment:c.trend_assessment}),h(BreakoutDetails,{assessment:c.breakout_assessment})),human(c.model),h('div',null,human(c.status),h('details',null,h('summary',null,'Blockers'),h('p',null,c.blockers.map(human).join(', ')||'No recorded blockers'))),stamp(c.as_of),c.source_status]),'No candidate assessments match this filter.')),
+   table(['Symbol','Score','Model','Status','Assessment time','Source'],data.candidates.filter(matches).slice(0,limit).map(c=>[c.symbol,h('div',null,c.score??'Unavailable',h(TrendDetails,{assessment:c.trend_assessment}),h(BreakoutDetails,{assessment:c.breakout_assessment})),human(c.model),h('div',null,c.decision_label||human(c.status),h(EntryDiagnostics,{candidate:c}),h('details',null,h('summary',null,'Blockers'),h('p',null,c.blockers.map(human).join(', ')||'No recorded blockers'))),stamp(c.as_of),c.source_status]),'No candidate assessments match this filter.')),
   h('section',{className:'panel'},h('h2',null,'Alert history'),table(['Time','Symbol','Source','Event','Detail'],data.alerts.filter(matches).slice(0,limit).map(a=>[stamp(a.timestamp),a.symbol,a.source,pill(human(a.kind),'amber'),human(a.detail)]),'No alerts in the recent log window. Missing sources are listed above.')),
   h('section',{className:'panel'},h('h2',null,'Recent watcher activity'),table(['Time','Symbol','Event','Failures','Next run'],data.activity.filter(matches).slice(0,limit).map(a=>[stamp(a.timestamp),a.symbol,human(a.status),a.failures??'—',a.next_run_seconds==null?'—':`${a.next_run_seconds}s`]),'No activity in the recent log window.'))
  );

@@ -13,3 +13,5 @@ const breakout=JSON.stringify(ctx.BreakoutDetails({assessment:{resistance:100,cl
 for(const text of ['Previous-bar ATR 1.0000','Distance 0.7500 ATR','Price action 25/25','Overextension 7.5/10','breakout chase ok']) assert.ok(breakout.includes(text),text);
 assert.equal(vm.runInContext("healthReason('ema21_slope_positive')",ctx),'EMA21 slope not positive');
 assert.equal(vm.runInContext("healthReason('market_regime_favorable')",ctx),'Market regime unfavorable');
+const diag=JSON.stringify(ctx.EntryDiagnostics({candidate:{diagnostics:{metrics:{feed:'iex',liquidity_coverage:'single_exchange',quoted_spread_percent:4.31,maximum_spread_percent:.5,matched_intraday_average_dollar_volume:95000,minimum_average_dollar_volume:500000},reentry_policy:{reason:'next_session_setup'}},blockers:['spread_ok']}}));
+for(const text of ['Feed: iex','4.31%','0.5%','95,000','500,000','next session setup']) assert.ok(diag.includes(text),text);

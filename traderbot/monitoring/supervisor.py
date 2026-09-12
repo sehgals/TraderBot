@@ -7,6 +7,7 @@ import signal
 import time
 import traceback
 from contextlib import nullcontext
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from traderbot.core_strategy_engine.engine import (
@@ -17,6 +18,9 @@ from traderbot.core_strategy_engine.engine import (
     load_env,
     load_json,
     save_json,
+    refresh_dynamic_plan_only,
+    timeframe_minutes,
+    parse_alpaca_time,
 )
 from traderbot.core_strategy_engine.strategies import (
     DEFAULT_STRATEGY_TYPE,
@@ -365,7 +369,7 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
         factor_exposure[factor] = factor_exposure.get(factor, 0) + notional
         aggregate_risk += notional * 0.06
 
-    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    today = datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     allocation_state = load_json(project_root / PORTFOLIO_ALLOCATION_STATE, {})
     if allocation_state.get("date") != today:
         allocation_state = {"date": today, "entries": 0, "turnover": 0.0}
@@ -461,6 +465,37 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
         for record in records
     ):
         return None, []
+    # Refresh stale/high-quality candidates on one completed-bar cutoff without submitting orders.
+    refreshed_records = []
+    refresh_rejections = []
+    snapshot_now = datetime.datetime.fromisoformat(str(clock["timestamp"]).replace("Z", "+00:00")) if clock.get("timestamp") else datetime.datetime.now(datetime.timezone.utc)
+    watcher_by_symbol = {watcher["symbol"]: watcher for watcher in watchers}
+    for record in records:
+        cfg = record.get("strategy_config", {})
+        plan = (record.get("result") or {}).get("dynamic_plan") or {}
+        if not (cfg.get("portfolio_allocation_observed") or cfg.get("portfolio_allocation_required")):
+            refreshed_records.append(record)
+            continue
+        minutes = timeframe_minutes(cfg.get("dynamic_timeframe", "5Min"))
+        cutoff = snapshot_now.replace(second=0, microsecond=0) - datetime.timedelta(minutes=snapshot_now.minute % minutes)
+        expected = cutoff - datetime.timedelta(minutes=minutes)
+        if parse_alpaca_time(plan.get("last_bar_time")) != expected and _float(plan.get("setup_score")) >= _float(cfg.get("minimum_entry_setup_score"), 80):
+            watcher = watcher_by_symbol.get(record["symbol"])
+            if watcher:
+                try:
+                    with client.symbol_transaction(record["symbol"]) if hasattr(client, "symbol_transaction") else nullcontext():
+                        state_data = load_json(watcher["state_path"], {})
+                        plan = refresh_dynamic_plan_only(client, {**cfg, "entry_snapshot_end": cutoff.isoformat()}, state_data) or {}
+                        save_json(watcher["state_path"], state_data)
+                    record = {**record, "result": {**record.get("result", {}), "dynamic_plan": plan}}
+                except Exception:
+                    refresh_rejections.append({"symbol":record["symbol"],"reason":"candidate_refresh_failed"})
+                    continue
+        if parse_alpaca_time(plan.get("last_bar_time")) != expected:
+            refresh_rejections.append({"symbol":record["symbol"],"reason":"candidate_bar_mismatch_or_stale"})
+            continue
+        refreshed_records.append(record)
+    records = refreshed_records
     candidates, portfolio, state = allocation_inputs(
         client, records, supervisor_config, watchers, project_root
     )
@@ -474,6 +509,7 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
             "as_of": iso_now(), "controls": settings, "ranked": [],
             "selected": [], "rejected": [], "candidate_bar_times": bar_times,
             "status": "incomplete_candidate_snapshot",
+            "refresh_rejections": refresh_rejections,
             "shadow_mode": settings.get("shadow_mode", True), "executions": [],
         }
         append_jsonl(
@@ -493,6 +529,7 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
     decision = apply_promotion_stage(decision, settings)
     decision["candidate_bar_times"] = bar_times
     decision["status"] = "allocation_completed"
+    decision["refresh_rejections"] = refresh_rejections
     execution_records = []
     promotion_stage = settings.get(
         "promotion_stage", "shadow" if settings.get("shadow_mode", True) else "full"
