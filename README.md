@@ -100,6 +100,16 @@ C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\p
 
 `traderbot.monitoring.supervisor` runs all configured watchers from `config/watchers.json`. It replaces deprecated per-symbol PowerShell watcher tasks and reuses one market-clock check per scheduler pass.
 
+The supervisor checks for watcher-list edits between completed scheduler batches.
+Add a symbol to `new_watchers` with its `state` and `log` paths to have it picked
+up automatically on the next pass. Unchanged watchers retain their schedules;
+added or changed entries become due immediately. Removed or disabled entries
+stop being scheduled after the current batch finishes. Invalid edits retain the
+last valid list and emit `watcher_list_reload_failed` until corrected. Successful
+reloads emit `watcher_list_reloaded`. Watcher defaults also reload; global
+execution controls and scheduler settings still require a service restart.
+Existing services require one restart to load this code update.
+
 The production bot must always run through `TraderBot_Watcher_Supervisor` as the Windows `SYSTEM` service account (`ServiceAccount` logon, highest privileges). It must not run under an interactive user account. Apply or repair this required configuration from an Administrator PowerShell window with:
 
 ```powershell

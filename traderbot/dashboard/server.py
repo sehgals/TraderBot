@@ -112,7 +112,7 @@ def create_app(store=None):
                 while not await request.is_disconnected():
                     snapshot = await asyncio.to_thread(store.snapshot)
                     yield "data: " + json.dumps(snapshot, allow_nan=False) + "\n\n"
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(snapshot.get("stream_interval_seconds", 5))
             return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 
     def endpoint_factory(path):
@@ -125,7 +125,7 @@ def create_app(store=None):
     return app
 
 
-def main():
+def main(*, log_config=None):
     import argparse
     import uvicorn
     parser = argparse.ArgumentParser(description="Read-only TraderBot dashboard.")
@@ -134,4 +134,5 @@ def main():
     args = parser.parse_args()
     from traderbot.dashboard.live import LiveStore
     store = SnapshotStore() if args.offline else LiveStore(ROOT)
-    uvicorn.run(create_app(store), host="127.0.0.1", port=args.port)
+    uvicorn.run(create_app(store), host="127.0.0.1", port=args.port,
+                log_config=log_config or uvicorn.config.LOGGING_CONFIG)

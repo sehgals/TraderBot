@@ -7,45 +7,51 @@
     "poll_seconds": 300,
     "target_margin_dollars": 0
   },
-  "portfolio_allocator": {
-    "enabled": true,
-    "promotion_stage": "full",
-    "shadow_slippage_bps": 5,
-    "minimum_shadow_sessions": 20,
-    "minimum_shadow_signals": 30,
-    "small_notional_dollars": 1000,
-    "partial_allocation_fraction": 0.5,
-    "minimum_stage_live_entries": 5,
-    "maximum_simultaneous_positions": 12,
-    "maximum_aggregate_open_risk_percent": 6,
-    "maximum_sector_exposure_percent": 30,
-    "maximum_correlated_factor_exposure_percent": 35,
-    "maximum_symbol_notional_percent": 15,
-    "maximum_daily_entries": 4,
-    "maximum_daily_turnover_percent": 25,
-    "minimum_cash_reserve_percent": 20,
-    "minimum_score": 80,
-    "minimum_score_separation": 2,
-    "sector_penalty": 0.25,
-    "correlated_factor_penalty": 0.15,
-    "regime_exposure_bands": {
-      "defensive": {
-        "minimum_percent": 0,
-        "maximum_percent": 25
-      },
-      "neutral": {
-        "minimum_percent": 25,
-        "maximum_percent": 55
-      },
-      "favorable": {
-        "minimum_percent": 50,
-        "maximum_percent": 80
-      }
-    }
-  },
   "default_error_poll_seconds": 30,
   "default_market_closed_poll_seconds": 900,
   "default_poll_seconds": 30,
+  "entry_filters": {
+    "corporate_actions": {
+      "blackout_days_after": 1,
+      "blackout_days_before": 3,
+      "enabled": false,
+      "missing_data_policy": "block"
+    },
+    "earnings": {
+      "blackout_days_after": 1,
+      "blackout_days_before": 2,
+      "enabled": false,
+      "missing_data_policy": "block"
+    },
+    "gap": {
+      "enabled": true,
+      "maximum_absolute_percent": 8.0,
+      "missing_data_policy": "block"
+    },
+    "liquidity": {
+      "enabled": true,
+      "minimum_sample_size": 5,
+      "missing_data_policy": "block"
+    },
+    "spread": {
+      "enabled": true,
+      "maximum_percent": 0.5,
+      "maximum_quote_age_seconds": 60,
+      "missing_data_policy": "block"
+    }
+  },
+  "managed_watcher_defaults": {
+    "absolute_minimum_entry_reward_risk": 1.0,
+    "entry_score_weights": {
+      "market_sector_regime": 15,
+      "price_action": 25,
+      "relative_strength_execution": 10,
+      "reward_risk_geometry": 15,
+      "stock_trend": 20,
+      "volume_liquidity_quality": 15
+    },
+    "minimum_entry_setup_score": 75
+  },
   "managed_watchers": [
     {
       "config": "traderbot/core_strategy_engine/strategies/configs/strategy_config.json",
@@ -294,12 +300,6 @@
       "symbol": "POWW"
     },
     {
-      "config": "traderbot/core_strategy_engine/strategies/configs/pltr_strategy_config.json",
-      "log": "runtime/logs/pltr_watcher.jsonl",
-      "state": "runtime/state/pltr_strategy_state.json",
-      "symbol": "PLTR"
-    },
-    {
       "config": "traderbot/core_strategy_engine/strategies/configs/ibm_strategy_config.json",
       "log": "runtime/logs/ibm_watcher.jsonl",
       "state": "runtime/state/ibm_strategy_state.json",
@@ -334,12 +334,6 @@
       "log": "runtime/logs/gfs_watcher.jsonl",
       "state": "runtime/state/gfs_strategy_state.json",
       "symbol": "GFS"
-    },
-    {
-      "config": "traderbot/core_strategy_engine/strategies/configs/crwd_strategy_config.json",
-      "log": "runtime/logs/crwd_watcher.jsonl",
-      "state": "runtime/state/crwd_strategy_state.json",
-      "symbol": "CRWD"
     },
     {
       "config": "traderbot/core_strategy_engine/strategies/configs/orcl_strategy_config.json",
@@ -490,104 +484,41 @@
       "log": "runtime/logs/azn_watcher.jsonl",
       "state": "runtime/state/azn_strategy_state.json",
       "symbol": "AZN"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/pltr_strategy_config.json",
+      "log": "runtime/logs/pltr_watcher.jsonl",
+      "state": "runtime/state/pltr_strategy_state.json",
+      "symbol": "PLTR"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/msft_strategy_config.json",
+      "log": "runtime/logs/msft_watcher.jsonl",
+      "state": "runtime/state/msft_strategy_state.json",
+      "symbol": "MSFT"
     }
   ],
-  "entry_filters": {
-    "corporate_actions": {
-      "blackout_days_after": 1,
-      "blackout_days_before": 3,
-      "enabled": false,
-      "missing_data_policy": "block"
-    },
-    "earnings": {
-      "blackout_days_after": 1,
-      "blackout_days_before": 2,
-      "enabled": false,
-      "missing_data_policy": "block"
-    },
-    "gap": {
-      "enabled": true,
-      "maximum_absolute_percent": 8.0,
-      "missing_data_policy": "block"
-    },
-    "liquidity": {
-      "enabled": true,
-      "minimum_sample_size": 5,
-      "missing_data_policy": "block"
-    },
-    "spread": {
-      "enabled": true,
-      "maximum_percent": 0.5,
-      "maximum_quote_age_seconds": 60,
-      "missing_data_policy": "block"
-    }
-  },
-  "managed_watcher_defaults": {
-    "absolute_minimum_entry_reward_risk": 1.0,
-    "entry_score_weights": {
-      "price_action": 25,
-      "stock_trend": 20,
-      "market_sector_regime": 15,
-      "volume_liquidity_quality": 15,
-      "reward_risk_geometry": 15,
-      "relative_strength_execution": 10
-    },
-    "minimum_entry_setup_score": 80
-  },
   "max_concurrency": 3,
   "new_watcher_defaults": {
+    "absolute_minimum_entry_reward_risk": 1.0,
     "direct_ladder_authority_enabled": false,
     "dynamic_entry_enabled": true,
     "dynamic_entry_notional": 5000,
     "dynamic_entry_time_in_force": "day",
     "dynamic_lookback_days": 7,
     "dynamic_market_filter_ignored_notional": 2500,
-    "dynamic_require_market_regime": true,
-    "dynamic_require_sector_regime": true,
     "dynamic_reentry_enabled": false,
     "dynamic_replace_min_change_percent": 0.25,
     "dynamic_replace_open_orders": true,
+    "dynamic_require_market_regime": true,
+    "dynamic_require_sector_regime": true,
     "dynamic_timeframe": "5Min",
     "entry_model_architecture_version": 2,
-    "entry_score_weights": {
-      "price_action": 25,
-      "stock_trend": 20,
-      "market_sector_regime": 15,
-      "volume_liquidity_quality": 15,
-      "reward_risk_geometry": 15,
-      "relative_strength_execution": 10
-    },
     "entry_models": {
       "breakout": {
         "enabled": true,
         "minimum_reward_risk": 1.5,
         "minimum_rvol": 1.5
-      },
-      "pullback": {
-        "enabled": true,
-        "minimum_reward_risk": 1.5,
-        "minimum_rvol": 1.15
-      },
-      "relative_strength": {
-        "enabled": false,
-        "risk_budget_percent": 0.25,
-        "minimum_relative_return": 0.02
-      },
-      "low_volatility_trend": {
-        "enabled": false,
-        "risk_budget_percent": 0.2,
-        "maximum_atr_percent": 2.0
-      },
-      "post_earnings_drift": {
-        "enabled": false,
-        "risk_budget_percent": 0.2,
-        "minimum_surprise_percent": 2.0,
-        "maximum_days_after_earnings": 10
-      },
-      "trend_mean_reversion": {
-        "enabled": false,
-        "risk_budget_percent": 0.2,
-        "maximum_pullback_atr": 1.5
       },
       "defensive_etf": {
         "enabled": false,
@@ -598,19 +529,52 @@
           "VTI",
           "USMV"
         ]
+      },
+      "low_volatility_trend": {
+        "enabled": false,
+        "maximum_atr_percent": 2.0,
+        "risk_budget_percent": 0.2
+      },
+      "post_earnings_drift": {
+        "enabled": false,
+        "maximum_days_after_earnings": 10,
+        "minimum_surprise_percent": 2.0,
+        "risk_budget_percent": 0.2
+      },
+      "pullback": {
+        "enabled": true,
+        "minimum_reward_risk": 1.5,
+        "minimum_rvol": 1.15
+      },
+      "relative_strength": {
+        "enabled": false,
+        "minimum_relative_return": 0.02,
+        "risk_budget_percent": 0.25
+      },
+      "trend_mean_reversion": {
+        "enabled": false,
+        "maximum_pullback_atr": 1.5,
+        "risk_budget_percent": 0.2
       }
     },
     "entry_quantity": 1,
+    "entry_score_weights": {
+      "market_sector_regime": 15,
+      "price_action": 25,
+      "relative_strength_execution": 10,
+      "reward_risk_geometry": 15,
+      "stock_trend": 20,
+      "volume_liquidity_quality": 15
+    },
     "initial_stop_loss_percent": 20,
     "ladder_buy_quantity": 0,
     "ladder_drop_steps_percent": [],
     "market_closed_poll_seconds": 900,
     "max_ladder_count": 0,
     "max_symbol_notional_percent": 15,
-    "absolute_minimum_entry_reward_risk": 1.0,
-    "minimum_entry_setup_score": 80,
-    "minimum_entry_reward_risk": 1.5,
     "min_cash_balance_percent": 20,
+    "minimum_entry_reward_risk": 1.5,
+    "minimum_entry_setup_score": 75,
     "poll_seconds": 60,
     "reentry_cooldown_seconds": 600,
     "reentry_enabled": false,
@@ -619,11 +583,11 @@
     "risk_per_trade_percent": 0.5,
     "risk_profile": "speculative",
     "rvol_lookback_days": 35,
+    "strategy_name": "Dynamic new-candidate entry",
+    "strategy_type": "new_candidate_dynamic_entry",
     "structural_stop_atr_multiple": 1.5,
     "structural_stop_buffer_atr": 0.1,
     "structural_stop_max_percent": 6,
-    "strategy_name": "Dynamic new-candidate entry",
-    "strategy_type": "new_candidate_dynamic_entry",
     "trail_stop_below_current_percent": 2.5,
     "trail_trigger_step_percent": 5
   },
@@ -662,8 +626,49 @@
       "log": "runtime/logs/candidates/kslv_watcher.jsonl",
       "state": "runtime/state/candidates/kslv_strategy_state.json",
       "symbol": "KSLV"
+    },
+    {
+      "log": "runtime/logs/crwd_watcher.jsonl",
+      "state": "runtime/state/crwd_strategy_state.json",
+      "symbol": "CRWD"
     }
   ],
+  "portfolio_allocator": {
+    "correlated_factor_penalty": 0.15,
+    "enabled": true,
+    "maximum_aggregate_open_risk_percent": 6,
+    "maximum_correlated_factor_exposure_percent": 35,
+    "maximum_daily_entries": 4,
+    "maximum_daily_turnover_percent": 25,
+    "maximum_sector_exposure_percent": 30,
+    "maximum_simultaneous_positions": 12,
+    "maximum_symbol_notional_percent": 15,
+    "minimum_cash_reserve_percent": 20,
+    "minimum_score": 80,
+    "minimum_score_separation": 2,
+    "minimum_shadow_sessions": 20,
+    "minimum_shadow_signals": 30,
+    "minimum_stage_live_entries": 5,
+    "partial_allocation_fraction": 0.5,
+    "promotion_stage": "full",
+    "regime_exposure_bands": {
+      "defensive": {
+        "maximum_percent": 25,
+        "minimum_percent": 0
+      },
+      "favorable": {
+        "maximum_percent": 80,
+        "minimum_percent": 50
+      },
+      "neutral": {
+        "maximum_percent": 55,
+        "minimum_percent": 25
+      }
+    },
+    "sector_penalty": 0.25,
+    "shadow_slippage_bps": 5,
+    "small_notional_dollars": 1000
+  },
   "position_health": {
     "additions_enabled": true,
     "at_risk_score": 25,

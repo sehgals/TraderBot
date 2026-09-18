@@ -14,7 +14,7 @@ boundary for review. Do not deploy or start a later phase automatically.
   from the bot's Python dependencies. React assets are served locally.
 - The viewer reads only saved reports. Broker polling, watcher reads, and SSE
   from the initial prototype were removed to keep Phase 1 independently reviewable.
-- No dashboard scheduled task has been installed. A temporary local viewer was
+- At the Phase 1 checkpoint, no dashboard task was installed. A temporary viewer was
   started for verification on port 8765.
 - Production bot configuration has not been changed.
 - Five backend tests passed for report fidelity, field allowlisting, missing/bad
@@ -44,9 +44,8 @@ boundary for review. Do not deploy or start a later phase automatically.
   SYSTEM / ServiceAccount / Highest; a pythonw.exe process was observed in session
   0, but its supervisor command line was not visible, so its identity remains
   unverified. No production service code or configuration was changed.
-- Next phase is Phase 4 (dashboard service/startup), pending separate review.
-- Phase 5 was requested separately and implemented on 2026-09-07; Phase 4 remains
-  pending. Added keyboard-focusable scrolling tables, responsive filters, explicit
+- Phase 5 was requested separately and implemented on 2026-09-07 before Phase 4.
+  Added keyboard-focusable scrolling tables, responsive filters, explicit
   loading state, and light landscape print styling with automatic detail expansion
   and restoration. Desktop/mobile/print screenshots were visually inspected.
 - Phase 5 verification: 23 backend tests passed; live browser regression passed;
@@ -54,7 +53,20 @@ boundary for review. Do not deploy or start a later phase automatically.
   stale values, missing reports, failure/retry, responsive widths, and print styles.
   See `scripts/verify_dashboard_release.py` and `docs/dashboard.md` for reproduction
   and limitations. No service installation, commit, or push was performed.
-- No dashboard scheduled task, commit, or push was performed.
+- Phases 1, 2, 3, and 5 were committed and pushed as `c9e53c6` at the user's request.
+- Phase 4 is complete (2026-09-07). `TraderBot_Dashboard` was installed and started
+  as SYSTEM / ServiceAccount / Highest, using pythonw.exe and an at-startup trigger.
+  The service captures rotating logs and binds only to `127.0.0.1:8765`.
+- Elevated service verification passed: dashboard PID 29232 was replaced by 7728
+  during a dashboard-only restart, and both ran as SYSTEM in session 0. The
+  production supervisor remained PID 5768, verified as SYSTEM in session 0 with
+  SYSTEM / ServiceAccount / Highest task configuration. No enforcement change was
+  needed. HTTP returned 200 and the live snapshot returned available.
+- Verification evidence: `runtime/dashboard-service-verification.json`. The
+  installer and repeatable verifier are `scripts/configure_dashboard_task.ps1`
+  and `scripts/verify_dashboard_service.ps1`. All 23 dashboard backend tests passed.
+  Boot behavior is configured but was not tested with a machine reboot.
+  Phase 4 changes have not been committed or pushed.
 
 ## Phase 1 — Read-only portfolio viewer
 

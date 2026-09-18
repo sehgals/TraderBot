@@ -74,7 +74,7 @@ class LiveDashboardTests(unittest.TestCase):
 
     def test_age_becomes_stale_without_a_refresh(self):
         self.store.refresh()
-        self.now += dt.timedelta(seconds=61)
+        self.now += dt.timedelta(seconds=961)
         self.assertTrue(self.store.snapshot()["connection"]["account"]["stale"])
 
     def health_files(self):
@@ -145,3 +145,15 @@ class LiveDashboardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_market_aware_refresh_and_open_boundary(tmp_path):
+    store=LiveStore(tmp_path,clock=lambda:NOW)
+    data={'market':{'is_open':False,'next_open':'2026-09-08T13:30:00Z'},'connection':{'market':{'error':None}}}
+    assert store.refresh_interval(data,NOW)==900
+    assert store.refresh_interval(data,dt.datetime(2026,9,8,13,29,40,tzinfo=dt.timezone.utc))==20
+    assert store.refresh_interval(data,dt.datetime(2026,9,8,13,30,tzinfo=dt.timezone.utc))==20
+    data['market']['is_open']=True
+    assert store.refresh_interval(data,NOW)==20
+    data['market']['is_open']=False;data['connection']['market']['error']='unavailable'
+    assert store.refresh_interval(data,NOW)==20

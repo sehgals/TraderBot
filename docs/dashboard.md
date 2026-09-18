@@ -1,4 +1,4 @@
-# Read-only dashboard (Phases 1 through 3)
+# Read-only dashboard
 
 The default mode uses one background collector for all browser tabs. Every 20
 seconds it retrieves account balances, positions, recent orders, the market clock,
@@ -36,7 +36,7 @@ Fresh/complete labels in score details describe the assessment at report time.
 
 With `--offline`, the viewer does not load credentials, contact the broker, evaluate strategies,
 read watcher state, or write reports. Refresh report reloads the saved file; it
-does not regenerate a report. No automatic service is installed in this phase.
+does not regenerate a report.
 
 ## Run from PowerShell in the repository
 
@@ -75,8 +75,7 @@ $env:PYTHONPATH = 'runtime/dashboard-test-deps;runtime/dashboard-deps'
 
 Browser checks save desktop/mobile screenshots under `runtime/`. Tests use
 temporary reports and simulated browser responses, leaving production files intact.
-Automatic startup belongs to Phase 4. The dashboard
-currently runs as a temporary foreground process; no scheduled task is installed.
+Service startup and restart verification are described below.
 
 ## Watcher operations
 
@@ -106,7 +105,7 @@ text are excluded from browser responses.
 Phase 5 visual and accessibility work is implemented. Start the foreground viewer
 with the PowerShell command above, open <http://127.0.0.1:8765>, and reload an
 existing tab to load updated assets. Stop with Ctrl+C; restart using the same
-command. Phase 4 service installation remains pending.
+command. When the service occupies port 8765, use `--port 8766` for a foreground viewer.
 
 Use Tab to reach filters, scrollable tables, and detail summaries. Arrow keys
 scroll a focused table horizontally; Enter toggles focused details. Small screens
@@ -125,3 +124,41 @@ Verification uses headless Microsoft Edge because the in-app browser could not
 initialize. Print CSS was inspected through browser print-media emulation; physical
 printer output and a full assistive-technology audit were not tested. Live broker
 availability and dashboard service startup are outside these fixture checks.
+
+## SYSTEM dashboard service (Phase 4)
+
+The dedicated `TraderBot_Dashboard` scheduled task runs
+`pythonw.exe -m traderbot.cli.dashboard_service --port 8765` from the repository
+directory. It uses SYSTEM, ServiceAccount logon, highest privileges, and an
+at-startup trigger; no signed-in desktop or visible console is required. It binds
+only to <http://127.0.0.1:8765>. The production bot retains its separate
+`TraderBot_Watcher_Supervisor` task.
+
+Install dependencies using the commands above, then run from an administrator
+PowerShell in this repository:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/configure_dashboard_task.ps1 -Start
+Get-ScheduledTask -TaskName TraderBot_Dashboard
+Stop-ScheduledTask -TaskName TraderBot_Dashboard
+Start-ScheduledTask -TaskName TraderBot_Dashboard
+# Verify identity, HTTP, loopback binding, and a dashboard-only stop/start:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify_dashboard_service.ps1
+```
+
+For a restart, stop the dashboard task, wait until it is Ready, and start it again.
+The verification script performs this sequence and confirms the supervisor PID
+stays unchanged. `-Install` first configures and starts the dashboard task. The
+verification script checks the default port 8765; the installer also supports a
+custom `-Port` and `-Pythonw` path. Stop the task before rerunning configuration.
+
+Service startup/errors and HTTP access logs go to
+`runtime/logs/dashboard-service.log`, rotating at 5 MiB with three backups.
+The verification report is `runtime/dashboard-service-verification.json`.
+The task has no execution time limit, ignores duplicate starts, runs on battery,
+and retries failed exits three times at one-minute intervals. It does not install
+dependencies automatically. After editing Python code or dependencies, restart
+the dashboard task; after editing frontend assets, reload the browser tab.
+Boot startup is configured without rebooting the production machine. Task queries
+and management require administrator PowerShell; a non-elevated query may report
+the task as missing even while its local URL responds.

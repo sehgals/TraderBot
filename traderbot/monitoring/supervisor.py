@@ -142,6 +142,50 @@ def load_supervisor_config(path):
     return project_root, config, prepared
 
 
+class WatcherListReloader:
+    """Reload watcher definitions between batches, retaining runtime scheduling."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.fingerprint = self._fingerprint()
+
+    def _fingerprint(self):
+        stat = self.path.stat()
+        return stat.st_mtime_ns, stat.st_size
+
+    def reload(self, config, watchers):
+        try:
+            fingerprint = self._fingerprint()
+            if fingerprint == self.fingerprint:
+                return config, watchers
+            _, incoming, prepared = load_supervisor_config(self.path)
+            if self._fingerprint() != fingerprint:
+                raise ValueError("Watcher configuration changed while being read")
+            previous = {item["symbol"]: item for item in watchers}
+            runtime_keys = {"next_run_at", "failures"}
+            for index, item in enumerate(prepared):
+                old = previous.get(item["symbol"])
+                if old and all(old.get(key) == value for key, value in item.items()
+                               if key not in runtime_keys):
+                    prepared[index] = old
+            # Only watcher definitions/defaults reload; execution controls remain
+            # the startup settings until the service is restarted.
+            updated = dict(config)
+            for key in ("watchers", "managed_watchers", "new_watchers",
+                        "managed_watcher_defaults", "new_watcher_defaults"):
+                updated.pop(key, None)
+                if key in incoming:
+                    updated[key] = incoming[key]
+            self.fingerprint = fingerprint
+            print(json.dumps({"timestamp": iso_now(), "status": "watcher_list_reloaded",
+                              "symbols": [item["symbol"] for item in prepared]}), flush=True)
+            return updated, prepared
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            print(json.dumps({"timestamp": iso_now(), "status": "watcher_list_reload_failed",
+                              "error": str(exc)}), flush=True)
+            return config, watchers
+
+
 def seconds_until_next_open(clock):
     next_open = clock.get("next_open")
     if not next_open:
@@ -457,6 +501,9 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
 
 def run_portfolio_allocator(client, records, supervisor_config, watchers, project_root, clock):
     settings = supervisor_config.get("portfolio_allocator") or {}
+    promotion_stage = settings.get(
+        "promotion_stage", "shadow" if settings.get("shadow_mode", True) else "full"
+    )
     if not settings.get("enabled", False):
         return None, []
     if not any(
@@ -508,9 +555,10 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
         decision = {
             "as_of": iso_now(), "controls": settings, "ranked": [],
             "selected": [], "rejected": [], "candidate_bar_times": bar_times,
-            "status": "incomplete_candidate_snapshot",
             "refresh_rejections": refresh_rejections,
-            "shadow_mode": settings.get("shadow_mode", True), "executions": [],
+            "status": "incomplete_candidate_snapshot",
+            "shadow_mode": promotion_stage == "shadow",
+            "promotion_stage": promotion_stage, "executions": [],
         }
         append_jsonl(
             project_root / PORTFOLIO_ALLOCATION_LOG,
@@ -523,7 +571,8 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
             "as_of": iso_now(), "controls": settings, "ranked": [],
             "selected": [], "rejected": [], "candidate_bar_times": bar_times,
             "status": "candidate_snapshot_already_allocated",
-            "shadow_mode": settings.get("shadow_mode", True), "executions": [],
+            "shadow_mode": promotion_stage == "shadow",
+            "promotion_stage": promotion_stage, "executions": [],
         }, []
     decision = allocate_candidates(candidates, portfolio, settings)
     decision = apply_promotion_stage(decision, settings)
@@ -531,9 +580,6 @@ def run_portfolio_allocator(client, records, supervisor_config, watchers, projec
     decision["status"] = "allocation_completed"
     decision["refresh_rejections"] = refresh_rejections
     execution_records = []
-    promotion_stage = settings.get(
-        "promotion_stage", "shadow" if settings.get("shadow_mode", True) else "full"
-    )
     if promotion_stage != "shadow":
         watcher_by_symbol = {watcher["symbol"]: watcher for watcher in watchers}
         for selected in decision["selected"]:
@@ -768,6 +814,7 @@ def main():
     args = parser.parse_args()
 
     watchers_config_path = Path(args.config).resolve()
+    watcher_reloader = WatcherListReloader(watchers_config_path)
     project_root, supervisor_config, watchers = load_supervisor_config(args.config)
     os.chdir(project_root)
 
@@ -799,6 +846,8 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor:
         while not stop_requested:
+            if not args.once:
+                supervisor_config, watchers = watcher_reloader.reload(supervisor_config, watchers)
             due = due_watchers(watchers)
             allocator_enabled = (
                 supervisor_config.get("portfolio_allocator") or {}

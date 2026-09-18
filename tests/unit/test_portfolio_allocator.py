@@ -1,6 +1,7 @@
 from traderbot.portfolio_allocator import allocate_candidates, classify_exposure_regime
 from traderbot.monitoring import supervisor
 from unittest.mock import patch
+import pytest
 
 
 def candidate(symbol, score, rr=2, notional=1000, risk=100, sector="Tech", factor="Growth"):
@@ -138,6 +139,38 @@ def test_supervisor_live_allocation_issues_bar_bound_authorization(tmp_path):
         {"symbol": "AAA", "status": "dynamic_reentry_order_submitted"}
     ]
     assert len(executions) == 1
+
+
+@pytest.mark.parametrize("settings, stage", [
+    ({"promotion_stage": "full"}, "full"),
+    ({"promotion_stage": "full", "shadow_mode": True}, "full"),
+    ({"promotion_stage": "shadow", "shadow_mode": False}, "shadow"),
+    ({"promotion_stage": "partial_allocation"}, "partial_allocation"),
+    ({"promotion_stage": "small_notional"}, "small_notional"),
+    ({"shadow_mode": False}, "full"),
+    ({}, "shadow"),
+])
+@pytest.mark.parametrize("status", [
+    "incomplete_candidate_snapshot", "candidate_snapshot_already_allocated",
+])
+def test_skipped_allocation_reports_effective_mode(tmp_path, settings, stage, status):
+    bar_time = "2026-09-02T14:30:00+00:00"
+    candidates = [{"candidate_as_of": bar_time}]
+    state = {"last_allocated_bar": bar_time}
+    if status == "incomplete_candidate_snapshot":
+        candidates.append({"candidate_as_of": None})
+    config = {"portfolio_allocator": {"enabled": True, **settings}}
+    with patch.object(supervisor, "allocation_inputs", return_value=(
+        candidates, portfolio(), state
+    )), patch.object(supervisor, "run_watcher") as runner:
+        decision, executions = supervisor.run_portfolio_allocator(
+            BrokerSnapshot(), [allocation_record()], config, [], tmp_path, {}
+        )
+    assert decision["status"] == status
+    assert decision["promotion_stage"] == stage
+    assert decision["shadow_mode"] is (stage == "shadow")
+    assert executions == []
+    runner.assert_not_called()
 
 
 def market_bars(close, ema21, ema50, slope=1):

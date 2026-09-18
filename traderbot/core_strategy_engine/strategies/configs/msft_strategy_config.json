@@ -223,12 +223,12 @@
   "risk_per_trade_percent": 0.5,
   "risk_profile": "speculative",
   "rvol_lookback_days": 35,
-  "strategy_name": "Managed dynamic reentry for PLTR",
+  "strategy_name": "Managed dynamic reentry for MSFT",
   "strategy_type": "managed_dynamic_reentry",
   "structural_stop_atr_multiple": 1.5,
   "structural_stop_buffer_atr": 0.1,
   "structural_stop_max_percent": 6,
-  "symbol": "PLTR",
+  "symbol": "MSFT",
   "trail_stop_below_current_percent": 2.5,
   "trail_trigger_step_percent": 5
 }

@@ -91,6 +91,7 @@ def orders_data(raw):
 
 class LiveStore:
     interval = 20
+    closed_interval = 900
 
     def __init__(self, root, broker=None, clock=None):
         self.root, self.broker = root, broker
@@ -125,7 +126,21 @@ class LiveStore:
                 with self.lock:
                     for section in self.data["connection"].values():
                         section["error"] = "Broker unavailable; check configuration or connectivity"
-            self.stop.wait(max(1, self.interval - (time.monotonic() - started)))
+            self.stop.wait(max(1, self.refresh_interval() - (time.monotonic() - started)))
+
+    def refresh_interval(self, data=None, now=None):
+        if data is None:
+            with self.lock:
+                data = copy.deepcopy(self.data)
+        now = now or self.clock()
+        market = data.get("market", {})
+        health = data.get("connection", {}).get("market", {})
+        if market.get("is_open") is not False or health.get("error"):
+            return self.interval
+        next_open = timestamp(market.get("next_open"))
+        if not next_open or next_open <= now:
+            return self.interval
+        return max(1, min(self.closed_interval, (next_open-now).total_seconds()))
 
     def refresh(self):
         tasks = {
@@ -216,9 +231,12 @@ class LiveStore:
         with self.lock:
             data = copy.deepcopy(self.data)
         now = self.clock()
+        cadence = self.refresh_interval(data, now)
+        data["refresh_interval_seconds"] = cadence
+        data["stream_interval_seconds"] = min(60, cadence) if cadence > self.interval else 5
         for status in data["connection"].values():
             as_of = timestamp(status["as_of"])
-            status["stale"] = bool(status["error"] or not as_of or (now - as_of).total_seconds() > 60)
+            status["stale"] = bool(status["error"] or not as_of or (now - as_of).total_seconds() > max(60, cadence + 60))
         for p in data["positions"]:
             bar = timestamp(p.get("position_health_as_of"))
             status, bar_end = assessment_bar_status(bar, now,
