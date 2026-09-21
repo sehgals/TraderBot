@@ -207,6 +207,41 @@ The harness requires matching hourly stock and benchmark data whenever live
 Position Health actions are enabled, so an active production rule cannot be
 silently omitted from a backtest.
 
+## Tastytrade Market-Data Comparison
+
+The tastytrade adapter is read-only and uses only the OAuth `read` scope. It
+renews the short-lived REST access token, obtains a DXLink quote token, and
+collects quotes, trades, and historical candles without connecting to the
+tastytrade account streamer or exposing order methods.
+
+Create a personal OAuth application and grant in tastytrade, then set these
+secrets in `.env`:
+
+```text
+TASTYTRADE_CLIENT_ID=...
+TASTYTRADE_CLIENT_SECRET=...
+TASTYTRADE_REFRESH_TOKEN=...
+```
+
+Install the DXLink transport dependency and run a comparison:
+
+```powershell
+python -m pip install -r requirements-market-data.txt
+python -m traderbot.cli.compare_tastytrade_market_data MU WDC CRDO --timeframe 5Min
+```
+
+Raw tastytrade observations are written under `runtime/market_data/tastytrade`.
+Alpaca observations remain under `runtime/market_data/alpaca`, and calculated
+differences are written under `runtime/market_data/comparisons`. Tastytrade data
+is observation-only and cannot affect entries, positions, or order submission.
+
+The watcher supervisor also runs this comparison automatically for every enabled
+watcher while the market is open. Configure its five-minute schedule, candle
+timeframe, lookback, and symbol cap in the `tastytrade_comparison` block of
+`config/watchers.json`. Collection uses its own worker so a slow data stream does
+not delay watcher decisions. Run summaries and failures are recorded in
+`runtime/logs/tastytrade_collection.jsonl`.
+
 ## Runtime Files
 
 Runtime files live outside the importable package:

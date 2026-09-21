@@ -1,7 +1,9 @@
 import datetime
 from unittest.mock import patch
+import pytest
 
 from scripts import run_risk_control_backtest as backtest
+from traderbot.backtester.swing_research import research_configs
 
 
 def bars(symbol, next_bar_low=99.0):
@@ -195,6 +197,61 @@ def test_portfolio_uses_live_catastrophic_floor_and_hard_reduction():
     assert trade["reductions"][0]["qty"] == 25
 
 
+@pytest.mark.parametrize("variant,exit_reason", [
+    ("hourly_swing", "stop_floor"),
+    ("hourly_swing_slow_trail", "end_open_mark"),
+])
+def test_swing_research_preserves_wider_stop_and_delays_trailing(variant, exit_reason):
+    symbol_bars = bars("AAA")
+    for bar in symbol_bars[62:]:
+        bar.update(c=103, h=104, l=100, o=103)
+    hourly_bars = [
+        {**symbol_bars[0], "t": symbol_bars[60]["t"] + datetime.timedelta(hours=index - 77), "l": 98}
+        for index in range(80)
+    ]
+    configs = research_configs({"AAA": {**config("AAA"), "initial_stop_loss_percent": 0.5}}, variant)
+    original_plan = signal_on_bar_60({"AAA": symbol_bars[60]["t"]})
+
+    def research_plan(*args, candidate_transform=None, **kwargs):
+        plan = original_plan(*args, **kwargs)
+        if plan["status"] == "active_signal":
+            plan.update(stop_price=99, target_price=110)
+            candidate_transform(plan)
+        return plan
+
+    with patch.object(backtest, "dynamic_entry_plan", research_plan):
+        result = backtest.simulate_portfolio(
+            configs, {"AAA": symbol_bars}, symbol_bars, starting_equity=10000,
+            health_bars_by_symbol={"AAA": hourly_bars})
+    trade = result["trades_detail"][0]
+    assert trade["episode"]["initial_stop_price"] == 97.5
+    assert trade["base_qty"] == 20
+    assert trade["exit_reason"] == exit_reason
+
+
+def test_enforced_hourly_gate_requires_research_data():
+    with pytest.raises(ValueError, match="requires 1Hour bars for AAA"):
+        backtest.simulate_portfolio(
+            research_configs({"AAA": config("AAA")}, "hourly_gate"),
+            {"AAA": bars("AAA")}, bars("AAA"))
+
+
+def test_hourly_gate_applies_before_candidate_selection():
+    symbol_bars = bars("AAA")
+    now = symbol_bars[-1]["t"] + datetime.timedelta(minutes=5)
+    context = {"as_of": (now - datetime.timedelta(hours=1)).isoformat(),
+               "latest_bar": {"c": 90, "ema21": 95, "ema50": 96, "ema21_slope": -1}}
+    plan = backtest.dynamic_entry_plan(
+        "AAA", symbol_bars, symbol_bars, ignore_ledger=True,
+        config={**config("AAA"), "position_health": {"entry_gate_mode": "enforce"}},
+        filter_context={"hourly_entry_context": context, "evaluated_at": now})
+    for candidate in plan["entry_candidates"]:
+        if candidate["model_id"] in ("pullback_reclaim", "breakout_continuation"):
+            assert candidate["status"] == "watch"
+            assert "hourly_structural_trend_failure" in candidate["hard_blockers"]
+    assert plan["model_id"] not in ("pullback_reclaim", "breakout_continuation")
+
+
 def test_legacy_ladder_trigger_is_observation_only_in_backtest():
     symbol_bars = bars("AAA")
     symbol_bars[62].update({"o": 97.5, "h": 98.0, "l": 97.5, "c": 97.5})
@@ -260,20 +317,29 @@ def test_confirmed_position_health_reduction_is_simulated():
         "state": "At Risk",
         "recommended_action": "reduce",
         "data_fresh": True,
+        "data_complete": True,
         "remaining_r": 1.0,
         "components": {"trend_checks": {}},
     }
 
+    hourly_bars = [
+        {**symbol_bars[0], "t": symbol_bars[60]["t"] + datetime.timedelta(hours=index - 77)}
+        for index in range(80)
+    ]
+
+    def assessed_health(position, episode, context, protection, settings, now):
+        return {**health, "as_of": context["as_of"], "bar_id": context["bar_id"]}
+
     with (
         patch.object(backtest, "dynamic_entry_plan", signal_on_bar_60(signal_times)),
-        patch.object(backtest, "evaluate_position_health", return_value=health),
+        patch.object(backtest, "evaluate_position_health", side_effect=assessed_health),
     ):
         result = backtest.simulate_portfolio(
             {"AAA": active_config},
             {"AAA": symbol_bars},
             symbol_bars,
             starting_equity=10_000,
-            health_bars_by_symbol={"AAA": symbol_bars, "QQQ": symbol_bars},
+            health_bars_by_symbol={"AAA": hourly_bars, "QQQ": hourly_bars},
         )
 
     trade = result["trades_detail"][0]

@@ -51,6 +51,10 @@ from traderbot.core_strategy_engine.engine import (
     trail_below_current_percent,
 )
 from traderbot.portfolio_allocator import regime_exposure_band
+from traderbot.core_strategy_engine.hourly_policy import advance_confirmation, hourly_gate_mode
+from traderbot.backtester.swing_research import (
+    VARIANTS, research_configs, transform_swing_candidate, lifecycle_metrics,
+)
 
 
 TIMEFRAME = "5Min"
@@ -543,6 +547,19 @@ def portfolio_equity(cash, positions, last_prices):
     )
 
 
+def historical_hourly_entry_context(symbol, timestamp, health_bars_by_symbol):
+    completed_at = timestamp + datetime.timedelta(minutes=5) - datetime.timedelta(hours=1)
+    bars = health_bars_by_symbol.get(symbol, [])
+    end = bisect.bisect_right([bar["t"] for bar in bars], completed_at)
+    if end < 51:
+        return {}
+    latest = dict(bars[end - 1])
+    latest["ema21_slope"] = latest["ema21"] - bars[end - 6]["ema21"]
+    stamp = latest["t"].isoformat()
+    return {"latest_bar": latest, "as_of": stamp, "bar_id": f"{symbol}:1Hour:{stamp}",
+            "structure_low": min(bar["l"] for bar in bars[end - 6:end])}
+
+
 def historical_health_context(symbol, timestamp, config, health_bars_by_symbol):
     settings = position_health_config(config)
     timeframe = str(settings.get("timeframe", "1Hour")).lower()
@@ -676,6 +693,9 @@ def simulate_portfolio(
     regime_bars_by_symbol = {"QQQ": market_bars, **(regime_bars_by_symbol or {})}
     for symbol in eligible:
         settings = position_health_config(configs[symbol])
+        if (hourly_gate_mode(configs[symbol]) == "enforce"
+                or configs[symbol].get("research_swing_stops")) and not health_bars_by_symbol.get(symbol):
+            raise ValueError(f"hourly entry research requires 1Hour bars for {symbol}")
         if settings.get("enabled", True) and not settings.get("shadow_mode", True):
             benchmark = str(
                 (settings.get("benchmark_by_symbol") or {}).get(symbol)
@@ -802,6 +822,9 @@ def simulate_portfolio(
             base_floor = managed_initial_floor_price(
                 config, entry_price, {"latest_bar": bar}
             )
+            swing_settings = config.get("research_swing_stops") or {}
+            if swing_settings:
+                base_floor = position["episode"]["initial_stop_price"]
             initial_risk = float(
                 position["episode"].get("initial_risk_per_share") or 0
             )
@@ -815,7 +838,11 @@ def simulate_portfolio(
                     else 0
                 )
             position["highest_trail_rung"] = max(position["highest_trail_rung"], rung)
-            if position["highest_trail_rung"]:
+            trail_active = bool(position["highest_trail_rung"])
+            if swing_settings.get("slow_trail"):
+                trail_active = trail_active and initial_risk > 0 and (
+                    bar["c"] - entry_price >= initial_risk * swing_settings["trail_activation_r"])
+            if trail_active:
                 trail_pct = trail_below_current_percent(
                     config, position["highest_trail_rung"]
                 )
@@ -856,15 +883,9 @@ def simulate_portfolio(
                         now=timestamp + datetime.timedelta(minutes=5),
                     )
                     action = health.get("recommended_action")
-                    if action in ("reduce", "exit"):
-                        if position.get("health_confirmation_action") == action:
-                            position["health_confirmation_count"] += 1
-                        else:
-                            position["health_confirmation_action"] = action
-                            position["health_confirmation_count"] = 1
-                    else:
-                        position["health_confirmation_action"] = action
-                        position["health_confirmation_count"] = 0
+                    position["health_confirmation"] = advance_confirmation(
+                        position.get("health_confirmation"), health,
+                        position["episode"]["episode_id"], 60)
                     position["health_last_bar_id"] = health_context["bar_id"]
                     position["latest_health"] = health
 
@@ -877,7 +898,9 @@ def simulate_portfolio(
                     ) if action in ("reduce", "exit") else 0
                     confirmed = (
                         action in ("reduce", "exit")
-                        and position["health_confirmation_count"] >= required
+                        and health.get("data_fresh") and health.get("data_complete")
+                        and position["health_confirmation"].get("action") == action
+                        and position["health_confirmation"].get("count", 0) >= required
                     )
                     if confirmed and action == "exit":
                         close_portfolio_position(symbol, bar, bar["c"], "health_exit")
@@ -1045,6 +1068,7 @@ def simulate_portfolio(
                 config, {"dynamic_entry_plan": plan}, fill_price
             )
             episode = {
+                "episode_id": f"{symbol}:{bar['t'].isoformat()}",
                 "symbol": symbol,
                 "origin_model_id": plan_model_id(plan),
                 "origin_model_version": int(plan.get("model_version") or 0),
@@ -1097,9 +1121,12 @@ def simulate_portfolio(
                 "adds": [],
                 "episode": episode,
                 "health_last_bar_id": None,
-                "health_confirmation_action": None,
-                "health_confirmation_count": 0,
+                "health_confirmation": None,
             }
+            if config.get("research_swing_stops"):
+                positions[symbol]["floor_price"] = max(
+                    float(plan["stop_price"]),
+                    fill_price * (1 - float(risk_setting(config, "catastrophic_stop_loss_percent", 8)) / 100))
             pending_orders.pop(symbol, None)
 
         # Generate new orders only after all current-bar prices and indicators are known.
@@ -1125,6 +1152,16 @@ def simulate_portfolio(
                 plan_args["filter_context"] = entry_filter_context_at(
                     symbol, timestamp
                 )
+            if hourly_gate_mode(config) != "off" or config.get("research_swing_stops"):
+                hourly_context = historical_hourly_entry_context(symbol, timestamp, health_bars_by_symbol)
+                evaluated_at = timestamp + datetime.timedelta(minutes=5)
+                plan_args["filter_context"] = {
+                    **(plan_args.get("filter_context") or {}),
+                    "hourly_entry_context": hourly_context, "evaluated_at": evaluated_at,
+                }
+                if config.get("research_swing_stops"):
+                    plan_args["candidate_transform"] = lambda candidate: transform_swing_candidate(
+                        candidate, config, hourly_context, evaluated_at)
             plan = dynamic_entry_plan(
                 symbol,
                 eligible[symbol][max(0, index - 100) : index + 1],
@@ -1368,6 +1405,7 @@ def main():
     parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
     parser.add_argument("--apply-regime-exposure-bands", action="store_true")
     parser.add_argument("--only-entry-model")
+    parser.add_argument("--research-variant", choices=VARIANTS)
     args = parser.parse_args()
     start = parse_backtest_time(args.start)
     end = parse_backtest_time(args.end)
@@ -1398,6 +1436,8 @@ def main():
     }
     configs["SPY"] = {**base_index_config, "symbol": "SPY"}
     configs["QQQ"] = {**base_index_config, "symbol": "QQQ"}
+    if args.research_variant:
+        configs = research_configs(configs, args.research_variant)
 
     market_bars = fetch_bars("QQQ", data_url, headers, start=start, end=end)
     bars_by_symbol = {}
@@ -1429,6 +1469,8 @@ def main():
         ).upper()
         if configs[symbol].get("dynamic_require_sector_regime", True):
             regime_symbols.add(benchmark)
+        if hourly_gate_mode(configs[symbol]) != "off" or configs[symbol].get("research_swing_stops"):
+            health_symbols.add(symbol)
         if settings.get("enabled", True) and not settings.get("shadow_mode", True):
             health_symbols.add(symbol)
             health_symbols.add(benchmark)
@@ -1490,6 +1532,8 @@ def main():
         "account_equity_assumption": ACCOUNT_EQUITY,
         "regime_exposure_bands_applied": args.apply_regime_exposure_bands,
         "isolated_entry_model": args.only_entry_model,
+        "research_variant": args.research_variant,
+        "lifecycle_metrics": lifecycle_metrics(simulation["trades_detail"]),
         "configuration_snapshot": {
             symbol: configs[symbol] for symbol in sorted(bars_by_symbol)
         },
@@ -1521,7 +1565,11 @@ def main():
             "shared_dynamic_entry_plan": True,
             "separate_entry_models": True,
             "deterministic_entry_arbiter": True,
-            "shared_initial_and_catastrophic_floor": True,
+            "shared_initial_and_catastrophic_floor": not bool(
+                args.research_variant and args.research_variant.startswith("hourly_swing")
+            ),
+            "shared_hourly_confirmation": True,
+            "hourly_entry_gate": True,
             "adverse_reduction": True,
             "ledger_aware_reentry": True,
             "reentry_cooldown": True,

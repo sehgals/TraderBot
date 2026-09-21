@@ -228,6 +228,7 @@ class LiveStore:
 
     def snapshot(self):
         from traderbot.core_strategy_engine.position_health import assessment_bar_status
+        from traderbot.dashboard.feed_quality import feed_quality_snapshot
         with self.lock:
             data = copy.deepcopy(self.data)
         now = self.clock()
@@ -251,4 +252,5 @@ class LiveStore:
                 p.get("position_health_data_fresh") and status == "Latest completed bar")
         data["generated_at"] = now.isoformat()
         data["operations"] = self.operations.snapshot(p["symbol"] for p in data["positions"])
+        data["feed_comparisons"] = feed_quality_snapshot(self.root)
         return data

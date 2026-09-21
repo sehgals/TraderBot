@@ -138,12 +138,6 @@
       "symbol": "TEM"
     },
     {
-      "config": "traderbot/core_strategy_engine/strategies/configs/cohr_strategy_config.json",
-      "log": "runtime/logs/cohr_watcher.jsonl",
-      "state": "runtime/state/cohr_strategy_state.json",
-      "symbol": "COHR"
-    },
-    {
       "config": "traderbot/core_strategy_engine/strategies/configs/anet_strategy_config.json",
       "log": "runtime/logs/anet_watcher.jsonl",
       "state": "runtime/state/anet_strategy_state.json",
@@ -420,12 +414,6 @@
       "symbol": "INTC"
     },
     {
-      "config": "traderbot/core_strategy_engine/strategies/configs/mu_strategy_config.json",
-      "log": "runtime/logs/mu_watcher.jsonl",
-      "state": "runtime/state/mu_strategy_state.json",
-      "symbol": "MU"
-    },
-    {
       "config": "traderbot/core_strategy_engine/strategies/configs/tm_strategy_config.json",
       "log": "runtime/logs/tm_watcher.jsonl",
       "state": "runtime/state/tm_strategy_state.json",
@@ -496,6 +484,12 @@
       "log": "runtime/logs/msft_watcher.jsonl",
       "state": "runtime/state/msft_strategy_state.json",
       "symbol": "MSFT"
+    },
+    {
+      "config": "traderbot/core_strategy_engine/strategies/configs/mu_strategy_config.json",
+      "log": "runtime/logs/mu_watcher.jsonl",
+      "state": "runtime/state/mu_strategy_state.json",
+      "symbol": "MU"
     }
   ],
   "max_concurrency": 3,
@@ -592,6 +586,16 @@
     "trail_trigger_step_percent": 5
   },
   "new_watchers": [
+    {
+      "log": "runtime/logs/candidates/tsem_watcher.jsonl",
+      "state": "runtime/state/candidates/tsem_strategy_state.json",
+      "symbol": "TSEM"
+    },
+    {
+      "log": "runtime/logs/cohr_watcher.jsonl",
+      "state": "runtime/state/cohr_strategy_state.json",
+      "symbol": "COHR"
+    },
     {
       "log": "runtime/logs/candidates/algs_watcher.jsonl",
       "state": "runtime/state/candidates/algs_strategy_state.json",
@@ -758,6 +762,7 @@
     "benchmark_symbol": "SPY",
     "catastrophic_stop_loss_percent": 8,
     "enabled": true,
+    "entry_gate_mode": "shadow",
     "exit_confirmation_bars": 2,
     "hard_reduction_loss_percent": 6,
     "health_reduction_fraction": 0.5,
@@ -777,6 +782,16 @@
     "stable_score": 65,
     "timeframe": "1Hour",
     "watch_score": 45
+  },
+  "tastytrade_comparison": {
+    "enabled": true,
+    "poll_seconds": 300,
+    "timeframe": "5Min",
+    "lookback_hours": 8,
+    "stream_seconds": 8,
+    "require_market_open": true,
+    "maximum_symbols": 100,
+    "output_root": "runtime/market_data"
   },
   "reporting": {
     "total_gain_baseline": 50000

@@ -1,4 +1,8 @@
 from traderbot.core_strategy_engine.entry_models.entry_safety import checked_quote, quote_diagnostics
+from traderbot.core_strategy_engine.hourly_policy import (
+    TREND_MODELS, advance_confirmation, apply_hourly_entry_gate,
+    hourly_entry_assessment, hourly_gate_mode,
+)
 import argparse
 import datetime
 import hashlib
@@ -850,6 +854,23 @@ def price_action_label(bar, ema21_slope):
     return "neutral"
 
 
+def live_hourly_entry_context(client, config, now=None):
+    """Fetch only completed hourly bars, independently of position ownership."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    start = iso_utc(now - datetime.timedelta(days=45))
+    session_close = position_health_session_close(client, now)
+    end = iso_utc(parse_alpaca_time(session_close) - datetime.timedelta(seconds=1)) if session_close else iso_utc(now)
+    bars = calculate_indicators(completed_market_bars(
+        client.stock_bars(config["symbol"], start, end, "1Hour"), "1Hour", now))
+    if len(bars) < 51:
+        return {}
+    latest = dict(bars[-1])
+    latest["ema21_slope"] = latest["ema21"] - bars[-6]["ema21"]
+    return {"latest_bar": latest, "as_of": latest["t"].isoformat(),
+            "bar_id": f"{config['symbol']}:1Hour:{latest['t'].isoformat()}",
+            "session_close": session_close}
+
+
 def live_bar_context(client, symbol, config, exit_trade=None):
     now = datetime.datetime.now(datetime.timezone.utc)
     lookback_days = max(
@@ -918,7 +939,12 @@ def live_bar_context(client, symbol, config, exit_trade=None):
         isinstance(spread_settings, dict) and spread_settings.get("enabled", False)
     ):
         filter_context["quote"], filter_context["quote_attempts"] = checked_quote(client, symbol, spread_settings if isinstance(spread_settings, dict) else {})
-    filter_context["evaluated_at"] = datetime.datetime.now(datetime.timezone.utc)
+    if hourly_gate_mode(config) != "off":
+        try:
+            filter_context["hourly_entry_context"] = live_hourly_entry_context(client, config, cutoff)
+        except Exception:
+            filter_context["hourly_entry_context"] = {}
+    filter_context["evaluated_at"] = cutoff
     event_calendar_path = filter_settings.get("event_calendar_path")
     if event_calendar_path:
         filter_context["event_calendar"] = load_json(event_calendar_path, {})
@@ -934,6 +960,7 @@ def dynamic_entry_plan(
     sector_bars=None,
     config=None,
     filter_context=None,
+    candidate_transform=None,
 ):
     config = config or {}
     features = build_entry_features(
@@ -958,6 +985,17 @@ def dynamic_entry_plan(
     breakout_candidate = evaluate_breakout(features, config)
     family_candidates = evaluate_signal_families(features, config)
     entry_candidates = [pullback_candidate, breakout_candidate, *family_candidates]
+    gate_mode = hourly_gate_mode(config)
+    if gate_mode != "off":
+        gate_context = (filter_context or {}).get("hourly_entry_context") or {}
+        evaluated_at = (filter_context or {}).get("evaluated_at") or bar["t"] + datetime.timedelta(minutes=5)
+        gate = hourly_entry_assessment(gate_context, evaluated_at,
+                                      (config.get("position_health") or {}).get("max_data_age_bars", 2))
+        for candidate in entry_candidates:
+            apply_hourly_entry_gate(candidate, gate, gate_mode)
+    if candidate_transform:
+        for candidate in entry_candidates:
+            candidate_transform(candidate)
     pullback_zone = pullback_candidate["pullback_zone"]
     pullback_touch_trigger = pullback_candidate["touch_trigger"]
     pullback_reclaim_trigger = pullback_candidate["reclaim_trigger"]
@@ -1010,6 +1048,7 @@ def dynamic_entry_plan(
         "factor_weights": classified_candidate.get("factor_weights"),
         "factor_contributions": classified_candidate.get("factor_contributions"),
         "trend_assessment": classified_candidate.get("trend_assessment"),
+        "hourly_entry_gate": classified_candidate.get("hourly_entry_gate"),
         "breakout_assessment": classified_candidate.get("breakout_assessment"),
         "overall_check_score": classified_candidate.get("overall_check_score"),
         "minimum_setup_score": classified_candidate.get("minimum_setup_score"),
@@ -1863,6 +1902,7 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "adverse_reduction_completed": bool(state.get("adverse_reduction_completed")),
     }
     state["position_episode"] = episode
+    state.pop("position_health_confirmation", None)
     if entry_order_id:
         state["managed_entry_order_id"] = entry_order_id
     return episode
@@ -2010,24 +2050,11 @@ def refresh_position_health(client, config, state, position, force=False):
 
     state["position_health_last_checked_at"] = iso_utc(now)
     previous = state.get("position_health") or {}
+    state["position_health_confirmation"] = advance_confirmation(
+        state.get("position_health_confirmation"), assessment, episode.get("episode_id"),
+        timeframe_minutes(settings.get("timeframe", "1Hour")))
     if not force and assessment == previous:
         return previous
-    confirmation = state.get("position_health_confirmation") or {}
-    if assessment.get("bar_id") and assessment.get("bar_id") != previous.get("bar_id"):
-        action = assessment.get("recommended_action")
-        if action in ("reduce", "exit"):
-            count = confirmation.get("count", 0) + 1 if confirmation.get("action") == action else 1
-            state["position_health_confirmation"] = {
-                "action": action,
-                "count": count,
-                "last_bar_id": assessment["bar_id"],
-            }
-        else:
-            state["position_health_confirmation"] = {
-                "action": action,
-                "count": 0,
-                "last_bar_id": assessment["bar_id"],
-            }
     state["position_health"] = assessment
     state["position_health_last_evaluated_at"] = iso_utc(now)
     episode["current_qty"] = position_quantity(position)
@@ -2655,6 +2682,17 @@ def validate_entry_submission(client, config, plan):
         reasons.append("stale_entry_plan")
     if plan.get("status") != "active_signal" or plan.get("hard_blockers"):
         reasons.append("entry_signal_inactive")
+    gate = None
+    mode = hourly_gate_mode(config)
+    if mode != "off" and plan.get("model_id") in TREND_MODELS:
+        try:
+            context = live_hourly_entry_context(client, config, now)
+        except Exception:
+            context = {}
+        gate = {**hourly_entry_assessment(context, now,
+                (config.get("position_health") or {}).get("max_data_age_bars", 2)), "mode": mode}
+        if mode == "enforce":
+            reasons.extend(gate["reasons"])
     settings = (config.get("entry_filters") or {}).get("spread") or {}
     settings = settings if isinstance(settings, dict) else {}
     quote, attempts = checked_quote(client, config["symbol"], settings)
@@ -2678,7 +2716,7 @@ def validate_entry_submission(client, config, plan):
             reasons.append("execution_chase_limit")
     result = {"passed": not reasons, "reasons": sorted(set(reasons)), "quote": diagnostics,
               "quote_attempts": attempts, "rounded_limit_price": entry, "reward_risk": rr,
-              "checked_at": iso_utc(now)}
+              "checked_at": iso_utc(now), "hourly_entry_gate": gate}
     plan["submission_validation"] = result
     return result
 

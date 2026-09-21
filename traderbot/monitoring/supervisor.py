@@ -29,6 +29,7 @@ from traderbot.core_strategy_engine.strategies import (
 from traderbot.broker.execution_gateway import ExecutionGateway
 from traderbot.portfolio_allocator import allocate_candidates, classify_exposure_regime
 from traderbot.shadow_deployment import apply_promotion_stage, update_shadow_ledger
+from traderbot.data.tastytrade_collector import collect_tastytrade_comparison
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -40,6 +41,7 @@ MARGIN_REDUCTION_LOG = RUNTIME_LOG_DIR / "margin_reduction.jsonl"
 POSITION_HEALTH_ALERT_LOG = RUNTIME_LOG_DIR / "position_health_alerts.jsonl"
 PORTFOLIO_ALLOCATION_STATE = RUNTIME_STATE_DIR / "portfolio_allocation_state.json"
 PORTFOLIO_ALLOCATION_LOG = RUNTIME_LOG_DIR / "portfolio_allocations.jsonl"
+TASTYTRADE_COLLECTION_LOG = RUNTIME_LOG_DIR / "tastytrade_collection.jsonl"
 
 
 def utc_now():
@@ -48,6 +50,22 @@ def utc_now():
 
 def iso_now():
     return utc_now().isoformat()
+
+
+def record_tastytrade_collection(project_root, future):
+    try:
+        result = future.result()
+    except Exception as exc:
+        result = {
+            "status": "tastytrade_collection_error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    append_jsonl(
+        project_root / TASTYTRADE_COLLECTION_LOG,
+        {"timestamp": iso_now(), "result": result},
+    )
+    print(json.dumps({"timestamp": iso_now(), **result}, sort_keys=True), flush=True)
 
 
 def resolve_path(project_root, path):
@@ -840,12 +858,22 @@ def main():
         int(supervisor_config.get("auto_margin_reduction", {}).get("poll_seconds", 300)),
     )
     next_margin_reduction_at = 0.0
+    tastytrade_settings = supervisor_config.get("tastytrade_comparison") or {}
+    tastytrade_interval = max(60, int(tastytrade_settings.get("poll_seconds", 300)))
+    next_tastytrade_collection_at = 0.0
+    tastytrade_future = None
 
     for index, watcher in enumerate(watchers):
         watcher["next_run_at"] = 0.0 if args.once else time.monotonic() + index
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+    with (
+        concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as executor,
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) as collector_executor,
+    ):
         while not stop_requested:
+            if tastytrade_future is not None and tastytrade_future.done():
+                record_tastytrade_collection(project_root, tastytrade_future)
+                tastytrade_future = None
             if not args.once:
                 supervisor_config, watchers = watcher_reloader.reload(supervisor_config, watchers)
             due = due_watchers(watchers)
@@ -860,7 +888,12 @@ def main():
                     and item.get("enabled")
                     and item["symbol"] not in due_symbols
                 )
-            if not due:
+            collector_due = (
+                tastytrade_settings.get("enabled", False)
+                and tastytrade_future is None
+                and time.monotonic() >= next_tastytrade_collection_at
+            )
+            if not due and not collector_due:
                 if args.once:
                     break
                 time.sleep(scheduler_sleep)
@@ -874,6 +907,42 @@ def main():
                     "timestamp": iso_now(),
                     "next_open": None,
                 }
+
+            if collector_due:
+                require_open = tastytrade_settings.get("require_market_open", True)
+                if require_open and not clock.get("is_open"):
+                    result = {
+                        "status": "tastytrade_collection_skipped",
+                        "reason": "market_closed",
+                    }
+                    append_jsonl(
+                        project_root / TASTYTRADE_COLLECTION_LOG,
+                        {"timestamp": iso_now(), "result": result},
+                    )
+                else:
+                    collection_symbols = [
+                        watcher["symbol"] for watcher in watchers if watcher.get("enabled")
+                    ]
+                    observed_at = datetime.datetime.fromisoformat(
+                        str(clock.get("timestamp") or iso_now()).replace("Z", "+00:00")
+                    )
+                    tastytrade_future = collector_executor.submit(
+                        collect_tastytrade_comparison,
+                        tastytrade_settings,
+                        collection_symbols,
+                        project_root,
+                        observed_at,
+                    )
+                next_tastytrade_collection_at = time.monotonic() + tastytrade_interval
+
+            if not due:
+                if args.once:
+                    if tastytrade_future is not None:
+                        record_tastytrade_collection(project_root, tastytrade_future)
+                        tastytrade_future = None
+                    break
+                time.sleep(scheduler_sleep)
+                continue
 
             if time.monotonic() >= next_margin_reduction_at:
                 try:
@@ -986,7 +1055,13 @@ def main():
                 )
 
             if args.once:
+                if tastytrade_future is not None:
+                    record_tastytrade_collection(project_root, tastytrade_future)
+                    tastytrade_future = None
                 break
+
+        if tastytrade_future is not None:
+            record_tastytrade_collection(project_root, tastytrade_future)
 
     return 0
 

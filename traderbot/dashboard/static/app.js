@@ -76,6 +76,17 @@ function OperationsView({data}) {
   h('section',{className:'panel'},h('h2',null,'Recent watcher activity'),table(['Time','Symbol','Event','Failures','Next run'],data.activity.filter(matches).slice(0,limit).map(a=>[stamp(a.timestamp),a.symbol,human(a.status),a.failures??'—',a.next_run_seconds==null?'—':`${a.next_run_seconds}s`]),'No activity in the recent log window.'))
  );
 }
+function FeedComparisonView({rows}) {
+ const [symbol,setSymbol]=React.useState('');
+ const filtered=(rows||[]).filter(row=>row.symbol.toLowerCase().includes(symbol.trim().toLowerCase()));
+ const n=(value,digits=2)=>value==null?'Unavailable':Number(value).toFixed(digits);
+ const tone=score=>score>=80?'green':score>=65?'neutral':'amber';
+ return h('section',{className:'panel'},
+  h('div',{className:'section-head'},h('div',null,h('h2',null,'Feed comparison by ticker'),h('p',{className:'muted'},'Rolling Alpaca versus tastytrade quality score. This is diagnostic and does not change trading decisions.')),h('input',{'aria-label':'Filter feed comparisons by symbol',placeholder:'Filter by symbol',value:symbol,onChange:e=>setSymbol(e.target.value)})),
+  table(['Symbol','Score','Preferred feed','Samples','Median difference','Bar completeness','Latest comparison'],filtered.map(row=>[
+   row.symbol,pill(`${row.score} · ${row.grade}`,tone(row.score)),h('div',null,h('b',null,human(row.preferred_source)),h('small',null,row.reason)),row.samples,`${n(row.median_midpoint_difference_bps)} bps`,`${n(row.bar_completeness_percent)}%`,stamp(row.observed_at)
+  ]),'No tastytrade comparison records are available yet.'));
+}
 function OrdersView({data}) {
  const [symbol,setSymbol]=React.useState(''),[status,setStatus]=React.useState('all');
  const orders=data.orders.filter(o=>(o.symbol||'').toLowerCase().includes(symbol.trim().toLowerCase())&&(status==='all'||o.status===status));
@@ -131,6 +142,7 @@ function App() {
     human(p.position_health_action),h('div',null,money(p.position_health_stop_price),h('small',null,`${p.position_health_stop_qty??0} / ${p.qty} shares`)),h('div',null,`Bar: ${stamp(p.position_health_as_of)}${p.position_health_bar_end?' ? '+stamp(p.position_health_bar_end):''}`,live&&h('small',null,`${p.position_health_source||'No assessment'} | Evaluated ${stamp(p.position_health_evaluated_at)}`))
    ]),data.status!=='available'?'Positions unavailable until a valid report is loaded.':data.positions.length?'No positions match this filter.':'This report contains no open positions.')),
   live&&h(OrdersView,{data}),
+  live&&h(FeedComparisonView,{rows:data.feed_comparisons}),
   live&&data.operations&&h(OperationsView,{data:data.operations}),
   h('footer',null,live?`Read-only | View updates every ${data.stream_interval_seconds||5} seconds | Times shown in your browser time zone`:'Read-only saved report | Refresh reloads the latest report file | All times shown in your browser time zone')
  );
