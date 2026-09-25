@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,14 +57,39 @@ class MarginReductionTests(unittest.TestCase):
     def test_sells_weakest_position_with_incremental_cap(self):
         client = FakeClient()
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / "runtime" / "state").mkdir(parents=True)
-            result = run_margin_reducer(client, self.config, Path(directory), {"is_open": True})
+            root = Path(directory)
+            state_dir = root / "runtime" / "state"
+            state_dir.mkdir(parents=True)
+            watcher_state = state_dir / "loss_strategy_state.json"
+            watcher_state.write_text(
+                json.dumps({"position_episode": {"episode_id": "LOSS:entry-1"}}),
+                encoding="utf-8",
+            )
+            config = {
+                **self.config,
+                "managed_watchers": [
+                    {
+                        "symbol": "LOSS",
+                        "state": "runtime/state/loss_strategy_state.json",
+                    }
+                ],
+            }
+            result = run_margin_reducer(client, config, root, {"is_open": True})
+            saved_state = json.loads(watcher_state.read_text(encoding="utf-8"))
 
         self.assertEqual(result["status"], "margin_reduction_order_submitted")
         self.assertEqual(result["symbol"], "LOSS")
         self.assertEqual(result["qty"], 10)
         self.assertEqual(client.canceled, ["buy-1", "stop-1"])
         self.assertEqual(client.submitted[0]["side"], "sell")
+        self.assertEqual(
+            saved_state["exit_order_intents"]["sell-1"]["exit_reason"],
+            "portfolio_margin_reduction",
+        )
+        self.assertEqual(
+            saved_state["exit_order_intents"]["sell-1"]["episode_id"],
+            "LOSS:entry-1",
+        )
 
 
 if __name__ == "__main__":

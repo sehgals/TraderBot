@@ -36,7 +36,7 @@ def collect_tastytrade_comparison(settings, symbols, project_root, observed_at=N
     for symbol in selected:
         try:
             common = {
-                "schema_version": 1, "symbol": symbol, "observed_at": end_text,
+                "schema_version": 2, "symbol": symbol, "observed_at": end_text,
                 "timeframe": timeframe, "start": start_text, "end": end_text,
             }
             alpaca_record = {

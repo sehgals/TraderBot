@@ -26,14 +26,18 @@ from traderbot.core_strategy_engine.engine import (
     position_health_market_context,
     reconcile_flat_position_state,
     resolve_adverse_reduction_order,
+    resolve_winner_partial_order,
+    runner_stop_price,
     run_once,
     submit_confirmed_health_action,
     submit_position_health_add,
     submit_adverse_reduction,
+    submit_winner_partial_exit,
     structural_stop_price,
     trail_below_current_percent,
     update_dynamic_pending_order,
     update_stop_order,
+    winner_trigger_details,
 )
 
 
@@ -116,6 +120,112 @@ class FakeHealthClient(FakeClient):
 
 
 class RiskControlTests(unittest.TestCase):
+    def test_winner_candidate_sells_half_at_two_r_and_keeps_runner(self):
+        position = {"symbol": "WAT", "qty": "10", "avg_entry_price": "100"}
+        state = {
+            "position_health_atr14": 4,
+            "position_episode": {
+                "episode_id": "WAT:entry-1",
+                "initial_qty": 10,
+                "initial_risk_per_share": 5,
+            }
+        }
+        config = {
+            "symbol": "WAT",
+            "winner_management": {
+                "enabled": True,
+                "partial_exit_fraction": 0.5,
+                "partial_exit_trigger_r": 2,
+            },
+        }
+
+        below = winner_trigger_details(config, state, position, 109.99, 95)
+        at_trigger = winner_trigger_details(config, state, position, 110, 95)
+
+        self.assertFalse(below["eligible"])
+        self.assertTrue(at_trigger["eligible"])
+        self.assertEqual(at_trigger["sell_qty"], 5)
+        self.assertEqual(at_trigger["runner_qty"], 5)
+
+    def test_winner_partial_exit_records_intent_and_cancels_stop(self):
+        position = {"symbol": "WAT", "qty": "10", "avg_entry_price": "100"}
+        client = FakeClient(position=position, orders=[{
+            "id": "stop-1", "symbol": "WAT", "side": "sell", "type": "stop",
+            "status": "new", "qty": "10", "stop_price": "95",
+        }])
+        state = {
+            "active_stop_order_id": "stop-1",
+            "position_health_atr14": 4,
+            "position_episode": {
+                "episode_id": "WAT:entry-1", "initial_qty": 10,
+                "initial_risk_per_share": 5,
+            },
+        }
+        config = {"symbol": "WAT", "winner_management": {"enabled": True}}
+
+        result = submit_winner_partial_exit(client, config, state, position, 110, 95)
+
+        self.assertEqual(result["status"], "winner_partial_exit_submitted")
+        self.assertEqual(client.canceled, ["stop-1"])
+        self.assertEqual(client.submitted[0]["qty"], "5")
+        self.assertEqual(
+            state["exit_order_intents"]["new-1"]["exit_reason"],
+            "profit_tranche_2r",
+        )
+
+    def test_winner_candidate_refuses_live_broker_endpoint(self):
+        position = {"symbol": "WAT", "qty": "10", "avg_entry_price": "100"}
+        client = FakeClient(position=position)
+        client.trade_base_url = "https://api.alpaca.markets"
+        state = {
+            "position_health_atr14": 4,
+            "position_episode": {
+                "episode_id": "WAT:entry-1", "initial_qty": 10,
+                "initial_risk_per_share": 5,
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "paper account"):
+            submit_winner_partial_exit(
+                client,
+                {"symbol": "WAT", "winner_management": {"enabled": True}},
+                state,
+                position,
+                110,
+                95,
+            )
+
+    def test_filled_winner_partial_starts_ratcheting_atr_runner(self):
+        order = {
+            "id": "partial-1", "status": "filled", "qty": "5", "filled_qty": "5",
+            "filled_avg_price": "111", "filled_at": "2026-09-24T15:00:00Z",
+        }
+        client = FakeClient(orders=[order])
+        state = {
+            "winner_partial_order_id": "partial-1",
+            "floor_price": 108,
+            "highest_trail_rung": 2,
+            "position_health_atr14": 4,
+            "position_episode": {"episode_id": "WAT:entry-1"},
+            "exit_order_intents": {"partial-1": {
+                "episode_id": "WAT:entry-1", "exit_reason": "profit_tranche_2r",
+            }},
+        }
+
+        result = resolve_winner_partial_order(client, state)
+        first_stop = runner_stop_price(
+            {"winner_management": {"enabled": True}}, state, 120, 95
+        )
+        retained_stop = runner_stop_price(
+            {"winner_management": {"enabled": True}}, state, 115, 95
+        )
+
+        self.assertEqual(result["status"], "winner_partial_exit_filled")
+        self.assertTrue(state["winner_partial_completed"])
+        self.assertNotIn("floor_price", state)
+        self.assertEqual(first_stop, 110)
+        self.assertEqual(retained_stop, 110)
+
     def test_ladder_trigger_is_observation_only(self):
         observations, _detail = observe_ladder_opportunities(
             {

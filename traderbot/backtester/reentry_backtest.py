@@ -67,15 +67,31 @@ class AlpacaData:
         return self.request(self.data_base_url, path)
 
     def fills(self, start):
-        query = urllib.parse.urlencode(
-            {
+        fills = []
+        page_token = None
+        seen_page_tokens = set()
+        while True:
+            params = {
                 "activity_types": "FILL",
                 "after": start,
                 "direction": "asc",
                 "page_size": "100",
             }
-        )
-        return self.trading(f"/account/activities?{query}") or []
+            if page_token:
+                params["page_token"] = page_token
+            payload = self.trading(
+                f"/account/activities?{urllib.parse.urlencode(params)}"
+            ) or []
+            if isinstance(payload, dict):
+                page = payload.get("activities", [])
+                page_token = payload.get("next_page_token")
+            else:
+                page = payload
+                page_token = page[-1].get("id") if len(page) == 100 else None
+            fills.extend(page)
+            if not page_token or page_token in seen_page_tokens:
+                return fills
+            seen_page_tokens.add(page_token)
 
     def bars(self, symbol, start, end, timeframe):
         bars = []
@@ -111,6 +127,7 @@ def load_strategy_configs(watchers_path):
     global_position_health = supervisor_config.get("position_health") or {}
     global_entry_filters = supervisor_config.get("entry_filters") or {}
     global_portfolio_allocator = supervisor_config.get("portfolio_allocator") or {}
+    global_winner_management = supervisor_config.get("winner_management") or {}
     managed_defaults = supervisor_config.get("managed_watcher_defaults", {})
     configs = {}
     for watcher in supervisor_config.get("managed_watchers", supervisor_config.get("watchers", [])):
@@ -128,6 +145,10 @@ def load_strategy_configs(watchers_path):
             **global_portfolio_allocator,
             **(config.get("portfolio_allocator") or {}),
         }
+        config["winner_management"] = {
+            **global_winner_management,
+            **(config.get("winner_management") or {}),
+        }
         configs[config["symbol"]] = config
     new_defaults = supervisor_config.get("new_watcher_defaults", {})
     for watcher in supervisor_config.get("new_watchers", []):
@@ -144,6 +165,10 @@ def load_strategy_configs(watchers_path):
         config["portfolio_allocator"] = {
             **global_portfolio_allocator,
             **(config.get("portfolio_allocator") or {}),
+        }
+        config["winner_management"] = {
+            **global_winner_management,
+            **(config.get("winner_management") or {}),
         }
         configs[config["symbol"]] = config
     return configs
@@ -255,6 +280,7 @@ def calculate_indicators(raw_bars):
 def pair_completed_trades(fills, symbols):
     fills = aggregate_order_fills(fills, symbols)
     lots = defaultdict(list)
+    episode_ids = {}
     exits = []
     for fill in fills:
         symbol = fill.get("symbol")
@@ -266,6 +292,11 @@ def pair_completed_trades(fills, symbols):
         price = float(fill["price"])
         timestamp = parse_time(fill["transaction_time"])
         if side == "buy":
+            if not lots[symbol]:
+                episode_ids[symbol] = (
+                    fill.get("episode_id")
+                    or f"{symbol}:{fill.get('order_id') or fill['transaction_time']}"
+                )
             lots[symbol].append({"qty": qty, "price": price, "time": timestamp})
             continue
 
@@ -296,8 +327,14 @@ def pair_completed_trades(fills, symbols):
                     "avg_entry": avg_entry,
                     "exit_price": price,
                     "realized_pl": realized_pl,
+                    "episode_id": fill.get("episode_id") or episode_ids.get(symbol),
+                    "exit_order_id": fill.get("order_id"),
+                    "exit_reason": fill.get("exit_reason") or "unknown",
                 }
             )
+
+        if not lots[symbol]:
+            episode_ids.pop(symbol, None)
 
     return exits
 
@@ -320,6 +357,8 @@ def aggregate_order_fills(fills, symbols):
                 "qty": 0.0,
                 "notional": 0.0,
                 "order_id": order_id,
+                "episode_id": fill.get("episode_id"),
+                "exit_reason": fill.get("exit_reason"),
             }
             order_sequence.append(key)
 
@@ -343,6 +382,8 @@ def aggregate_order_fills(fills, symbols):
                 "qty": str(order["qty"]),
                 "price": str(order["notional"] / order["qty"]),
                 "order_id": order["order_id"],
+                "episode_id": order.get("episode_id"),
+                "exit_reason": order.get("exit_reason"),
                 "type": "aggregated_fill",
             }
         )

@@ -37,8 +37,18 @@ def _score(symbol, records):
         abs(value) for value in (_number(row.get("midpoint_difference_bps")) for row in records)
         if value is not None
     ])
-    primary_bars = sum(_number(row.get(f"{primary}_bar_count")) or 0 for row in records)
-    secondary_bars = sum(_number(row.get(f"{secondary}_bar_count")) or 0 for row in records)
+    primary_bars = sum(
+        (_number(row.get(f"{primary}_bar_count_in_window")) or 0)
+        if row.get(f"{primary}_bar_count_in_window") is not None
+        else _number(row.get(f"{primary}_bar_count")) or 0
+        for row in records
+    )
+    secondary_bars = sum(
+        (_number(row.get(f"{secondary}_bar_count_in_window")) or 0)
+        if row.get(f"{secondary}_bar_count_in_window") is not None
+        else _number(row.get(f"{secondary}_bar_count")) or 0
+        for row in records
+    )
     largest_bar_total = max(primary_bars, secondary_bars)
     bar_ratio = min(primary_bars, secondary_bars) / largest_bar_total if largest_bar_total else 0
     primary_spread = _median([_number(row.get(f"{primary}_spread_percent")) for row in records])
@@ -100,7 +110,11 @@ def feed_quality_snapshot(root, maximum_days=20):
             symbol = str(row.get("symbol") or "").upper()
             if symbol and row.get("secondary_source") == "tastytrade":
                 grouped[symbol].append(row)
-    return sorted((_score(symbol, rows) for symbol, rows in grouped.items()),
+    corrected = {}
+    for symbol, rows in grouped.items():
+        version_two = [row for row in rows if int(row.get("schema_version") or 1) >= 2]
+        corrected[symbol] = version_two or rows
+    return sorted((_score(symbol, rows) for symbol, rows in corrected.items()),
                   key=lambda row: row["symbol"])
 
 
