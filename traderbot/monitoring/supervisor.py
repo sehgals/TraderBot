@@ -21,6 +21,7 @@ from traderbot.core_strategy_engine.engine import (
     refresh_dynamic_plan_only,
     timeframe_minutes,
     parse_alpaca_time,
+    record_exit_intent,
 )
 from traderbot.core_strategy_engine.strategies import (
     DEFAULT_STRATEGY_TYPE,
@@ -309,6 +310,10 @@ def run_watcher(client, watcher, supervisor_config, clock, config_overrides=None
     strategy_config["position_health"] = {
         **(supervisor_config.get("position_health") or {}),
         **(strategy_config.get("position_health") or {}),
+    }
+    strategy_config["winner_management"] = {
+        **(supervisor_config.get("winner_management") or {}),
+        **(strategy_config.get("winner_management") or {}),
     }
     strategy_config["entry_filters"] = {
         **(supervisor_config.get("entry_filters") or {}),
@@ -806,6 +811,21 @@ def run_margin_reducer(client, supervisor_config, project_root, clock):
                 ),
             }
         )
+        watcher = next(
+            (
+                item
+                for item in supervisor_config.get(
+                    "managed_watchers", supervisor_config.get("watchers", [])
+                )
+                if item.get("symbol") == symbol and item.get("state")
+            ),
+            None,
+        )
+        if watcher:
+            watcher_state_path = resolve_path(project_root, watcher["state"])
+            watcher_state = load_json(watcher_state_path, {})
+            record_exit_intent(watcher_state, order, "portfolio_margin_reduction")
+            save_json(watcher_state_path, watcher_state)
     state["submitted_notional"] = round(submitted + estimated_notional, 2)
     state["last_order_id"] = order.get("id")
     state["last_symbol"] = symbol

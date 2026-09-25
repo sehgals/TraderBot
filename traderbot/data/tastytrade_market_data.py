@@ -34,7 +34,10 @@ def _number(value):
 
 def _iso_millis(value):
     try:
-        return dt.datetime.fromtimestamp(float(value) / 1000, UTC).isoformat().replace(
+        milliseconds = float(value)
+        if not math.isfinite(milliseconds) or milliseconds <= 0:
+            return None
+        return dt.datetime.fromtimestamp(milliseconds / 1000, UTC).isoformat().replace(
             "+00:00", "Z"
         )
     except (TypeError, ValueError, OSError):
@@ -216,7 +219,8 @@ class TastytradeMarketDataClient:
                             "acceptEventFields": EVENT_FIELDS})
             self._receive_until(ws, lambda msg: msg.get("type") == "FEED_CONFIG", deadline)
             additions = []
-            from_time = int(start_at.timestamp())
+            # DXLink time-series subscriptions use Unix epoch milliseconds.
+            from_time = int(start_at.timestamp() * 1000)
             for symbol in symbols:
                 additions.extend([
                     {"type": "Quote", "symbol": symbol},
@@ -228,14 +232,40 @@ class TastytradeMarketDataClient:
                             "reset": True, "add": additions})
             if hasattr(ws, "settimeout"):
                 ws.settimeout(min(1.0, max(0.1, wait_seconds)))
-            return self._collect_events(ws, symbols, period, wait_seconds)
+            snapshot = self._collect_events(
+                ws, symbols, period, wait_seconds, start_at=start_at
+            )
         finally:
             ws.close()
 
-    def _collect_events(self, ws, symbols, period, wait_seconds):
+        missing_quotes = [
+            symbol
+            for symbol, item in snapshot.items()
+            if item["quote"].get("bid_price") is None
+            or item["quote"].get("ask_price") is None
+        ]
+        if missing_quotes:
+            try:
+                rest_quotes = self.latest_quotes(missing_quotes)
+            except (OSError, RuntimeError, TimeoutError, ValueError):
+                rest_quotes = {}
+            for symbol in missing_quotes:
+                rest_quote = rest_quotes.get(symbol)
+                if rest_quote and rest_quote.get("bid_price") is not None \
+                        and rest_quote.get("ask_price") is not None:
+                    rest_quote = dict(rest_quote)
+                    rest_quote["feed"] = "tastytrade_rest_fallback"
+                    snapshot[symbol]["quote"] = rest_quote
+        return snapshot
+
+    def _collect_events(self, ws, symbols, period, wait_seconds, start_at=None):
         quotes = {symbol: {"feed": "tastytrade_dxlink", "symbol": symbol,
                            "conditions": []} for symbol in symbols}
         bars = {symbol: [] for symbol in symbols}
+        collected_from = start_at or dt.datetime.min.replace(tzinfo=UTC)
+        if collected_from.tzinfo is None:
+            collected_from = collected_from.replace(tzinfo=UTC)
+        collected_from = collected_from.astimezone(UTC)
         deadline = time.monotonic() + wait_seconds
         last_keepalive = time.monotonic()
         while time.monotonic() < deadline:
@@ -262,16 +292,21 @@ class TastytradeMarketDataClient:
                         "ask_price": _number(event.get("askPrice")),
                         "bid_size": _number(event.get("bidSize")),
                         "ask_size": _number(event.get("askSize")),
-                        "timestamp": _iso_millis(event.get("eventTime")),
+                        "received_at": dt.datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     })
+                    event_timestamp = _iso_millis(event.get("eventTime"))
+                    if event_timestamp:
+                        quotes[symbol]["timestamp"] = event_timestamp
                 elif event_type == "Trade":
                     quotes[symbol].update({
                         "last_price": _number(event.get("price")),
                         "last_size": _number(event.get("size")),
                         "volume": _number(event.get("dayVolume")),
-                        "timestamp": _iso_millis(event.get("time"))
-                        or quotes[symbol].get("timestamp"),
+                        "received_at": dt.datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     })
+                    trade_timestamp = _iso_millis(event.get("time"))
+                    if trade_timestamp:
+                        quotes[symbol]["timestamp"] = trade_timestamp
                 elif event_type == "Candle":
                     bars[symbol].append({
                         "t": _iso_millis(event.get("time")),
@@ -280,7 +315,16 @@ class TastytradeMarketDataClient:
                         "v": _number(event.get("volume")), "feed": "tastytrade_dxlink",
                     })
         for symbol in bars:
-            by_timestamp = {bar["t"]: bar for bar in bars[symbol] if bar["t"]}
+            collected_until = dt.datetime.now(UTC)
+            by_timestamp = {}
+            for bar in bars[symbol]:
+                timestamp = bar.get("t")
+                try:
+                    parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if collected_from <= parsed.astimezone(UTC) <= collected_until:
+                    by_timestamp[timestamp] = bar
             bars[symbol] = [by_timestamp[key] for key in sorted(by_timestamp)]
         return {symbol: {"quote": quotes[symbol], "bars": bars[symbol],
                          "candle_period": period} for symbol in symbols}

@@ -29,3 +29,30 @@ def test_feed_quality_scores_each_ticker(tmp_path):
     assert result[0]["score"] >= 90
     assert result[0]["preferred_source"] == "tastytrade"
     assert result[0]["samples"] == 20
+
+
+def test_feed_quality_ignores_legacy_records_after_corrected_schema_arrives(tmp_path):
+    directory = tmp_path / "runtime/market_data/comparisons"
+    directory.mkdir(parents=True)
+    rows = [
+        {
+            "schema_version": 1, "symbol": "MU", "observed_at": "2026-09-18T14:00:00Z",
+            "primary_source": "alpaca", "secondary_source": "tastytrade",
+            "alpaca_bar_count": 1, "tastytrade_bar_count": 80,
+        },
+        {
+            "schema_version": 2, "symbol": "MU", "observed_at": "2026-09-18T15:00:00Z",
+            "primary_source": "alpaca", "secondary_source": "tastytrade",
+            "alpaca_bar_count_in_window": 12, "tastytrade_bar_count_in_window": 10,
+            "alpaca_midpoint": 100, "tastytrade_midpoint": 100,
+            "midpoint_difference_bps": 0,
+        },
+    ]
+    (directory / "2026-09-18.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+    )
+
+    result = feed_quality_snapshot(tmp_path)
+
+    assert result[0]["samples"] == 1
+    assert result[0]["preferred_source"] == "alpaca"

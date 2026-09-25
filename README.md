@@ -207,6 +207,34 @@ The harness requires matching hourly stock and benchmark data whenever live
 Position Health actions are enabled, so an active production rule cannot be
 silently omitted from a backtest.
 
+Build the paginated, episode-aware exit baseline with:
+
+```powershell
+py -3.12 scripts/analyze_exit_ledger.py --start 2026-06-01T00:00:00Z
+```
+
+The report is written to `runtime/reports/exit_ledger_baseline_YYYY-MM-DD.json`.
+It groups partial sales under their position episode, lists each exit with its
+realized P/L, reason, and attribution source, and reports post-exit recovery.
+Reasons first come from watcher order intents or closed episodes. For older
+orders, the report reads the broker order by ID: known bot client-order prefixes
+identify the rule, while a stop without a retained rule is labeled
+`broker_stop_unclassified`. Other unidentifiable sales remain `unknown`.
+
+Paper trading uses the opt-in `winner_management` policy in
+`config/watchers.json`: sell half at `+2R`, then manage the remaining runner
+with a ratcheting stop `2.5` completed-hour ATR below its highest observed
+price. The policy refuses to submit its profit tranche against a non-paper
+Alpaca endpoint. Snapshot its live state with:
+
+```powershell
+py -3.12 scripts/report_winner_management.py
+```
+
+A separate, backtest-only LEAN breakout and winner-exit experiment lives in
+`research/lean/traderbot_helper`. See `docs/lean_helper_plan.md` for its scope,
+setup, and comparison gates.
+
 ## Tastytrade Market-Data Comparison
 
 The tastytrade adapter is read-only and uses only the OAuth `read` scope. It

@@ -17,16 +17,49 @@ def _spread_percent(quote):
     return (float(quote["ask_price"]) - float(quote["bid_price"])) / midpoint * 100
 
 
+def _parse_time(value):
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bar_window_stats(record, observed_at):
+    bars = record.get("bars") or []
+    start = _parse_time(record.get("start"))
+    end = _parse_time(record.get("end")) or _parse_time(observed_at)
+    valid = []
+    for bar in bars:
+        timestamp = _parse_time(bar.get("t"))
+        if timestamp and (start is None or timestamp >= start) and (end is None or timestamp <= end):
+            valid.append(bar)
+    latest = valid[-1] if valid else None
+    latest_at = _parse_time((latest or {}).get("t"))
+    observed = _parse_time(observed_at)
+    return {
+        "count": len(valid),
+        "window_valid": len(valid) == len(bars),
+        "latest": latest,
+        "latest_age_seconds": (
+            (observed - latest_at).total_seconds()
+            if observed is not None and latest_at is not None else None
+        ),
+    }
+
+
 def compare_source_observations(symbol, primary, secondary, observed_at,
                                 primary_name="alpaca", secondary_name="secondary"):
     primary_quote = primary.get("quote", {})
     secondary_quote = secondary.get("quote", {})
     primary_midpoint = _midpoint(primary_quote)
     secondary_midpoint = _midpoint(secondary_quote)
-    latest_primary = (primary.get("bars") or [{}])[-1]
-    latest_secondary = (secondary.get("bars") or [{}])[-1]
+    primary_bars = _bar_window_stats(primary, observed_at)
+    secondary_bars = _bar_window_stats(secondary, observed_at)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": symbol,
         "observed_at": observed_at,
         "primary_source": primary_name,
@@ -45,10 +78,16 @@ def compare_source_observations(symbol, primary, secondary, observed_at,
         ),
         f"{primary_name}_spread_percent": _spread_percent(primary_quote),
         f"{secondary_name}_spread_percent": _spread_percent(secondary_quote),
-        f"{primary_name}_latest_bar": latest_primary or None,
-        f"{secondary_name}_latest_bar": latest_secondary or None,
+        f"{primary_name}_latest_bar": primary_bars["latest"],
+        f"{secondary_name}_latest_bar": secondary_bars["latest"],
         f"{primary_name}_bar_count": len(primary.get("bars") or []),
         f"{secondary_name}_bar_count": len(secondary.get("bars") or []),
+        f"{primary_name}_bar_count_in_window": primary_bars["count"],
+        f"{secondary_name}_bar_count_in_window": secondary_bars["count"],
+        f"{primary_name}_bar_window_valid": primary_bars["window_valid"],
+        f"{secondary_name}_bar_window_valid": secondary_bars["window_valid"],
+        f"{primary_name}_latest_bar_age_seconds": primary_bars["latest_age_seconds"],
+        f"{secondary_name}_latest_bar_age_seconds": secondary_bars["latest_age_seconds"],
     }
 
 

@@ -374,6 +374,61 @@ def action_client_order_id(prefix, symbol, episode_id, sequence=1):
     return f"tb-{prefix}-{str(symbol).lower()}-{digest}-{int(sequence)}"[:48]
 
 
+def record_exit_intent(state, order, reason):
+    """Persist why a sell was submitted so later fills remain attributable."""
+    if not order or not order.get("id"):
+        return None
+    episode = state.get("position_episode") or {}
+    intent = {
+        "order_id": order["id"],
+        "episode_id": episode.get("episode_id"),
+        "exit_reason": reason or "unknown",
+        "qty": order.get("qty"),
+        "submitted_at": order.get("submitted_at") or order.get("created_at"),
+    }
+    intents = dict(state.get("exit_order_intents") or {})
+    intents[order["id"]] = intent
+    # Bound long-running watcher state while retaining ample reconciliation history.
+    state["exit_order_intents"] = dict(list(intents.items())[-100:])
+    return intent
+
+
+def exit_attribution(state, order_id=None, order=None):
+    intent = (state.get("exit_order_intents") or {}).get(order_id) or {}
+    client_order_id = str((order or {}).get("client_order_id") or "")
+    inferred = "unknown"
+    if client_order_id.startswith("tb-hard-reduce-"):
+        inferred = "hard_adverse_reduction"
+    elif client_order_id.startswith("tb-health-reduce-"):
+        inferred = "health_reduction"
+    elif client_order_id.startswith("tb-health-exit-"):
+        inferred = "health_exit"
+    return {
+        "episode_id": intent.get("episode_id")
+        or (state.get("position_episode") or {}).get("episode_id"),
+        "exit_reason": intent.get("exit_reason") or inferred,
+    }
+
+
+def append_episode_exit_event(state, details):
+    episode = state.get("position_episode")
+    if not episode or not details:
+        return
+    event = {
+        "order_id": details.get("last_exit_order_id") or details.get("order_id"),
+        "episode_id": details.get("episode_id") or episode.get("episode_id"),
+        "exit_reason": details.get("exit_reason") or "unknown",
+        "exit_price": details.get("last_exit_price") or details.get("filled_avg_price"),
+        "exit_qty": details.get("last_exit_qty") or details.get("filled_qty"),
+        "exited_at": details.get("last_exit_at") or details.get("filled_at"),
+    }
+    events = list(episode.get("exit_events") or [])
+    if event["order_id"] and any(item.get("order_id") == event["order_id"] for item in events):
+        return
+    events.append(event)
+    episode["exit_events"] = events[-100:]
+
+
 def cancel_symbol_order(client, order_id, symbol):
     if hasattr(client, "symbol_transaction"):
         return client.cancel_order(order_id, symbol=symbol)
@@ -1113,6 +1168,7 @@ def reset_managed_position_state(state):
         "active_stop_order_id",
         "active_stop_price",
         "active_stop_qty",
+        "active_stop_reason",
         "recovery_stop_active",
         "recovery_stop_price",
         "entry_fill_price",
@@ -1132,6 +1188,14 @@ def reset_managed_position_state(state):
         "position_health_last_evaluated_at",
         "position_health_last_checked_at",
         "position_health_confirmation",
+        "winner_partial_order_id",
+        "winner_partial_qty",
+        "winner_partial_completed",
+        "winner_partial_filled_at",
+        "runner_high_price",
+        "runner_stop_price",
+        "position_health_atr14",
+        "position_health_atr_as_of",
     ):
         state.pop(key, None)
 
@@ -1257,13 +1321,19 @@ def record_exit_from_order(state, order):
             float(state["last_exit_price"]) - float(entry_price)
         ) * float(state["last_exit_qty"])
     state["last_exit_source"] = "tracked_order"
-    return {
+    attribution = exit_attribution(state, order["id"], order)
+    state["last_exit_reason"] = attribution["exit_reason"]
+    state["last_exit_episode_id"] = attribution["episode_id"]
+    details = {
         "last_exit_order_id": state.get("last_exit_order_id"),
         "last_exit_price": state.get("last_exit_price"),
         "last_exit_at": state.get("last_exit_at"),
         "last_exit_qty": state.get("last_exit_qty"),
         "last_trade_pl": state.get("last_trade_pl"),
+        **attribution,
     }
+    append_episode_exit_event(state, details)
+    return details
 
 
 def record_position_snapshot(state, position, as_of=None):
@@ -1355,15 +1425,23 @@ def reconstruct_exit_from_fills(client, symbol, state):
             state["last_exit_price"] - state["last_exit_entry_price"]
         ) * state["last_exit_qty"]
     state["last_exit_source"] = "broker_fill_reconstruction"
+    attributions = [exit_attribution(state, order_id) for order_id in order_ids]
+    reasons = {item["exit_reason"] for item in attributions if item["exit_reason"] != "unknown"}
+    state["last_exit_reason"] = reasons.pop() if len(reasons) == 1 else "unknown"
+    state["last_exit_episode_id"] = episode.get("episode_id")
     state.pop("exit_reconciliation_error", None)
-    return {
+    details = {
         "last_exit_order_id": state.get("last_exit_order_id"),
         "last_exit_price": state["last_exit_price"],
         "last_exit_at": state["last_exit_at"],
         "last_exit_qty": state["last_exit_qty"],
         "last_exit_source": state["last_exit_source"],
         "last_trade_pl": state.get("last_trade_pl"),
+        "episode_id": state.get("last_exit_episode_id"),
+        "exit_reason": state.get("last_exit_reason"),
     }
+    append_episode_exit_event(state, details)
+    return details
 
 
 def reconcile_flat_position_state(client, symbol, state):
@@ -1420,6 +1498,8 @@ def reconcile_flat_position_state(client, symbol, state):
             or iso_utc(datetime.datetime.now(datetime.timezone.utc)),
             "exit_order_id": (exit_details or {}).get("last_exit_order_id"),
             "exit_price": (exit_details or {}).get("last_exit_price"),
+            "exit_reason": (exit_details or {}).get("exit_reason") or "unknown",
+            "exit_events": list(episode.get("exit_events") or []),
             "final_health": state.get("position_health"),
         }
         history = list(state.get("closed_position_episodes") or [])
@@ -1439,7 +1519,7 @@ def reconcile_flat_position_state(client, symbol, state):
     }
 
 
-def update_stop_order(client, symbol, qty, stop_price, state):
+def update_stop_order(client, symbol, qty, stop_price, state, exit_reason="stop_floor"):
     rounded_stop = dollars(stop_price)
     active_stop_id = state.get("active_stop_order_id")
     open_stop_orders = client.open_stop_orders(symbol)
@@ -1454,6 +1534,8 @@ def update_stop_order(client, symbol, qty, stop_price, state):
         and int(float(active_open_stop.get("qty") or 0)) == qty
         and dollars(float(active_open_stop.get("stop_price") or 0)) == rounded_stop
     ):
+        state["active_stop_reason"] = exit_reason
+        record_exit_intent(state, active_open_stop, exit_reason)
         for order in open_stop_orders:
             if order.get("id") != active_stop_id:
                 cancel_symbol_order(client, order["id"], symbol)
@@ -1472,6 +1554,8 @@ def update_stop_order(client, symbol, qty, stop_price, state):
             state["active_stop_order_id"] = order["id"]
             state["active_stop_price"] = rounded_stop
             state["active_stop_qty"] = qty
+            state["active_stop_reason"] = exit_reason
+            record_exit_intent(state, order, exit_reason)
             for open_order in open_stop_orders:
                 if open_order.get("id") != active_stop_id:
                     cancel_symbol_order(client, open_order["id"], symbol)
@@ -1496,6 +1580,8 @@ def update_stop_order(client, symbol, qty, stop_price, state):
     state["active_stop_order_id"] = order["id"]
     state["active_stop_price"] = rounded_stop
     state["active_stop_qty"] = qty
+    state["active_stop_reason"] = exit_reason
+    record_exit_intent(state, order, exit_reason)
     return order
 
 
@@ -1536,6 +1622,7 @@ def ensure_catastrophic_stop(client, config, position, state):
             qty,
             float(selected["stop_price"]),
             state,
+            state.get("active_stop_reason") or "catastrophic_stop",
         )
         return {
             "order_id": selected["id"],
@@ -1550,6 +1637,7 @@ def ensure_catastrophic_stop(client, config, position, state):
         qty,
         valid_floor,
         state,
+        "catastrophic_stop",
     )
     return {
         "order_id": state["active_stop_order_id"],
@@ -1611,6 +1699,144 @@ def adverse_reduction_details(config, entry_price, qty):
     }
 
 
+def winner_management_config(config):
+    settings = dict(config.get("winner_management") or {})
+    settings.setdefault("enabled", False)
+    settings.setdefault("paper_only", True)
+    settings.setdefault("partial_exit_fraction", 0.5)
+    settings.setdefault("partial_exit_trigger_r", 2.0)
+    settings.setdefault("runner_trail_atr_multiple", 2.5)
+    settings.setdefault("minimum_runner_quantity", 1)
+    fraction = float(settings["partial_exit_fraction"])
+    trigger_r = float(settings["partial_exit_trigger_r"])
+    atr_multiple = float(settings["runner_trail_atr_multiple"])
+    if not 0 < fraction < 1:
+        raise ValueError("winner partial_exit_fraction must be between 0 and 1")
+    if trigger_r <= 0 or atr_multiple <= 0:
+        raise ValueError("winner R trigger and ATR multiple must be positive")
+    return settings
+
+
+def winner_trigger_details(config, state, position, current_price, base_floor):
+    settings = winner_management_config(config)
+    if not settings["enabled"] or state.get("winner_partial_completed"):
+        return None
+    qty = position_quantity(position)
+    minimum_runner = max(1, int(settings["minimum_runner_quantity"]))
+    if qty <= minimum_runner:
+        return None
+    episode = state.get("position_episode") or {}
+    entry_price = float(position.get("avg_entry_price") or episode.get("average_entry_price") or 0)
+    initial_risk = float(episode.get("initial_risk_per_share") or 0)
+    if initial_risk <= 0:
+        initial_stop = float(episode.get("initial_stop_price") or base_floor or 0)
+        initial_risk = entry_price - initial_stop
+    if entry_price <= 0 or initial_risk <= 0:
+        return None
+    trigger_price = entry_price + float(settings["partial_exit_trigger_r"]) * initial_risk
+    initial_qty = max(qty, int(episode.get("initial_qty") or qty))
+    sell_qty = max(1, math.floor(initial_qty * float(settings["partial_exit_fraction"])))
+    sell_qty = min(sell_qty, qty - minimum_runner)
+    hourly_atr = float(state.get("position_health_atr14") or 0)
+    return {
+        "eligible": current_price >= trigger_price and sell_qty > 0 and hourly_atr > 0,
+        "trigger_price": trigger_price,
+        "initial_risk_per_share": initial_risk,
+        "hourly_atr14": hourly_atr or None,
+        "sell_qty": sell_qty,
+        "runner_qty": qty - sell_qty,
+        "trigger_r": float(settings["partial_exit_trigger_r"]),
+    }
+
+
+def submit_winner_partial_exit(client, config, state, position, current_price, base_floor):
+    if state.get("winner_partial_order_id"):
+        return None
+    details = winner_trigger_details(config, state, position, current_price, base_floor)
+    if not details or not details["eligible"]:
+        return None
+    settings = winner_management_config(config)
+    trade_base_url = str(getattr(client, "trade_base_url", "") or "").lower()
+    if settings.get("paper_only", True) and trade_base_url and "paper-api" not in trade_base_url:
+        raise RuntimeError("winner management is restricted to the Alpaca paper account")
+    symbol = config["symbol"]
+    transaction = client.symbol_transaction(symbol) if hasattr(client, "symbol_transaction") else nullcontext()
+    with transaction:
+        canceled_stop_order_ids = []
+        for stop in client.open_stop_orders(symbol):
+            cancel_symbol_order(client, stop["id"], symbol)
+            canceled_stop_order_ids.append(stop["id"])
+        for key in ("active_stop_order_id", "active_stop_price", "active_stop_qty", "active_stop_reason"):
+            state.pop(key, None)
+        episode_id = (state.get("position_episode") or {}).get("episode_id", symbol)
+        order = client.submit_order(
+            {
+                "symbol": symbol,
+                "qty": str(details["sell_qty"]),
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": action_client_order_id("profit-tranche", symbol, episode_id),
+            }
+        )
+        record_exit_intent(state, order, "profit_tranche_2r")
+    state["winner_partial_order_id"] = order["id"]
+    state["winner_partial_qty"] = details["sell_qty"]
+    return {
+        "status": "winner_partial_exit_submitted",
+        "order_id": order["id"],
+        "current_price": current_price,
+        "canceled_stop_order_ids": canceled_stop_order_ids,
+        **details,
+    }
+
+
+def resolve_winner_partial_order(client, state):
+    order_id = state.get("winner_partial_order_id")
+    if not order_id:
+        return None
+    order = client.order(order_id)
+    if order_is_open(order):
+        return {"status": "winner_partial_exit_pending", "order_id": order_id}
+    state.pop("winner_partial_order_id", None)
+    if order.get("status") != "filled":
+        return {"status": "winner_partial_exit_not_filled", "order_id": order_id, "order_status": order.get("status")}
+    state["winner_partial_completed"] = True
+    state["winner_partial_filled_at"] = order.get("filled_at")
+    state.pop("floor_price", None)
+    state["highest_trail_rung"] = 0
+    attribution = exit_attribution(state, order_id, order)
+    details = {
+        "status": "winner_partial_exit_filled",
+        "order_id": order_id,
+        "filled_qty": order.get("filled_qty") or order.get("qty"),
+        "filled_avg_price": order.get("filled_avg_price"),
+        "filled_at": order.get("filled_at"),
+        **attribution,
+    }
+    append_episode_exit_event(state, details)
+    episode = state.get("position_episode") or {}
+    episode["winner_partial_completed"] = True
+    episode["winner_partial_qty"] = details["filled_qty"]
+    episode["runner_started_at"] = order.get("filled_at")
+    return details
+
+
+def runner_stop_price(config, state, current_price, base_floor):
+    if not state.get("winner_partial_completed"):
+        return None
+    settings = winner_management_config(config)
+    high = max(float(state.get("runner_high_price") or 0), float(current_price))
+    state["runner_high_price"] = high
+    atr = float(state.get("position_health_atr14") or 0)
+    if atr <= 0:
+        return max(float(base_floor), float(state.get("runner_stop_price") or 0))
+    candidate = high - atr * float(settings["runner_trail_atr_multiple"])
+    stop = max(float(base_floor), float(state.get("runner_stop_price") or 0), candidate)
+    state["runner_stop_price"] = stop
+    return stop
+
+
 def submit_adverse_reduction(client, config, position, current_price, state):
     if state.get("adverse_reduction_completed"):
         return None
@@ -1650,6 +1876,7 @@ def submit_adverse_reduction(client, config, position, current_price, state):
                 ),
             }
         )
+        record_exit_intent(state, order, "hard_adverse_reduction")
     state["adverse_reduction_order_id"] = order["id"]
     state["adverse_reduction_qty"] = details["qty"]
     state["adverse_reduction_trigger_price"] = details["trigger_price"]
@@ -1678,12 +1905,17 @@ def resolve_adverse_reduction_order(client, state):
     state.pop("adverse_reduction_order_id", None)
     if order.get("status") == "filled":
         state["adverse_reduction_completed"] = True
-        return {
+        attribution = exit_attribution(state, order_id, order)
+        details = {
             "status": "adverse_reduction_filled",
             "order_id": order_id,
             "filled_qty": order.get("filled_qty") or order.get("qty"),
             "filled_avg_price": order.get("filled_avg_price"),
+            "filled_at": order.get("filled_at"),
+            **attribution,
         }
+        append_episode_exit_event(state, details)
+        return details
     return {
         "status": "adverse_reduction_not_filled",
         "order_id": order_id,
@@ -2019,8 +2251,12 @@ def refresh_position_health(client, config, state, position, force=False):
     }
     try:
         context = position_health_market_context(client, config)
+        latest_health_bar = context.get("latest_bar") or {}
+        if float(latest_health_bar.get("atr14") or 0) > 0:
+            state["position_health_atr14"] = float(latest_health_bar["atr14"])
+            state["position_health_atr_as_of"] = context.get("as_of")
         if episode.get("target_source") == "reconstructed_1_5r_target":
-            latest_bar = context.get("latest_bar") or {}
+            latest_bar = latest_health_bar
             atr = float(latest_bar.get("atr14") or 0)
             if atr > 0:
                 entry_price = float(episode["average_entry_price"])
@@ -2123,6 +2359,7 @@ def submit_confirmed_health_action(client, config, state, position, health):
                 ),
             }
         )
+        record_exit_intent(state, order, f"health_{action}")
     state["adverse_reduction_order_id"] = order["id"]
     state["adverse_reduction_qty"] = action_qty
     state["position_health_action_reason"] = f"health_{action}"
@@ -3079,6 +3316,9 @@ def handle_reentry(client, config, state):
 
 def run_once(client, config, state, clock=None):
     symbol = config["symbol"]
+    winner_resolution = resolve_winner_partial_order(client, state)
+    if winner_resolution and winner_resolution["status"] == "winner_partial_exit_pending":
+        return winner_resolution
     reduction_resolution = resolve_adverse_reduction_order(client, state)
     if (
         reduction_resolution
@@ -3263,7 +3503,10 @@ def run_once(client, config, state, clock=None):
     if current_rung > state["highest_trail_rung"]:
         state["highest_trail_rung"] = current_rung
 
-    if state["highest_trail_rung"] > 0:
+    active_runner_stop = runner_stop_price(config, state, current_price, base_floor)
+    if active_runner_stop is not None:
+        candidate_floor = active_runner_stop
+    elif state["highest_trail_rung"] > 0:
         trail_below = trail_below_current_percent(config, state["highest_trail_rung"])
         candidate_floor = max(
             fill_price,
@@ -3288,6 +3531,15 @@ def run_once(client, config, state, clock=None):
         qty,
         effective_stop_price,
         state,
+        (
+            "runner_trailing_stop"
+            if active_runner_stop is not None
+            else "recovery_stop"
+            if recovery_stop.get("recovery_stop_active")
+            else "trailing_stop"
+            if state["highest_trail_rung"] > 0
+            else "initial_stop"
+        ),
     )
     position_for_health = dict(position)
     position_for_health["current_price"] = current_price
@@ -3309,6 +3561,17 @@ def run_once(client, config, state, clock=None):
     if position_action:
         return position_action
 
+    winner_action = submit_winner_partial_exit(
+        client,
+        config,
+        state,
+        position_for_health,
+        current_price,
+        base_floor,
+    )
+    if winner_action:
+        return winner_action
+
     ladder_opportunities, ladder_limit_detail = observe_ladder_opportunities(
         config, state, fill_price, current_price, context, health
     )
@@ -3324,6 +3587,15 @@ def run_once(client, config, state, clock=None):
         "highest_trail_rung": state["highest_trail_rung"],
         "updated_stop_order": stop_order["id"] if stop_order else None,
         "position_health": health,
+        "winner_management": {
+            "enabled": winner_management_config(config)["enabled"],
+            "partial_completed": bool(state.get("winner_partial_completed")),
+            "partial_qty": state.get("winner_partial_qty"),
+            "runner_high_price": state.get("runner_high_price"),
+            "runner_stop_price": state.get("runner_stop_price"),
+            "hourly_atr14": state.get("position_health_atr14"),
+            "hourly_atr_as_of": state.get("position_health_atr_as_of"),
+        },
         "new_ladder_orders": [],
         "ladder_sizing": [],
         "adaptive_ladder": [],

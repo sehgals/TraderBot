@@ -783,6 +783,14 @@
     "timeframe": "1Hour",
     "watch_score": 45
   },
+  "winner_management": {
+    "enabled": true,
+    "minimum_runner_quantity": 1,
+    "paper_only": true,
+    "partial_exit_fraction": 0.5,
+    "partial_exit_trigger_r": 2.0,
+    "runner_trail_atr_multiple": 2.5
+  },
   "tastytrade_comparison": {
     "enabled": true,
     "poll_seconds": 300,

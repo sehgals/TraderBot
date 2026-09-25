@@ -43,7 +43,7 @@ def main(argv=None):
     output = []
     for symbol in symbols:
         common = {
-            "schema_version": 1, "symbol": symbol, "observed_at": end_text,
+            "schema_version": 2, "symbol": symbol, "observed_at": end_text,
             "timeframe": args.timeframe, "start": start_text, "end": end_text,
         }
         alpaca_record = {
