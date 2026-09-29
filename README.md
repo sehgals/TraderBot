@@ -220,6 +220,7 @@ Reasons first come from watcher order intents or closed episodes. For older
 orders, the report reads the broker order by ID: known bot client-order prefixes
 identify the rule, while a stop without a retained rule is labeled
 `broker_stop_unclassified`. Other unidentifiable sales remain `unknown`.
+Recovery is summarized separately for winning and losing exits.
 
 Paper trading uses the opt-in `winner_management` policy in
 `config/watchers.json`: sell half at `+2R`, then manage the remaining runner
