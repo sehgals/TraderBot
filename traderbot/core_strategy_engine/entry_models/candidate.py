@@ -55,11 +55,14 @@ def structural_stop_price(config, entry_price, atr, setup_low):
     """Risk stop shared by signal qualification, sizing, and management."""
     atr_multiple = float(config.get("structural_stop_atr_multiple", 1.5))
     buffer_atr = float(config.get("structural_stop_buffer_atr", 0.1))
+    min_loss_percent = float(config.get("structural_stop_min_percent", 0))
     max_loss_percent = float(config.get("structural_stop_max_percent", 6.0))
     raw_stop = min(
         entry_price - atr_multiple * atr,
         float(setup_low) - buffer_atr * atr,
     )
+    if min_loss_percent > 0:
+        raw_stop = min(raw_stop, entry_price * (1 - min_loss_percent / 100))
     capped_stop = max(raw_stop, entry_price * (1 - max_loss_percent / 100))
     return min(capped_stop, entry_price - max(0.01, 0.1 * atr))
 

@@ -42,6 +42,9 @@
   },
   "managed_watcher_defaults": {
     "absolute_minimum_entry_reward_risk": 1.0,
+    "structural_stop_atr_multiple": 2.0,
+    "structural_stop_buffer_atr": 0.25,
+    "structural_stop_min_percent": 2.0,
     "entry_score_weights": {
       "market_sector_regime": 15,
       "price_action": 25,
@@ -579,8 +582,9 @@
     "rvol_lookback_days": 35,
     "strategy_name": "Dynamic new-candidate entry",
     "strategy_type": "new_candidate_dynamic_entry",
-    "structural_stop_atr_multiple": 1.5,
-    "structural_stop_buffer_atr": 0.1,
+    "structural_stop_atr_multiple": 2.0,
+    "structural_stop_buffer_atr": 0.25,
+    "structural_stop_min_percent": 2.0,
     "structural_stop_max_percent": 6,
     "trail_stop_below_current_percent": 2.5,
     "trail_trigger_step_percent": 5

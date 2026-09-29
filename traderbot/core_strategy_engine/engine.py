@@ -1668,6 +1668,13 @@ def managed_initial_floor_price(config, entry_price, context=None, plan=None):
     ]
     planned_stop = float((plan or {}).get("stop_price") or 0)
     if 0 < planned_stop < entry_price:
+        # Recheck the planned distance against the actual fill. A favorable
+        # limit fill can otherwise leave the planned stop too close to entry.
+        min_percent = float(config.get("structural_stop_min_percent", 0) or 0)
+        if min_percent > 0:
+            planned_stop = min(
+                planned_stop, entry_price * (1 - min_percent / 100)
+            )
         floors.append(planned_stop)
     return max(floors)
 
@@ -2103,6 +2110,13 @@ def ensure_position_episode(config, state, position, entry_order=None):
     plan = state.get("dynamic_entry_plan") or {}
     model_id, model_version = entry_model_identity(state, plan)
     candidate_snapshot = selected_entry_candidate_snapshot(state, plan, model_id)
+    initial_stop = plan.get("stop_price")
+    initial_risk = plan.get("risk_per_share")
+    if initial_stop and config.get("structural_stop_min_percent"):
+        initial_stop = managed_initial_floor_price(
+            config, entry_price, plan=plan
+        )
+        initial_risk = entry_price - initial_stop
     episode = {
         "episode_id": episode_id,
         "symbol": config["symbol"],
@@ -2123,8 +2137,8 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "entry_candidate_hash": candidate_snapshot_hash(candidate_snapshot),
         "entry_model_checks": dict(candidate_snapshot.get("checks") or {}),
         "entry_model_blockers": list(candidate_snapshot.get("blockers") or []),
-        "initial_stop_price": plan.get("stop_price"),
-        "initial_risk_per_share": plan.get("risk_per_share"),
+        "initial_stop_price": initial_stop,
+        "initial_risk_per_share": initial_risk,
         "original_target_price": target_price,
         "target_source": target_source,
         "initial_qty": qty,

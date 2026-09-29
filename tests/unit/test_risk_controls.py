@@ -21,6 +21,7 @@ from traderbot.core_strategy_engine.engine import (
     evaluate_flat_entry_eligibility,
     initial_floor_price,
     initial_entry_target,
+    managed_initial_floor_price,
     observe_ladder_opportunities,
     position_health_config,
     position_health_market_context,
@@ -406,6 +407,40 @@ class RiskControlTests(unittest.TestCase):
             initial_entry_target({}, {"dynamic_entry_plan": plan}, 100),
             (110, "entry_structural_target"),
         )
+
+    def test_paper_entry_stop_distance_flows_through_risk_sizing(self):
+        config = {
+            "structural_stop_atr_multiple": 2.0,
+            "structural_stop_buffer_atr": 0.25,
+            "structural_stop_min_percent": 2.0,
+            "structural_stop_max_percent": 6.0,
+        }
+        stop = structural_stop_price(config, 100, 0.4, 99.5)
+        plan = {"limit_price": 100, "stop_price": stop}
+
+        self.assertEqual(stop, 98)
+        self.assertEqual(dynamic_entry_quantity(config, plan, equity=10_000), 25)
+
+    def test_planned_stop_keeps_minimum_distance_from_favorable_fill(self):
+        config = {"initial_stop_loss_percent": 20,
+                  "structural_stop_min_percent": 2.0}
+
+        self.assertAlmostEqual(
+            managed_initial_floor_price(config, 99, plan={"stop_price": 98}),
+            97.02,
+        )
+
+        state = {"dynamic_entry_plan": {
+            "status": "active_signal", "limit_price": 100,
+            "stop_price": 98, "risk_per_share": 2,
+        }}
+        episode = ensure_position_episode(
+            {"symbol": "TEST", **config}, state,
+            {"symbol": "TEST", "qty": "1", "avg_entry_price": "99"},
+            entry_order={"id": "buy-1", "status": "filled"},
+        )
+        self.assertAlmostEqual(episode["initial_stop_price"], 97.02)
+        self.assertAlmostEqual(episode["initial_risk_per_share"], 1.98)
 
     def test_market_and_sector_regimes_are_soft_scored_entry_features(self):
         start = datetime.datetime(2026, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)
