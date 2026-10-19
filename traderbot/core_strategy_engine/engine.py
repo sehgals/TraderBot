@@ -241,6 +241,14 @@ class AlpacaClient:
     def clock(self):
         return self.trading("GET", "/clock")
 
+    def asset(self, symbol):
+        try:
+            return self.trading("GET", f"/assets/{symbol}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
     def calendar(self, start, end):
         query = urllib.parse.urlencode({"start": start, "end": end})
         return self.trading("GET", f"/calendar?{query}") or []

@@ -1,6 +1,8 @@
 import threading
 from contextlib import contextmanager
 
+from traderbot.data.market_cache import SharedMarketDataCache
+
 
 class ExecutionGateway:
     """Serialize broker mutations and deduplicate explicit action intents.
@@ -10,13 +12,22 @@ class ExecutionGateway:
     deduplication through Alpaca's client-order lookup endpoint.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, cache_ttl_seconds: float = 45.0):
         self.client = client
         self._locks_guard = threading.Lock()
         self._symbol_locks = {}
+        self.market_cache = SharedMarketDataCache(ttl_seconds=cache_ttl_seconds)
 
     def __getattr__(self, name):
         return getattr(self.client, name)
+
+    def stock_bars(self, symbol, start, end, timeframe):
+        """Retrieve stock bars with shared in-memory TTL caching."""
+        if hasattr(self.client, "stock_bars"):
+            return self.market_cache.get_or_fetch_bars(
+                self.client, symbol, start, end, timeframe
+            )
+        return []
 
     def _symbol_lock(self, symbol):
         key = str(symbol or "ACCOUNT").upper()

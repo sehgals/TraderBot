@@ -51,6 +51,7 @@ POSITION_HEALTH_ALERT_LOG = RUNTIME_LOG_DIR / "position_health_alerts.jsonl"
 PORTFOLIO_ALLOCATION_STATE = RUNTIME_STATE_DIR / "portfolio_allocation_state.json"
 PORTFOLIO_ALLOCATION_LOG = RUNTIME_LOG_DIR / "portfolio_allocations.jsonl"
 TASTYTRADE_COLLECTION_LOG = RUNTIME_LOG_DIR / "tastytrade_collection.jsonl"
+PROMOTED_WATCHERS_STATE = RUNTIME_STATE_DIR / "promoted_watchers.json"
 
 
 def utc_now():
@@ -113,6 +114,19 @@ def load_supervisor_config(path):
     config_path = Path(path).resolve()
     project_root = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
     config = load_json(config_path, {})
+    promotions_path = project_root / PROMOTED_WATCHERS_STATE
+    if promotions_path.exists():
+        promotions = load_json(promotions_path, {}).get("promoted_watchers", [])
+        promoted_symbols = {p["symbol"] for p in promotions if "symbol" in p}
+        if promoted_symbols:
+            managed_symbols = {w.get("symbol") for w in config.get("managed_watchers", config.get("watchers", []))}
+            for p in promotions:
+                if p["symbol"] not in managed_symbols:
+                    config.setdefault("managed_watchers", []).append(p)
+            config["new_watchers"] = [
+                w for w in config.get("new_watchers", []) if w.get("symbol") not in promoted_symbols
+            ]
+
     watchers = []
     watchers.extend(
         {**watcher, "group": watcher.get("group", "managed")}
@@ -305,7 +319,19 @@ def promote_new_watcher_if_bought(project_root, watchers_config_path, supervisor
         item for item in supervisor_config.get("new_watchers", [])
         if item.get("symbol") != symbol
     ]
-    save_json(watchers_config_path, supervisor_config)
+    # SRE decoupling: persist promotion to runtime registry
+    promotions_path = project_root / PROMOTED_WATCHERS_STATE
+    promotions_data = load_json(promotions_path, {"promoted_watchers": []})
+    promotions_list = promotions_data.setdefault("promoted_watchers", [])
+    if not any(p.get("symbol") == symbol for p in promotions_list):
+        promotions_list.append(managed_entry)
+        save_json(promotions_path, promotions_data)
+
+    if not supervisor_config.get("read_only_config", False):
+        try:
+            save_json(watchers_config_path, supervisor_config)
+        except OSError:
+            pass
 
     watcher["group"] = "managed"
     watcher["config_path"] = config_path
