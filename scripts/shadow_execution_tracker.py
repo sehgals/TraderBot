@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from traderbot.core_strategy_engine.rollout import get_symbol_rollout_cohort
 
 
 def load_json_safe(path):
@@ -52,8 +53,10 @@ def scan_active_and_shadow_positions(state_dir):
         t1 = shadow_targets.get("tranche_1_price")
         t2 = shadow_targets.get("tranche_2_price")
 
+        cohort = episode.get("rollout_cohort") or get_symbol_rollout_cohort(symbol)
         positions.append({
             "symbol": symbol,
+            "cohort": cohort,
             "opened_at": episode.get("opened_at"),
             "entry_price": entry_price,
             "qty": qty,
@@ -108,14 +111,14 @@ def main():
     print("=" * 95)
     print(f"Active Monitored Positions: {len(positions)}")
     if positions:
-        print(f"{'Symbol':<8} | {'Entry':<8} | {'Active Stop':<12} | {'Shadow Stop':<12} | {'Tranche 1 (1.0R)':<16} | {'Tranche 2 (2.0R)':<16} | {'Shadow Realized P/L':<15}")
+        print(f"{'Symbol':<8} | {'Cohort':<8} | {'Entry':<8} | {'Active Stop':<12} | {'Shadow Stop':<12} | {'Tranche 1 (1.0R)':<16} | {'Tranche 2 (2.0R)':<16} | {'Shadow Realized P/L':<15}")
         print("-" * 95)
         for p in positions:
             act = p["active"]
             sh = p["shadow"]
             t1_str = f"${sh['tranche_1_price']:.2f} ({'FILLED' if sh['tranche_1_filled'] else 'PENDING'})" if sh['tranche_1_price'] else "N/A"
             t2_str = f"${sh['tranche_2_price']:.2f} ({'FILLED' if sh['tranche_2_filled'] else 'PENDING'})" if sh['tranche_2_price'] else "N/A"
-            print(f"{p['symbol']:<8} | ${p['entry_price']:<7.2f} | ${act['stop_price']:<6.2f} ({act['stop_percent']}%) | ${sh['stop_price']:<6.2f} ({sh['stop_percent']}%) | {t1_str:<16} | {t2_str:<16} | ${sh['shadow_realized_pnl']:<14.2f}")
+            print(f"{p['symbol']:<8} | {p.get('cohort', 'control').upper():<8} | ${p['entry_price']:<7.2f} | ${act['stop_price']:<6.2f} ({act['stop_percent']}%) | ${sh['stop_price']:<6.2f} ({sh['stop_percent']}%) | {t1_str:<16} | {t2_str:<16} | ${sh['shadow_realized_pnl']:<14.2f}")
     else:
         print("No active open positions currently in runtime state.")
     print("=" * 95)

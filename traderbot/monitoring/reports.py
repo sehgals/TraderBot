@@ -18,6 +18,8 @@ from traderbot.core_strategy_engine.entry_models.candidate import (
     classify_entry_checks,
 )
 from traderbot.monitoring.supervisor import load_supervisor_config
+from traderbot.core_strategy_engine.rollout import get_symbol_rollout_cohort
+from traderbot.universe.sector_resolver import resolve_sector_etf
 
 
 def load_state_json(path):
@@ -226,7 +228,7 @@ def flat_managed_stock_evaluations(project_root, watchers_path, positions):
         evaluations.append(
             {
                 "symbol": symbol,
-                "sector": sector_by_symbol.get(symbol, "Unmapped"),
+                "sector": resolve_sector_etf(symbol, config),
                 **signal_strength(plan),
                 "entry_eligibility": eligibility,
                 "reentry_qualified": reentry_qualification.get("eligible", False),
@@ -390,7 +392,7 @@ def watcher_activity(project_root, watchers_path, report_date):
                     rejection_events.append(
                         {
                             "symbol": symbol,
-                            "sector": sector_by_symbol.get(symbol, "Unmapped"),
+                            "sector": resolve_sector_etf(symbol, supervisor_config),
                             "timestamp": bar_time or record.get("timestamp"),
                             "time_bucket": (
                                 timestamp.astimezone(LOCAL_TZ).strftime("%H:00")
@@ -879,8 +881,10 @@ def scan_active_and_shadow_positions(state_dir):
         t1 = shadow_targets.get("tranche_1_price")
         t2 = shadow_targets.get("tranche_2_price")
 
+        cohort = episode.get("rollout_cohort") or get_symbol_rollout_cohort(symbol)
         positions.append({
             "symbol": symbol,
+            "cohort": cohort,
             "opened_at": episode.get("opened_at"),
             "entry_price": entry_price,
             "qty": qty,
@@ -1442,8 +1446,10 @@ def render_shadow_execution_table(positions):
         t2_str = f"{money(t2)} ({'FILLED' if sh.get('tranche_2_filled') else 'PENDING'})" if t2 else "n/a"
         act_stop = f"{money(act.get('stop_price'))} ({percent(act.get('stop_percent'))})" if act.get("stop_price") else "n/a"
         sh_stop = f"{money(sh.get('stop_price'))} ({percent(sh.get('stop_percent'))})" if sh.get("stop_price") else "n/a"
+        cohort_label = (item.get("cohort") or "control").upper()
         rows.append([
-            item.get("symbol") or "n/a",
+            f"{item.get('symbol')} [{cohort_label}]",
+            cohort_label,
             money(item.get("entry_price")),
             number(item.get("qty")),
             act_stop,
@@ -1455,11 +1461,11 @@ def render_shadow_execution_table(positions):
         ])
     return markdown_table(
         [
-            "Symbol", "Entry Price", "Shares", "Active Stop", "Shadow Stop",
+            "Symbol", "Cohort", "Entry Price", "Shares", "Active Stop", "Shadow Stop",
             "Tranche 1 (1.0R / 50%)", "Tranche 2 (2.0R / 25%)", "Shadow Realized P/L", "Shadow Status",
         ],
         rows,
-        ["left", "right", "right", "right", "right", "left", "left", "right", "left"],
+        ["left", "center", "right", "right", "right", "right", "left", "left", "right", "left"],
         pad_columns=True,
         minimum_width=6,
     )

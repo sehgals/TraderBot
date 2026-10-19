@@ -1,0 +1,51 @@
+{
+  "archetypes": {
+    "default": {
+      "dynamic_entry_enabled": false,
+      "dynamic_entry_notional": 5000,
+      "dynamic_entry_time_in_force": "day",
+      "dynamic_lookback_days": 7,
+      "dynamic_market_filter_ignored_notional": 2500,
+      "dynamic_reentry_enabled": true,
+      "dynamic_replace_min_change_percent": 0.25,
+      "dynamic_replace_open_orders": true,
+      "dynamic_timeframe": "5Min",
+      "entry_quantity": 1,
+      "initial_stop_loss_percent": 20,
+      "ladder_buy_quantity": 0,
+      "ladder_drop_steps_percent": [],
+      "market_closed_poll_seconds": 900,
+      "max_symbol_notional_percent": 25,
+      "min_cash_balance_percent": 20,
+      "poll_seconds": 60,
+      "reentry_cooldown_seconds": 600,
+      "reentry_enabled": true,
+      "reentry_max_per_day": 1,
+      "reentry_quantity": 1,
+      "risk_profile": "large_cap",
+      "trail_stop_below_current_percent": 2.5,
+      "trail_trigger_step_percent": 5
+    },
+    "large_cap_tech": {
+      "dynamic_entry_notional": 5000,
+      "max_symbol_notional_percent": 25,
+      "risk_profile": "large_cap",
+      "trail_stop_below_current_percent": 2.5,
+      "trail_trigger_step_percent": 5.0
+    },
+    "high_beta_growth": {
+      "dynamic_entry_notional": 3000,
+      "max_symbol_notional_percent": 15,
+      "risk_profile": "high_beta",
+      "trail_stop_below_current_percent": 4.0,
+      "trail_trigger_step_percent": 7.0
+    },
+    "defensive_value": {
+      "dynamic_entry_notional": 5000,
+      "max_symbol_notional_percent": 20,
+      "risk_profile": "value",
+      "trail_stop_below_current_percent": 2.0,
+      "trail_trigger_step_percent": 4.0
+    }
+  }
+}

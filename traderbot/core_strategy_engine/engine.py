@@ -1,4 +1,5 @@
 from traderbot.core_strategy_engine.entry_models.entry_safety import checked_quote, quote_diagnostics
+from traderbot.universe.sector_resolver import resolve_sector_etf
 from traderbot.core_strategy_engine.hourly_policy import (
     TREND_MODELS, advance_confirmation, apply_hourly_entry_gate,
     hourly_entry_assessment, hourly_gate_mode,
@@ -973,11 +974,7 @@ def live_bar_context(client, symbol, config, exit_trade=None):
         )
     )
     health_settings = config.get("position_health") or {}
-    sector_symbol = str(
-        (health_settings.get("benchmark_by_symbol") or {}).get(symbol)
-        or health_settings.get("benchmark_symbol")
-        or MARKET_SYMBOL
-    ).upper()
+    sector_symbol = resolve_sector_etf(symbol, config)
     if sector_symbol == MARKET_SYMBOL:
         sector_bars = market_bars
     else:
@@ -1121,6 +1118,16 @@ def dynamic_entry_plan(
     shadow_risk = round(limit_price - shadow_stop, 2) if limit_price and shadow_stop else None
     shadow_t1 = round(limit_price + shadow_risk * 1.0, 2) if limit_price and shadow_risk else None
     shadow_t2 = round(limit_price + shadow_risk * 2.0, 2) if limit_price and shadow_risk else None
+    target_mode = config.get("target_mode") or (config.get("entry_models") or {}).get("target_mode", "legacy")
+    stop_mode = config.get("stop_mode") or (config.get("entry_models") or {}).get("stop_mode", "legacy")
+    if stop_mode == "v2" and shadow_stop:
+        selected_stop = shadow_stop
+        selected_risk = shadow_risk
+    if target_mode == "v2" and shadow_t2:
+        selected_target = shadow_t2
+        if shadow_risk and shadow_risk > 0:
+            selected_reward_risk = round((selected_target - limit_price) / shadow_risk, 2)
+
     shadow_execution = {
         "calibrated_stop_percent": calibrated_stop_pct,
         "shadow_stop_price": shadow_stop,
@@ -1199,6 +1206,9 @@ def dynamic_entry_plan(
         "qualification_policy": classified_candidate.get("qualification_policy"),
         "entry_candidates": entry_candidates,
         "shadow_execution": shadow_execution,
+        "stop_mode": stop_mode,
+        "target_mode": target_mode,
+        "rollout_cohort": config.get("rollout_cohort", "control"),
     }
 
 
@@ -1722,6 +1732,15 @@ def catastrophic_floor_price(config, entry_price):
 
 def managed_initial_floor_price(config, entry_price, context=None, plan=None):
     """Return the shared live/research floor used before trailing activates."""
+    stop_mode = config.get("stop_mode") or (config.get("entry_models") or {}).get("stop_mode", "legacy")
+    if stop_mode == "v2":
+        catastrophic = catastrophic_floor_price(config, entry_price)
+        planned_stop = float((plan or {}).get("stop_price") or 0)
+        if 0 < planned_stop < entry_price:
+            return max(catastrophic, planned_stop)
+        calibrated_pct = float(config.get("calibrated_structural_stop_percent", 3.5))
+        return max(catastrophic, entry_price * (1 - calibrated_pct / 100))
+
     floors = [
         initial_floor_price(config, entry_price, context),
         catastrophic_floor_price(config, entry_price),
@@ -2231,6 +2250,9 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "initial_risk_per_share": initial_risk,
         "original_target_price": target_price,
         "target_source": target_source,
+        "rollout_cohort": config.get("rollout_cohort", "control"),
+        "stop_mode": config.get("stop_mode", "legacy"),
+        "target_mode": config.get("target_mode", "legacy"),
         "initial_qty": qty,
         "requested_qty": requested_qty,
         "current_qty": qty,
@@ -2307,11 +2329,7 @@ def position_health_session_close(client, now):
 def position_health_market_context(client, config):
     settings = position_health_config(config)
     symbol = config["symbol"]
-    benchmark_symbol = str(
-        (settings.get("benchmark_by_symbol") or {}).get(symbol)
-        or settings.get("benchmark_symbol")
-        or MARKET_SYMBOL
-    ).upper()
+    benchmark_symbol = resolve_sector_etf(symbol, config)
     now = datetime.datetime.now(datetime.timezone.utc)
     session_close = position_health_session_close(client, now)
     start = iso_utc(now - datetime.timedelta(days=int(settings["lookback_days"])))

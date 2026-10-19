@@ -33,6 +33,12 @@ from traderbot.shadow_deployment import apply_promotion_stage, update_shadow_led
 from traderbot.data.tastytrade_collector import collect_tastytrade_comparison
 from traderbot.data.market_session import session_open_utc
 from traderbot.data.tastytrade_process import TastytradeStreamProcess
+from traderbot.core_strategy_engine.rollout import apply_rollout_settings
+from traderbot.universe.archetypes import (
+    resolve_watcher_paths,
+    resolve_watcher_strategy_defaults,
+)
+from traderbot.universe.sector_resolver import resolve_sector_etf
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -130,30 +136,36 @@ def load_supervisor_config(path):
             raise ValueError(f"Duplicate watcher symbol: {symbol}")
         seen_symbols.add(symbol)
 
-        config_file = watcher.get("config")
-        state_file = watcher.get("state")
+        config_path_resolved, state_path, log_path = resolve_watcher_paths(
+            symbol=symbol,
+            group=group,
+            project_root=project_root,
+            config_file=watcher.get("config"),
+            state_file=watcher.get("state"),
+            log_file=watcher.get("log"),
+        )
         defaults_key = f"{group}_watcher_defaults"
-        config_defaults = {
-            **config.get(defaults_key, {}),
-            **watcher.get("config_defaults", {}),
-        }
-        if not config_file and not config_defaults:
-            raise ValueError(f"{symbol} watcher must define config or {defaults_key}")
-        if not state_file:
-            raise ValueError(f"{symbol} watcher must define state")
+        if config_path_resolved:
+            config_defaults = {
+                **config.get(defaults_key, {}),
+                **watcher.get("config_defaults", {}),
+            }
+        else:
+            config_defaults = resolve_watcher_strategy_defaults(
+                symbol=symbol,
+                watcher=watcher,
+                supervisor_config=config,
+                project_root=project_root,
+            )
 
         prepared.append(
             {
                 "symbol": symbol,
                 "group": group,
-                "config_path": resolve_path(project_root, config_file)
-                if config_file
-                else None,
+                "config_path": config_path_resolved,
                 "config_defaults": config_defaults,
-                "state_path": resolve_path(project_root, state_file),
-                "log_path": resolve_path(
-                    project_root, watcher.get("log", f"{symbol.lower()}_watcher.jsonl")
-                ),
+                "state_path": state_path,
+                "log_path": log_path,
                 "enabled": watcher.get("enabled", True),
                 "next_run_at": 0.0,
                 "failures": 0,
@@ -344,6 +356,7 @@ def run_watcher(client, watcher, supervisor_config, clock, config_overrides=None
         if watcher.get("group") == "new"
         else DEFAULT_STRATEGY_TYPE,
     )
+    strategy_config = apply_rollout_settings(strategy_config, supervisor_config)
     state = load_json(watcher["state_path"], {})
     symbol = strategy_config.get("symbol", watcher["symbol"])
 
@@ -371,6 +384,8 @@ def run_watcher(client, watcher, supervisor_config, clock, config_overrides=None
     log_record = {
         "timestamp": iso_now(),
         "symbol": symbol,
+        "rollout_cohort": strategy_config.get("rollout_cohort", "control"),
+        "stop_mode": strategy_config.get("stop_mode", "legacy"),
         "duration_seconds": elapsed,
         "failures": watcher["failures"],
         "next_run_seconds": next_delay,
@@ -418,7 +433,7 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
         notional = abs(_float(position.get("market_value"))) or abs(
             _float(position.get("qty")) * _float(position.get("current_price"))
         )
-        sector = str(benchmark_by_symbol.get(symbol) or "Unmapped")
+        sector = resolve_sector_etf(symbol, supervisor_config)
         symbol_exposure[symbol] = symbol_exposure.get(symbol, 0) + notional
         sector_exposure[sector] = sector_exposure.get(sector, 0) + notional
         factor = str(factor_by_symbol.get(symbol) or sector)
@@ -431,7 +446,7 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
     for order in open_buy_orders:
         symbol = str(order.get("symbol") or "").upper()
         notional = _float(order.get("qty")) * _float(order.get("limit_price"))
-        sector = str(benchmark_by_symbol.get(symbol) or "Unmapped")
+        sector = resolve_sector_etf(symbol, supervisor_config)
         symbol_exposure[symbol] = symbol_exposure.get(symbol, 0) + notional
         sector_exposure[sector] = sector_exposure.get(sector, 0) + notional
         factor = str(factor_by_symbol.get(symbol) or sector)
@@ -461,16 +476,15 @@ def allocation_inputs(client, records, supervisor_config, watchers, project_root
             )
         ) / 100
         notional = min(target_notional, symbol_cap) if symbol_cap > 0 else target_notional
+        resolved_sector = resolve_sector_etf(record["symbol"], supervisor_config)
         candidates.append({
             "symbol": record["symbol"],
             "score": plan.get("setup_score"),
             "expected_reward_risk": plan.get("expected_reward_risk"),
             "notional": notional,
             "risk_dollars": notional * risk_per_share / limit_price if limit_price > 0 else 0,
-            "sector": benchmark_by_symbol.get(record["symbol"], "Unmapped"),
-            "factor": factor_by_symbol.get(
-                record["symbol"], benchmark_by_symbol.get(record["symbol"], "Unmapped")
-            ),
+            "sector": resolved_sector,
+            "factor": factor_by_symbol.get(record["symbol"], resolved_sector),
             "hard_safety_passed": not (plan.get("hard_blockers") or []),
             "candidate_as_of": plan.get("last_bar_time"),
             "model_id": plan.get("model_id") or plan.get("classified_model_id"),

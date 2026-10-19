@@ -812,5 +812,15 @@
   "reporting": {
     "total_gain_baseline": 50000
   },
-  "scheduler_sleep_seconds": 2
+  "scheduler_sleep_seconds": 2,
+  "stage_3_rollout": {
+    "enabled": true,
+    "stage": "3.2",
+    "canary_fraction": 0.25,
+    "salt": "stage3_canary",
+    "stop_mode": "v2",
+    "target_mode": "v2",
+    "calibrated_structural_stop_percent": 3.5,
+    "market_ok_hysteresis_bars": 2
+  }
 }
