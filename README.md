@@ -265,10 +265,18 @@ differences are written under `runtime/market_data/comparisons`. Tastytrade data
 is observation-only and cannot affect entries, positions, or order submission.
 
 The watcher supervisor also runs this comparison automatically for every enabled
-watcher while the market is open. Configure its five-minute schedule, candle
-timeframe, lookback, and symbol cap in the `tastytrade_comparison` block of
-`config/watchers.json`. Collection uses its own worker so a slow data stream does
-not delay watcher decisions. Run summaries and failures are recorded in
+watcher while the market is open. Both feeds request candles from that trading
+day's Alpaca-calendar open (normally 9:30 a.m. Eastern) through the observation
+time. Configure its five-minute schedule, candle timeframe, and symbol cap in
+the `tastytrade_comparison` block of `config/watchers.json`. Collection uses its
+own worker so a slow data stream does not delay watcher decisions. The supervisor
+starts a separate child process for DXLink. That process subscribes to all enabled
+comparison symbols in one session, keeps it open with 30-second keepalives, and
+reconnects if it drops. Each five-minute comparison requests the accumulated
+candles from the child process. Symbols with no DXLink
+candle yet are listed as `no_candle_symbols` and are not ranked as inferior.
+The `stream_seconds` setting is the maximum wait for the initial connection.
+Run summaries and failures are recorded in
 `runtime/logs/tastytrade_collection.jsonl`.
 
 ## Runtime Files

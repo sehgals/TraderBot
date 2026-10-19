@@ -215,23 +215,25 @@ def fetch_bars(
     return calculate_indicators(raw_bars)
 
 
-def cap_qty(config, desired_qty, price, current_qty):
+def cap_qty(config, desired_qty, price, current_qty, equity=None):
     qty = int(desired_qty)
     max_total = risk_setting(config, "max_total_position_qty")
     if max_total not in (None, ""):
         qty = min(qty, max(0, int(float(max_total)) - current_qty))
     max_notional_pct = risk_setting(config, "max_symbol_notional_percent")
     if max_notional_pct not in (None, "", 0):
-        cap_notional = ACCOUNT_EQUITY * float(max_notional_pct) / 100
+        eq = ACCOUNT_EQUITY if equity is None else float(equity)
+        cap_notional = eq * float(max_notional_pct) / 100
         qty = min(qty, max(0, math.floor(cap_notional / price) - current_qty))
     return max(0, qty)
 
 
-def ladder_cap_qty(config, open_pos, desired_qty, price):
+def ladder_cap_qty(config, open_pos, desired_qty, price, equity=None):
     qty = int(desired_qty)
     max_ladder_notional_pct = risk_setting(config, "max_ladder_notional_percent")
     if max_ladder_notional_pct not in (None, "", 0):
-        max_ladder_notional = ACCOUNT_EQUITY * float(max_ladder_notional_pct) / 100
+        eq = ACCOUNT_EQUITY if equity is None else float(equity)
+        max_ladder_notional = eq * float(max_ladder_notional_pct) / 100
         remaining_notional = max(0, max_ladder_notional - open_pos.get("ladder_notional", 0.0))
         qty = min(qty, math.floor(remaining_notional / price))
 
@@ -1403,6 +1405,12 @@ def main():
     parser.add_argument("--start", default=iso_utc(START))
     parser.add_argument("--end", default=iso_utc(END))
     parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
+    parser.add_argument(
+        "--starting-equity",
+        type=float,
+        default=ACCOUNT_EQUITY,
+        help=f"Starting equity for portfolio simulation (default: {ACCOUNT_EQUITY})",
+    )
     parser.add_argument("--apply-regime-exposure-bands", action="store_true")
     parser.add_argument("--only-entry-model")
     parser.add_argument("--research-variant", choices=VARIANTS)
@@ -1511,6 +1519,7 @@ def main():
         configs,
         bars_by_symbol,
         market_bars,
+        starting_equity=args.starting_equity,
         health_bars_by_symbol=health_bars_by_symbol,
         regime_bars_by_symbol=regime_bars_by_symbol,
         estimated_slippage_bps=args.estimated_slippage_bps,
@@ -1529,7 +1538,7 @@ def main():
         "start": iso_utc(start),
         "end": iso_utc(end),
         "timeframe": TIMEFRAME,
-        "account_equity_assumption": ACCOUNT_EQUITY,
+        "account_equity_assumption": args.starting_equity,
         "regime_exposure_bands_applied": args.apply_regime_exposure_bands,
         "isolated_entry_model": args.only_entry_model,
         "research_variant": args.research_variant,

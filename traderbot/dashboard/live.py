@@ -200,10 +200,11 @@ class LiveStore:
             episode = episode if isinstance(episode, dict) else {}
             if (number(health.get("position_qty")) == position.get("qty") and
                     number(episode.get("average_entry_price")) == position.get("avg_entry_price")):
-                mapping = {"state": "state", "score": "score", "recommended_action": "action", "as_of": "as_of",
+                mapping = {"state": "state", "score": "score", "exit_score": "exit_score", "recommended_action": "action", "as_of": "as_of",
                            "downside_score": "downside_score", "trend_score": "trend_score", "reward_risk_score": "reward_risk_score",
                            "stop_price": "stop_price", "stop_qty": "stop_qty", "data_fresh": "data_fresh", "data_complete": "data_complete", "reasons": "reasons"}
                 selected = {"position_health_" + dst: health.get(src) for src, dst in mapping.items()}
+                selected["entry_setup_score"] = number(episode.get("entry_setup_score"))
                 # Sanitize watcher values with the same field contract as reports.
                 for key in POSITION_NUMBERS:
                     if key.startswith("position_health_"):
@@ -224,6 +225,7 @@ class LiveStore:
             if valid:
                 evaluated, bar, selected, source = max(valid, key=lambda item: (item[0], item[1]))
                 position.update({k: v for k, v in selected.items() if k.startswith("position_health_")})
+                position["entry_setup_score"] = selected.get("entry_setup_score")
                 position.update(position_health_source=source, position_health_evaluated_at=evaluated.isoformat())
 
     def snapshot(self):

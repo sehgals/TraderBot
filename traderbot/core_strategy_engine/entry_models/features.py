@@ -4,15 +4,20 @@ from traderbot.core_strategy_engine.entry_models.entry_safety import reentry_pol
 from traderbot.core_strategy_engine.entry_models.filters import evaluate_entry_filters
 
 
-def market_ok_at(market_bars, timestamp):
-    """Return the completed-bar trend regime at ``timestamp``."""
+def market_ok_at(market_bars, timestamp, hysteresis_bars=1):
+    """Return the completed-bar trend regime at ``timestamp`` with optional confirmation hysteresis."""
     prior = [bar for bar in market_bars if bar["t"] <= timestamp]
-    if len(prior) < 6:
+    hysteresis = max(1, int(hysteresis_bars or 1))
+    if len(prior) < 5 + hysteresis:
         return True
-    bar = prior[-1]
-    previous = prior[-6]
-    ema21_slope = (bar["ema21"] - previous["ema21"]) / previous["ema21"]
-    return bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and ema21_slope >= 0
+    for offset in range(hysteresis):
+        idx = -1 - offset
+        bar = prior[idx]
+        previous = prior[idx - 5]
+        slope = (bar["ema21"] - previous["ema21"]) / previous["ema21"] if previous.get("ema21") else 0
+        if not (bar["c"] > bar["vwap"] and bar["c"] > bar["ema21"] and slope >= 0):
+            return False
+    return True
 
 
 def allowed_ledger_price(exit_price, realized_pl=0, strong=False):
@@ -67,8 +72,9 @@ def build_entry_features(
             strong=strong_volume,
         )
     )
-    market_ok = market_ok_at(market_bars, bar["t"])
-    sector_ok = market_ok_at(sector_bars, bar["t"]) if sector_bars else True
+    hysteresis = int((config or {}).get("market_ok_hysteresis_bars", 1))
+    market_ok = market_ok_at(market_bars, bar["t"], hysteresis_bars=hysteresis)
+    sector_ok = market_ok_at(sector_bars, bar["t"], hysteresis_bars=hysteresis) if sector_bars else True
     regime_ok = (
         (market_ok or not config.get("dynamic_require_market_regime", True))
         and (sector_ok or not config.get("dynamic_require_sector_regime", True))
@@ -103,6 +109,7 @@ def build_entry_features(
         "relative_dollar_volume": bar["volume_ratio"],
         "strong_volume": strong_volume,
         "market_ok": market_ok,
+        "market_ok_hysteresis_bars": hysteresis,
         "sector_ok": sector_ok,
         "regime_ok": regime_ok,
         "ledger_ignored": ledger_ignored,

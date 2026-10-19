@@ -31,6 +31,8 @@ from traderbot.broker.execution_gateway import ExecutionGateway
 from traderbot.portfolio_allocator import allocate_candidates, classify_exposure_regime
 from traderbot.shadow_deployment import apply_promotion_stage, update_shadow_ledger
 from traderbot.data.tastytrade_collector import collect_tastytrade_comparison
+from traderbot.data.market_session import session_open_utc
+from traderbot.data.tastytrade_process import TastytradeStreamProcess
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -882,6 +884,8 @@ def main():
     tastytrade_interval = max(60, int(tastytrade_settings.get("poll_seconds", 300)))
     next_tastytrade_collection_at = 0.0
     tastytrade_future = None
+    tastytrade_stream = None
+    tastytrade_stream_key = None
 
     for index, watcher in enumerate(watchers):
         watcher["next_run_at"] = 0.0 if args.once else time.monotonic() + index
@@ -896,6 +900,11 @@ def main():
                 tastytrade_future = None
             if not args.once:
                 supervisor_config, watchers = watcher_reloader.reload(supervisor_config, watchers)
+                tastytrade_settings = supervisor_config.get("tastytrade_comparison") or {}
+            if tastytrade_stream is not None and not tastytrade_settings.get("enabled", False):
+                tastytrade_stream.stop()
+                tastytrade_stream = None
+                tastytrade_stream_key = None
             due = due_watchers(watchers)
             allocator_enabled = (
                 supervisor_config.get("portfolio_allocator") or {}
@@ -929,8 +938,13 @@ def main():
                 }
 
             if collector_due:
+                next_collection_delay = tastytrade_interval
                 require_open = tastytrade_settings.get("require_market_open", True)
                 if require_open and not clock.get("is_open"):
+                    if tastytrade_stream is not None:
+                        tastytrade_stream.stop()
+                        tastytrade_stream = None
+                        tastytrade_stream_key = None
                     result = {
                         "status": "tastytrade_collection_skipped",
                         "reason": "market_closed",
@@ -939,6 +953,11 @@ def main():
                         project_root / TASTYTRADE_COLLECTION_LOG,
                         {"timestamp": iso_now(), "result": result},
                     )
+                    if clock.get("next_open"):
+                        next_collection_delay = min(
+                            tastytrade_interval,
+                            max(1, seconds_until_next_open(clock)),
+                        )
                 else:
                     collection_symbols = [
                         watcher["symbol"] for watcher in watchers if watcher.get("enabled")
@@ -946,14 +965,43 @@ def main():
                     observed_at = datetime.datetime.fromisoformat(
                         str(clock.get("timestamp") or iso_now()).replace("Z", "+00:00")
                     )
-                    tastytrade_future = collector_executor.submit(
-                        collect_tastytrade_comparison,
-                        tastytrade_settings,
-                        collection_symbols,
-                        project_root,
-                        observed_at,
-                    )
-                next_tastytrade_collection_at = time.monotonic() + tastytrade_interval
+                    try:
+                        maximum = min(100, max(1, int(tastytrade_settings.get("maximum_symbols", 100))))
+                        collection_symbols = list(dict.fromkeys(collection_symbols))[:maximum]
+                        start = session_open_utc(observed_at, AlpacaClient())
+                        start_text = start.isoformat().replace("+00:00", "Z")
+                        stream_key = (start_text, tuple(collection_symbols),
+                                      tastytrade_settings.get("timeframe", "5Min"))
+                        if tastytrade_stream_key != stream_key or (
+                            tastytrade_stream is not None and not tastytrade_stream.is_alive()
+                        ):
+                            if tastytrade_stream is not None:
+                                tastytrade_stream.stop()
+                            tastytrade_stream = TastytradeStreamProcess(
+                                collection_symbols, start_text, stream_key[2]
+                            ).start_background()
+                            tastytrade_stream_key = stream_key
+                            append_jsonl(project_root / TASTYTRADE_COLLECTION_LOG, {
+                                "timestamp": iso_now(),
+                                "result": {"status": "tastytrade_stream_started",
+                                           "pid": tastytrade_stream.pid,
+                                           "symbols": len(collection_symbols)},
+                            })
+                        tastytrade_future = collector_executor.submit(
+                            collect_tastytrade_comparison,
+                            tastytrade_settings,
+                            collection_symbols,
+                            project_root,
+                            observed_at,
+                            tastytrade_stream=tastytrade_stream,
+                        )
+                    except Exception as exc:
+                        append_jsonl(project_root / TASTYTRADE_COLLECTION_LOG, {
+                            "timestamp": iso_now(),
+                            "result": {"status": "tastytrade_collection_error",
+                                       "error_type": type(exc).__name__, "error": str(exc)},
+                        })
+                next_tastytrade_collection_at = time.monotonic() + next_collection_delay
 
             if not due:
                 if args.once:
@@ -1082,6 +1130,8 @@ def main():
 
         if tastytrade_future is not None:
             record_tastytrade_collection(project_root, tastytrade_future)
+        if tastytrade_stream is not None:
+            tastytrade_stream.stop()
 
     return 0
 

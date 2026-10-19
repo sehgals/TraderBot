@@ -230,6 +230,14 @@ def evaluate_position_health(
     elif state == "Watch":
         action = "watch"
 
+    # Higher values mean greater pressure to exit. Keep the displayed score
+    # aligned with the hard loss actions that override the weighted assessment.
+    exit_score = 100 - score if fully_protected else None
+    if exit_score is not None and entry_return_percent <= -float(settings["catastrophic_stop_loss_percent"]) + 1e-9:
+        exit_score = 100
+    elif exit_score is not None and entry_return_percent <= -float(settings["hard_reduction_loss_percent"]) + 1e-9:
+        exit_score = max(exit_score, 100 - int(settings["watch_score"]) + 1)
+
     failed_trend_checks = [name for name, passed in trend_checks.items() if not passed]
     reasons.extend(failed_trend_checks)
     return PositionHealthAssessment(
@@ -239,6 +247,7 @@ def evaluate_position_health(
         score=score,
         state=state,
         recommended_action=action,
+        exit_score=exit_score,
         downside_score=downside,
         trend_score=trend,
         reward_risk_score=rr,

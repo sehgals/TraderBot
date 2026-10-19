@@ -189,6 +189,39 @@ class TastytradeMarketDataClient:
     def stream_snapshot(self, symbols, start, timeframe="5Min", wait_seconds=8):
         """Collect current quotes/trades and historical candles in one DXLink session."""
         symbols = [str(symbol).upper() for symbol in symbols]
+        ws, start_at, period = self.open_stream(symbols, start, timeframe)
+        try:
+            if hasattr(ws, "settimeout"):
+                ws.settimeout(min(1.0, max(0.1, wait_seconds)))
+            snapshot = self._collect_events(
+                ws, symbols, period, wait_seconds, start_at=start_at
+            )
+        finally:
+            ws.close()
+
+        missing_quotes = [
+            symbol
+            for symbol, item in snapshot.items()
+            if item["quote"].get("bid_price") is None
+            or item["quote"].get("ask_price") is None
+        ]
+        if missing_quotes:
+            try:
+                rest_quotes = self.latest_quotes(missing_quotes)
+            except (OSError, RuntimeError, TimeoutError, ValueError):
+                rest_quotes = {}
+            for symbol in missing_quotes:
+                rest_quote = rest_quotes.get(symbol)
+                if rest_quote and rest_quote.get("bid_price") is not None \
+                        and rest_quote.get("ask_price") is not None:
+                    rest_quote = dict(rest_quote)
+                    rest_quote["feed"] = "tastytrade_rest_fallback"
+                    snapshot[symbol]["quote"] = rest_quote
+        return snapshot
+
+    def open_stream(self, symbols, start, timeframe="5Min"):
+        """Open and subscribe a DXLink socket; caller owns its lifetime."""
+        symbols = [str(symbol).upper() for symbol in symbols]
         if len(symbols) > 100:
             raise ValueError("DXLink Candle subscriptions support at most 100 symbols")
         period = TIMEFRAME_MAP.get(timeframe)
@@ -230,33 +263,10 @@ class TastytradeMarketDataClient:
                 ])
             self._send(ws, {"type": "FEED_SUBSCRIPTION", "channel": 3,
                             "reset": True, "add": additions})
-            if hasattr(ws, "settimeout"):
-                ws.settimeout(min(1.0, max(0.1, wait_seconds)))
-            snapshot = self._collect_events(
-                ws, symbols, period, wait_seconds, start_at=start_at
-            )
-        finally:
+        except Exception:
             ws.close()
-
-        missing_quotes = [
-            symbol
-            for symbol, item in snapshot.items()
-            if item["quote"].get("bid_price") is None
-            or item["quote"].get("ask_price") is None
-        ]
-        if missing_quotes:
-            try:
-                rest_quotes = self.latest_quotes(missing_quotes)
-            except (OSError, RuntimeError, TimeoutError, ValueError):
-                rest_quotes = {}
-            for symbol in missing_quotes:
-                rest_quote = rest_quotes.get(symbol)
-                if rest_quote and rest_quote.get("bid_price") is not None \
-                        and rest_quote.get("ask_price") is not None:
-                    rest_quote = dict(rest_quote)
-                    rest_quote["feed"] = "tastytrade_rest_fallback"
-                    snapshot[symbol]["quote"] = rest_quote
-        return snapshot
+            raise
+        return ws, start_at.astimezone(UTC), period
 
     def _collect_events(self, ws, symbols, period, wait_seconds, start_at=None):
         quotes = {symbol: {"feed": "tastytrade_dxlink", "symbol": symbol,

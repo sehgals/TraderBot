@@ -16,7 +16,7 @@ STATIC = Path(__file__).parent / "static"
 ACCOUNT_FIELDS = ("equity", "cash", "buying_power", "day_gain_percent")
 POSITION_NUMBERS = (
     "qty", "avg_entry_price", "current_price", "market_value", "total_gain_loss",
-    "total_gain_loss_percent", "position_health_score", "position_health_downside_score",
+    "total_gain_loss_percent", "entry_setup_score", "position_health_score", "position_health_exit_score", "position_health_downside_score",
     "position_health_trend_score", "position_health_reward_risk_score",
     "position_health_stop_price", "position_health_stop_qty",
 )
@@ -93,7 +93,11 @@ def create_app(store=None):
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; script-src-elem 'self'; "
+            "script-src-attr 'none'; style-src 'self'; style-src-elem 'self'; "
+            "style-src-attr 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+        )
         return response
 
     @app.get("/")

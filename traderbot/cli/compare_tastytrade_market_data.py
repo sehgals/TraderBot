@@ -8,6 +8,7 @@ import urllib.error
 
 from traderbot.core_strategy_engine.engine import AlpacaClient, load_env
 from traderbot.data.feed_comparison import append_observation, compare_source_observations
+from traderbot.data.market_session import session_open_utc
 from traderbot.data.tastytrade_market_data import TastytradeMarketDataClient
 
 
@@ -16,7 +17,6 @@ def parse_args(argv=None):
     parser.add_argument("symbols", nargs="+", help="US equity symbols")
     parser.add_argument("--timeframe", default="5Min",
                         choices=("1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"))
-    parser.add_argument("--lookback-hours", type=float, default=8.0)
     parser.add_argument("--stream-seconds", type=float, default=8.0)
     parser.add_argument("--output-root", default="runtime/market_data")
     return parser.parse_args(argv)
@@ -26,7 +26,12 @@ def main(argv=None):
     args = parse_args(argv)
     load_env()
     observed = dt.datetime.now(dt.timezone.utc)
-    start = observed - dt.timedelta(hours=args.lookback_hours)
+    alpaca = AlpacaClient()
+    try:
+        start = session_open_utc(observed, alpaca)
+    except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
+        print(f"trading calendar lookup failed: {exc}", file=sys.stderr)
+        return 2
     start_text = start.isoformat().replace("+00:00", "Z")
     end_text = observed.isoformat().replace("+00:00", "Z")
     symbols = list(dict.fromkeys(symbol.upper() for symbol in args.symbols))
@@ -39,7 +44,6 @@ def main(argv=None):
         print(f"tastytrade market-data collection failed: {exc}", file=sys.stderr)
         return 2
 
-    alpaca = AlpacaClient()
     output = []
     for symbol in symbols:
         common = {

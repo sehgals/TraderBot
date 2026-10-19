@@ -27,6 +27,7 @@ class PositionHealthAssessment:
     score: int | None
     state: str
     recommended_action: str
+    exit_score: int | None = None
     downside_score: int | None = None
     trend_score: int | None = None
     reward_risk_score: int | None = None

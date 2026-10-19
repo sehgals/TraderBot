@@ -212,7 +212,7 @@
     "minimum_add_setup_score": 85,
     "reduction_confirmation_bars": 2,
     "refresh_seconds": 3300,
-    "shadow_mode": false,
+    "shadow_mode": true,
     "stable_score": 65,
     "timeframe": "1Hour",
     "watch_score": 45

@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,6 +18,21 @@ from traderbot.core_strategy_engine.entry_models.candidate import (
     classify_entry_checks,
 )
 from traderbot.monitoring.supervisor import load_supervisor_config
+
+
+def load_state_json(path):
+    """Read a watcher state file for reporting; a corrupt file must not abort the report.
+
+    The live engine keeps using strict load_json so it never silently resets state.
+    """
+    try:
+        return load_json(path, {})
+    except (ValueError, OSError) as error:
+        print(
+            f"state_file_unreadable path={path} error={type(error).__name__}",
+            file=sys.stderr,
+        )
+        return {}
 
 
 DEFAULT_WATCHERS_PATH = "config/watchers.json"
@@ -163,7 +179,7 @@ def signal_strength(plan):
 def watcher_signal_strengths(project_root, watchers_path):
     strengths = {}
     for watcher in configured_watchers(project_root, watchers_path):
-        state = load_json(watcher["state_path"], {})
+        state = load_state_json(watcher["state_path"])
         strengths[watcher.get("symbol")] = signal_strength(state.get("dynamic_entry_plan"))
     return strengths
 
@@ -187,7 +203,7 @@ def flat_managed_stock_evaluations(project_root, watchers_path, positions):
         state_path = Path(watcher.get("state", ""))
         if not state_path.is_absolute():
             state_path = project_root / state_path
-        state = load_json(state_path, {})
+        state = load_state_json(state_path)
         plan = state.get("dynamic_entry_plan") or {}
         config_path = Path(watcher.get("config", ""))
         if not config_path.is_absolute():
@@ -230,6 +246,8 @@ def unavailable_position_health(reason="health_assessment_missing"):
     return {
         "position_health_state": "Unavailable",
         "position_health_score": None,
+        "position_health_exit_score": None,
+        "entry_setup_score": None,
         "position_health_action": "freeze",
         "position_health_as_of": None,
         "position_health_reasons": [reason],
@@ -238,12 +256,14 @@ def unavailable_position_health(reason="health_assessment_missing"):
     }
 
 
-def report_position_health(assessment):
+def report_position_health(assessment, entry_setup_score=None):
     if not assessment:
         return unavailable_position_health()
     return {
         "position_health_state": assessment.get("state") or "Unavailable",
         "position_health_score": assessment.get("score"),
+        "position_health_exit_score": assessment.get("exit_score"),
+        "entry_setup_score": entry_setup_score,
         "position_health_action": assessment.get("recommended_action") or "freeze",
         "position_health_as_of": assessment.get("as_of"),
         "position_health_reasons": assessment.get("reasons") or [],
@@ -271,7 +291,7 @@ def watcher_position_healths(project_root, watchers_path, client=None, positions
         _, supervisor_config, prepared_watchers = load_supervisor_config(watchers_path)
     watchers = prepared_watchers or configured_watchers(project_root, watchers_path)
     for watcher in watchers:
-        state = load_json(watcher["state_path"], {})
+        state = load_state_json(watcher["state_path"])
         assessment = state.get("position_health")
         position = broker_positions.get(watcher.get("symbol"))
         if client is not None and position is not None:
@@ -296,7 +316,11 @@ def watcher_position_healths(project_root, watchers_path, client=None, positions
                     f"health_refresh_error:{type(exc).__name__}"
                 )
                 continue
-        health[watcher.get("symbol")] = report_position_health(assessment)
+        episode = state.get("position_episode") or {}
+        entry_score = episode.get("entry_setup_score") if isinstance(episode, dict) else None
+        health[watcher.get("symbol")] = report_position_health(
+            assessment, entry_score if isinstance(entry_score, (int, float)) else None
+        )
     return health
 
 
@@ -629,7 +653,7 @@ def watcher_entry_history(project_root, watchers_path, end_at):
         symbol = watcher.get("symbol")
         if not symbol:
             continue
-        state = load_json(watcher["state_path"], {})
+        state = load_state_json(watcher["state_path"])
         exit_price = state.get("last_exit_entry_price")
         exit_at = parse_time(state.get("last_exit_at"))
         if exit_price not in (None, "") and exit_at:
@@ -827,6 +851,65 @@ def portfolio_utilization(account, positions, supervisor_config=None):
     }
 
 
+def scan_active_and_shadow_positions(state_dir):
+    p = Path(state_dir)
+    if not p.exists():
+        return []
+    state_files = list(p.glob("*_strategy_state.json"))
+    positions = []
+
+    for sf in state_files:
+        st = load_state_json(sf)
+        episode = st.get("position_episode") or {}
+        if not episode or episode.get("state") not in ("OPEN", "OPEN_PARTIAL"):
+            continue
+
+        symbol = episode.get("symbol") or sf.stem.replace("_strategy_state", "").upper()
+        entry_price = float(episode.get("average_entry_price") or 0.0)
+        qty = int(float(episode.get("current_qty") or 0))
+        if entry_price <= 0 or qty <= 0:
+            continue
+
+        active_stop = float(episode.get("initial_stop_price") or st.get("active_stop_price") or 0.0)
+        active_risk = round(entry_price - active_stop, 2) if active_stop else 0.0
+
+        shadow = episode.get("shadow_tracking") or {}
+        shadow_stop = float(shadow.get("shadow_stop_price") or entry_price * 0.965)
+        shadow_targets = shadow.get("shadow_targets") or {}
+        t1 = shadow_targets.get("tranche_1_price")
+        t2 = shadow_targets.get("tranche_2_price")
+
+        positions.append({
+            "symbol": symbol,
+            "opened_at": episode.get("opened_at"),
+            "entry_price": entry_price,
+            "qty": qty,
+            "max_price": float(episode.get("max_price") or entry_price),
+            "min_price": float(episode.get("min_price") or entry_price),
+            "mfe_percent": float(episode.get("mfe_percent") or 0.0),
+            "mae_percent": float(episode.get("mae_percent") or 0.0),
+            "active": {
+                "stop_price": active_stop,
+                "risk_per_share": active_risk,
+                "stop_percent": round((entry_price - active_stop) / entry_price * 100, 2) if entry_price and active_stop else None,
+            },
+            "shadow": {
+                "stop_price": shadow_stop,
+                "stop_percent": float(shadow.get("calibrated_stop_percent") or 3.5),
+                "tranche_1_price": t1,
+                "tranche_1_filled": shadow.get("tranche_1_filled", False),
+                "tranche_2_price": t2,
+                "tranche_2_filled": shadow.get("tranche_2_filled", False),
+                "shadow_realized_pnl": float(shadow.get("shadow_realized_pnl") or 0.0),
+                "shadow_remaining_qty": shadow.get("shadow_remaining_qty", qty),
+                "shadow_closed": shadow.get("shadow_closed", False),
+                "shadow_exit_reason": shadow.get("shadow_exit_reason"),
+            },
+        })
+
+    return positions
+
+
 def build_report(project_root, watchers_path, report_date, client=None):
     start_at, end_at = day_window(report_date)
     supervisor_config = load_json(watchers_path, {})
@@ -895,6 +978,7 @@ def build_report(project_root, watchers_path, report_date, client=None):
             **(allocation_state.get("shadow_ledger") or {}),
         },
         "current_positions": positions,
+        "stage_3_shadow_execution": scan_active_and_shadow_positions(project_root / "runtime" / "state"),
         "managed_stocks_not_held": flat_managed_stocks,
         "stocks_bought": bought,
         "stocks_sold": sold,
@@ -1318,7 +1402,9 @@ def render_position_health_table(positions):
         rows.append(
             [
                 item.get("symbol") or "n/a",
+                number(item.get("entry_setup_score")),
                 health,
+                number(item.get("position_health_exit_score")),
                 item.get("position_health_action") or "freeze",
                 percent(item.get("position_health_entry_return_percent")),
                 number(item.get("position_health_downside_score")),
@@ -1333,11 +1419,47 @@ def render_position_health_table(positions):
         )
     return markdown_table(
         [
-            "Symbol", "Health", "Action", "Entry Return", "Downside", "Trend",
+            "Symbol", "Entry Score", "Health", "Exit Score", "Action", "Entry Return", "Downside", "Trend",
             "Reward/Risk", "Remaining R", "Stop Coverage", "Data", "As Of", "Reasons",
         ],
         rows,
-        ["left", "left", "left", "right", "right", "right", "right", "right", "right", "left", "right", "left"],
+        ["left", "right", "left", "right", "left", "right", "right", "right", "right", "right", "right", "left", "right", "left"],
+        pad_columns=True,
+        minimum_width=6,
+    )
+
+
+def render_shadow_execution_table(positions):
+    if not positions:
+        return ["No open positions currently tracked in shadow mode."]
+    rows = []
+    for item in sorted(positions, key=lambda x: x.get("symbol") or ""):
+        act = item.get("active") or {}
+        sh = item.get("shadow") or {}
+        t1 = sh.get("tranche_1_price")
+        t2 = sh.get("tranche_2_price")
+        t1_str = f"{money(t1)} ({'FILLED' if sh.get('tranche_1_filled') else 'PENDING'})" if t1 else "n/a"
+        t2_str = f"{money(t2)} ({'FILLED' if sh.get('tranche_2_filled') else 'PENDING'})" if t2 else "n/a"
+        act_stop = f"{money(act.get('stop_price'))} ({percent(act.get('stop_percent'))})" if act.get("stop_price") else "n/a"
+        sh_stop = f"{money(sh.get('stop_price'))} ({percent(sh.get('stop_percent'))})" if sh.get("stop_price") else "n/a"
+        rows.append([
+            item.get("symbol") or "n/a",
+            money(item.get("entry_price")),
+            number(item.get("qty")),
+            act_stop,
+            sh_stop,
+            t1_str,
+            t2_str,
+            signed_money(sh.get("shadow_realized_pnl")),
+            sh.get("shadow_exit_reason") or ("ACTIVE" if not sh.get("shadow_closed") else "CLOSED"),
+        ])
+    return markdown_table(
+        [
+            "Symbol", "Entry Price", "Shares", "Active Stop", "Shadow Stop",
+            "Tranche 1 (1.0R / 50%)", "Tranche 2 (2.0R / 25%)", "Shadow Realized P/L", "Shadow Status",
+        ],
+        rows,
+        ["left", "right", "right", "right", "right", "left", "left", "right", "left"],
         pad_columns=True,
         minimum_width=6,
     )
@@ -1586,6 +1708,15 @@ def render_markdown(report):
     lines.extend(
         [
             "",
+            "## Stage 3.1: Shadow Execution Telemetry",
+            "Compares active broker stop and exit management against shadow execution (calibrated 3.5% structural stops, 2-bar regime hysteresis, and Target Mode v2 multi-tranche scaling). Position Health exits are currently in shadow mode.",
+            "",
+        ]
+    )
+    lines.extend(render_shadow_execution_table(report.get("stage_3_shadow_execution") or []))
+    lines.extend(
+        [
+            "",
             "## Managed Stocks Not Currently Held",
             "These are configured managed symbols with zero shares at Alpaca. Re-entry Qualified shows whether a symbol passes the execution checks with only observer mode ignored; YES does not authorize an order while observer mode is enabled. Decision and eligibility reasons show actual execution eligibility. Historical plans remain visible for audit but cannot authorize an order.",
             "",
@@ -1606,6 +1737,7 @@ def render_markdown(report):
             "",
             "### Position Health Method",
             "Position Health evaluates an open holding using entry-relative downside (45%), fresh holding-period trend (35%), and remaining reward/risk to the active broker stop (20%). Entry Setup scores are reserved for flat candidates and are not used as holding labels.",
+            "Entry Score is the setup score stored in the current position episode when available; reconstructed episodes may not have a score from the original purchase. Exit Score is 100 minus current Position Health, so higher means greater exit pressure. A catastrophic 8% loss scores 100; the 6% hard reduction raises Exit Score to at least 56. Missing protection or stale data leaves Exit Score unavailable while the safety action takes priority.",
             "",
             "Hard safety rules override the weighted score: incomplete stop coverage is Unprotected, a 6% entry-relative loss requires reduction, and the broker-held 8% catastrophic stop exits the remainder.",
             "",

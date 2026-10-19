@@ -139,12 +139,37 @@ def load_json(path, default):
 
 
 def save_json(path, data):
+    """Write JSON atomically so readers and crashes never see a partial file."""
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2, sort_keys=True)
-        file.write("\n")
+    temp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        # Windows can briefly deny replacement while another process reads the
+        # target (dashboard/report). Retry, then fall back to the previous
+        # direct write so atomic saving never fails where the old code succeeded.
+        for attempt in range(20):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    with open(path, "w", encoding="utf-8") as file:
+                        json.dump(data, file, indent=2, sort_keys=True)
+                        file.write("\n")
+                    break
+                time.sleep(0.025)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 class AlpacaClient:
@@ -1087,6 +1112,27 @@ def dynamic_entry_plan(
         else float(config.get("minimum_entry_reward_risk", 1.5))
     )
 
+    calibrated_stop_pct = float(config.get("calibrated_structural_stop_percent", 3.5))
+    shadow_stop = (
+        round(limit_price * (1 - calibrated_stop_pct / 100), 2)
+        if limit_price and limit_price > 0
+        else None
+    )
+    shadow_risk = round(limit_price - shadow_stop, 2) if limit_price and shadow_stop else None
+    shadow_t1 = round(limit_price + shadow_risk * 1.0, 2) if limit_price and shadow_risk else None
+    shadow_t2 = round(limit_price + shadow_risk * 2.0, 2) if limit_price and shadow_risk else None
+    shadow_execution = {
+        "calibrated_stop_percent": calibrated_stop_pct,
+        "shadow_stop_price": shadow_stop,
+        "shadow_risk_per_share": shadow_risk,
+        "shadow_targets": {
+            "tranche_1_1R": shadow_t1,
+            "tranche_2_2R": shadow_t2,
+        },
+        "active_stop_price": selected_stop,
+        "active_target_price": selected_target,
+    }
+
     return {
         "symbol": symbol,
         "status": "active_signal" if mode else "watch",
@@ -1152,6 +1198,7 @@ def dynamic_entry_plan(
         "decision_reasons": classified_candidate.get("decision_reasons", []),
         "qualification_policy": classified_candidate.get("qualification_policy"),
         "entry_candidates": entry_candidates,
+        "shadow_execution": shadow_execution,
     }
 
 
@@ -1491,11 +1538,24 @@ def reconcile_flat_position_state(client, symbol, state):
             state.pop("exit_record_missing", None)
     episode = state.get("position_episode")
     if episode:
+        opened_at_str = episode.get("opened_at")
+        closed_at_str = (exit_details or {}).get("last_exit_at") or iso_utc(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+        holding_hours = None
+        try:
+            if opened_at_str and closed_at_str:
+                t0 = parse_alpaca_time(opened_at_str)
+                t1 = parse_alpaca_time(closed_at_str)
+                if t0 and t1:
+                    holding_hours = round((t1 - t0).total_seconds() / 3600, 2)
+        except Exception:
+            pass
         closed_episode = {
             **episode,
             "state": "CLOSED",
-            "closed_at": (exit_details or {}).get("last_exit_at")
-            or iso_utc(datetime.datetime.now(datetime.timezone.utc)),
+            "closed_at": closed_at_str,
+            "holding_hours": holding_hours,
             "exit_order_id": (exit_details or {}).get("last_exit_order_id"),
             "exit_price": (exit_details or {}).get("last_exit_price"),
             "exit_reason": (exit_details or {}).get("exit_reason") or "unknown",
@@ -2117,6 +2177,36 @@ def ensure_position_episode(config, state, position, entry_order=None):
             config, entry_price, plan=plan
         )
         initial_risk = entry_price - initial_stop
+    requested_qty = (
+        int(float((entry_order or {}).get("qty") or 0))
+        or int(float(state.get("pending_entry_requested_qty") or 0))
+        or qty
+    )
+    stop_loss_pct = (
+        round((entry_price - float(initial_stop)) / entry_price * 100, 4)
+        if (initial_stop is not None and entry_price > 0)
+        else None
+    )
+    atr_val = (
+        float(plan.get("atr14") or 0)
+        if plan and plan.get("atr14") is not None
+        else 0.0
+    )
+    atr_pct = (
+        round(atr_val / entry_price * 100, 4)
+        if (atr_val > 0 and entry_price > 0)
+        else None
+    )
+    req_risk_dollars = (
+        round(requested_qty * float(initial_risk), 4)
+        if (initial_risk is not None and requested_qty > 0)
+        else None
+    )
+    filled_risk_dollars = (
+        round(qty * float(initial_risk), 4)
+        if (initial_risk is not None and qty > 0)
+        else None
+    )
     episode = {
         "episode_id": episode_id,
         "symbol": config["symbol"],
@@ -2142,10 +2232,46 @@ def ensure_position_episode(config, state, position, entry_order=None):
         "original_target_price": target_price,
         "target_source": target_source,
         "initial_qty": qty,
+        "requested_qty": requested_qty,
         "current_qty": qty,
         "average_entry_price": entry_price,
+        "requested_notional": round(requested_qty * entry_price, 2) if entry_price else None,
+        "filled_notional": round(qty * entry_price, 2) if entry_price else None,
+        "requested_risk_dollars": req_risk_dollars,
+        "filled_risk_dollars": filled_risk_dollars,
+        "stop_loss_percent": stop_loss_pct,
+        "atr_percent": atr_pct,
+        "max_price": entry_price,
+        "min_price": entry_price,
+        "mfe_percent": 0.0,
+        "mae_percent": 0.0,
+        "mfe_r": 0.0 if initial_risk else None,
+        "mae_r": 0.0 if initial_risk else None,
         "add_count": 0,
         "adverse_reduction_completed": bool(state.get("adverse_reduction_completed")),
+        "shadow_tracking": {
+            "calibrated_stop_percent": float(config.get("calibrated_structural_stop_percent", 3.5)),
+            "shadow_stop_price": round(entry_price * (1 - float(config.get("calibrated_structural_stop_percent", 3.5)) / 100), 2) if entry_price > 0 else None,
+            "shadow_risk_per_share": round(entry_price - round(entry_price * (1 - float(config.get("calibrated_structural_stop_percent", 3.5)) / 100), 2), 2) if entry_price > 0 else None,
+            "shadow_targets": {
+                "tranche_1_price": round(entry_price + (entry_price - round(entry_price * (1 - float(config.get("calibrated_structural_stop_percent", 3.5)) / 100), 2)) * 1.0, 2) if entry_price > 0 else None,
+                "tranche_2_price": round(entry_price + (entry_price - round(entry_price * (1 - float(config.get("calibrated_structural_stop_percent", 3.5)) / 100), 2)) * 2.0, 2) if entry_price > 0 else None,
+            },
+            "shadow_qty": qty,
+            "shadow_remaining_qty": qty,
+            "shadow_realized_pnl": 0.0,
+            "tranche_1_filled": False,
+            "tranche_1_fill_price": None,
+            "tranche_1_fill_time": None,
+            "tranche_2_filled": False,
+            "tranche_2_fill_price": None,
+            "tranche_2_fill_time": None,
+            "shadow_stop_hit": False,
+            "shadow_closed": False,
+            "shadow_exit_price": None,
+            "shadow_exit_reason": None,
+            "shadow_exit_time": None,
+        },
     }
     state["position_episode"] = episode
     state.pop("position_health_confirmation", None)
@@ -2386,6 +2512,7 @@ def submit_confirmed_health_action(client, config, state, position, health):
         "qty": action_qty,
         "position_qty": position_qty,
         "health_score": health.get("score"),
+        "exit_score": health.get("exit_score"),
         "health_state": health.get("state"),
         "confirmation_bars": confirmation.get("count"),
         "canceled_stop_order_ids": canceled_stop_order_ids,
@@ -2891,13 +3018,15 @@ def evaluate_flat_entry_eligibility(config, state, plan=None, now=None, mode=Non
 
 
 def dynamic_entry_reference_qty(client, config, state, fallback_qty):
+    target_qty = int(float(fallback_qty or 0))
+    if target_qty > 0:
+        return target_qty
     position = client.position(config["symbol"])
     position_qty = position_quantity(position)
     for value in (
         position_qty,
         state.get("active_stop_qty"),
         state.get("last_exit_qty"),
-        fallback_qty,
     ):
         qty = int(float(value or 0))
         if qty > 0:
@@ -2977,6 +3106,7 @@ def submit_dynamic_entry(client, config, state, plan, reason_prefix):
     requested_qty = dynamic_entry_quantity(
         config, plan, equity=float(client.account().get("equity") or 0)
     )
+    state["pending_entry_requested_qty"] = requested_qty
     daily_limit = dynamic_entry_share_limit(
         client,
         config,
@@ -3495,6 +3625,94 @@ def run_once(client, config, state, clock=None):
         return handle_reentry(client, config, state)
 
     current_price = client.latest_trade_price(symbol)
+    episode = state.get("position_episode")
+    if episode and current_price > 0 and fill_price > 0:
+        high_water = max(float(episode.get("max_price") or fill_price), current_price)
+        low_water = min(float(episode.get("min_price") or fill_price), current_price)
+        episode["max_price"] = high_water
+        episode["min_price"] = low_water
+        mfe_dollars = max(0.0, high_water - fill_price)
+        mae_dollars = max(0.0, fill_price - low_water)
+        episode["mfe_percent"] = round(mfe_dollars / fill_price * 100, 4)
+        episode["mae_percent"] = round(mae_dollars / fill_price * 100, 4)
+        init_r = float(episode.get("initial_risk_per_share") or 0)
+        if init_r > 0:
+            episode["mfe_r"] = round(mfe_dollars / init_r, 4)
+            episode["mae_r"] = round(mae_dollars / init_r, 4)
+
+        shadow = episode.setdefault("shadow_tracking", {})
+        if not shadow.get("shadow_targets"):
+            calibrated_stop_pct = float(config.get("calibrated_structural_stop_percent", 3.5))
+            shadow_initial_stop = round(fill_price * (1 - calibrated_stop_pct / 100), 2)
+            shadow_risk = round(fill_price - shadow_initial_stop, 2)
+            shadow.update({
+                "calibrated_stop_percent": calibrated_stop_pct,
+                "shadow_stop_price": shadow_initial_stop,
+                "shadow_risk_per_share": shadow_risk,
+                "shadow_targets": {
+                    "tranche_1_price": round(fill_price + shadow_risk * 1.0, 2),
+                    "tranche_2_price": round(fill_price + shadow_risk * 2.0, 2),
+                },
+                "shadow_qty": qty,
+                "shadow_remaining_qty": qty,
+                "shadow_realized_pnl": 0.0,
+                "tranche_1_filled": False,
+                "tranche_1_fill_price": None,
+                "tranche_1_fill_time": None,
+                "tranche_2_filled": False,
+                "tranche_2_fill_price": None,
+                "tranche_2_fill_time": None,
+                "shadow_stop_hit": False,
+                "shadow_closed": False,
+                "shadow_exit_price": None,
+                "shadow_exit_reason": None,
+                "shadow_exit_time": None,
+            })
+
+        if shadow and not shadow.get("shadow_closed"):
+            t1_price = shadow.get("shadow_targets", {}).get("tranche_1_price")
+            t2_price = shadow.get("shadow_targets", {}).get("tranche_2_price")
+            shadow_stop = shadow.get("shadow_stop_price")
+            now_iso = iso_utc(datetime.datetime.now(datetime.timezone.utc))
+
+            stop_triggered = False
+            if shadow_stop:
+                if not shadow.get("tranche_1_filled"):
+                    stop_triggered = (low_water <= shadow_stop)
+                else:
+                    stop_triggered = (current_price <= shadow_stop)
+
+            if stop_triggered:
+                shadow["shadow_stop_hit"] = True
+                shadow["shadow_closed"] = True
+                shadow["shadow_exit_price"] = shadow_stop
+                shadow["shadow_exit_time"] = now_iso
+                rem_qty = shadow.get("shadow_remaining_qty", shadow.get("shadow_qty", qty))
+                shadow["shadow_exit_reason"] = "shadow_breakeven_stop" if shadow.get("tranche_1_filled") else "shadow_stop_floor"
+                exit_pnl = round((shadow_stop - fill_price) * rem_qty, 2)
+                shadow["shadow_realized_pnl"] = round(shadow.get("shadow_realized_pnl", 0.0) + exit_pnl, 2)
+                shadow["shadow_remaining_qty"] = 0
+            else:
+                if t1_price and high_water >= t1_price and not shadow.get("tranche_1_filled"):
+                    shadow["tranche_1_filled"] = True
+                    shadow["tranche_1_fill_price"] = t1_price
+                    shadow["tranche_1_fill_time"] = now_iso
+                    total_qty = shadow.get("shadow_qty", qty)
+                    t1_qty = max(1, total_qty // 2)
+                    t1_pnl = round((t1_price - fill_price) * t1_qty, 2)
+                    shadow["shadow_realized_pnl"] = round(shadow.get("shadow_realized_pnl", 0.0) + t1_pnl, 2)
+                    shadow["shadow_remaining_qty"] = total_qty - t1_qty
+                    shadow["shadow_stop_price"] = fill_price
+
+                if shadow.get("tranche_1_filled") and t2_price and high_water >= t2_price and not shadow.get("tranche_2_filled"):
+                    shadow["tranche_2_filled"] = True
+                    shadow["tranche_2_fill_price"] = t2_price
+                    shadow["tranche_2_fill_time"] = now_iso
+                    total_qty = shadow.get("shadow_qty", qty)
+                    t2_qty = max(1, (total_qty - (total_qty // 2)) // 2)
+                    t2_pnl = round((t2_price - fill_price) * t2_qty, 2)
+                    shadow["shadow_realized_pnl"] = round(shadow.get("shadow_realized_pnl", 0.0) + t2_pnl, 2)
+                    shadow["shadow_remaining_qty"] = max(0, shadow.get("shadow_remaining_qty", total_qty) - t2_qty)
 
     context = risk_context(client, config) if risk_context_needed(config) else None
     base_floor = managed_initial_floor_price(

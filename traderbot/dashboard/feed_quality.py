@@ -112,8 +112,9 @@ def feed_quality_snapshot(root, maximum_days=20):
                 grouped[symbol].append(row)
     corrected = {}
     for symbol, rows in grouped.items():
-        version_two = [row for row in rows if int(row.get("schema_version") or 1) >= 2]
-        corrected[symbol] = version_two or rows
+        latest_version = max(int(row.get("schema_version") or 1) for row in rows)
+        corrected[symbol] = [row for row in rows
+                             if int(row.get("schema_version") or 1) == latest_version]
     return sorted((_score(symbol, rows) for symbol, rows in corrected.items()),
                   key=lambda row: row["symbol"])
 

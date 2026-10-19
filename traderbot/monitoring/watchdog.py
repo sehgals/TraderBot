@@ -103,30 +103,32 @@ def consume_restart_request():
     if not RESTART_REQUEST_PATH.exists():
         return False
     request = json.loads(RESTART_REQUEST_PATH.read_text(encoding="utf-8"))
-    expected_pid = int(request["expected_pid"])
+    expected_pid = request.get("expected_pid")
     supervisor_pids = get_supervisor_process_ids()
-    if expected_pid not in supervisor_pids:
+    if expected_pid is not None and int(expected_pid) not in supervisor_pids:
         raise RuntimeError(
             f"restart request PID {expected_pid} is not a named watcher supervisor; "
             f"found {supervisor_pids}"
         )
-    result = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            f"Stop-Process -Id {expected_pid} -Force",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        creationflags=NO_WINDOW,
-    )
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout).strip()
-        raise RuntimeError(details or f"failed to stop supervisor PID {expected_pid}")
-    RESTART_REQUEST_PATH.unlink()
-    write_monitor_log(f"Consumed restart request and stopped supervisor PID {expected_pid}.")
+    pids_to_stop = [int(expected_pid)] if expected_pid is not None else supervisor_pids
+    for pid in pids_to_stop:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"Stop-Process -Id {pid} -Force",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(details or f"failed to stop supervisor PID {pid}")
+    RESTART_REQUEST_PATH.unlink(missing_ok=True)
+    write_monitor_log(f"Consumed restart request and stopped supervisor PID(s) {pids_to_stop}.")
     start_supervisor()
     write_monitor_log("Restart request completed; started a fresh watcher supervisor.")
     return True
@@ -141,7 +143,7 @@ def start_supervisor():
     SUPERVISOR_OUT.parent.mkdir(parents=True, exist_ok=True)
     stdout = SUPERVISOR_OUT.open("a", encoding="utf-8")
     stderr = SUPERVISOR_ERR.open("a", encoding="utf-8")
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [
             str(PYTHONW_EXE),
             "-m",
@@ -156,6 +158,18 @@ def start_supervisor():
         close_fds=True,
         creationflags=NO_WINDOW,
     )
+    status_file = PROJECT_ROOT / "runtime" / "state" / "supervisor_status.json"
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status_file.write_text(
+        json.dumps({
+            "pid": proc.pid,
+            "session": 0,
+            "user": "SYSTEM",
+            "started_at": local_now(),
+        }, indent=2),
+        encoding="utf-8",
+    )
+    return proc.pid
 
 
 def main():

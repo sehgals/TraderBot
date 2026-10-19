@@ -36,7 +36,15 @@ def load_exit_attribution(watchers_path):
     watchers = payload.get("managed_watchers", payload.get("watchers", []))
     watchers = [*watchers, *payload.get("new_watchers", [])]
     for watcher in watchers:
-        state = load_json(root / watcher["state"], {})
+        try:
+            state = load_json(root / watcher["state"], {})
+        except (ValueError, OSError) as error:
+            print(
+                f"state_file_unreadable path={root / watcher['state']} "
+                f"error={type(error).__name__}",
+                file=sys.stderr,
+            )
+            continue
         for order_id, item in (state.get("exit_order_intents") or {}).items():
             if item.get("exit_reason") and item["exit_reason"] != "unknown":
                 attribution[order_id] = {**item, "exit_reason_source": "watcher_intent"}
@@ -48,6 +56,32 @@ def load_exit_attribution(watchers_path):
                         order_id, {**event, "exit_reason_source": "watcher_episode"}
                     )
     return attribution
+
+
+def load_episode_attribution(watchers_path):
+    """Load metadata for closed position episodes across all watchers."""
+    watchers_file = Path(watchers_path).resolve()
+    root = watchers_file.parent.parent if watchers_file.parent.name == "config" else watchers_file.parent
+    payload = load_json(watchers_file, {})
+    episodes_meta = {}
+    watchers = payload.get("managed_watchers", payload.get("watchers", []))
+    watchers = [*watchers, *payload.get("new_watchers", [])]
+    for watcher in watchers:
+        try:
+            state = load_json(root / watcher["state"], {})
+        except (ValueError, OSError):
+            continue
+        for episode in state.get("closed_position_episodes") or []:
+            ep_id = episode.get("episode_id")
+            if ep_id:
+                episodes_meta[ep_id] = {
+                    "holding_hours": episode.get("holding_hours"),
+                    "mfe_percent": episode.get("mfe_percent"),
+                    "mae_percent": episode.get("mae_percent"),
+                    "mfe_r": episode.get("mfe_r"),
+                    "mae_r": episode.get("mae_r"),
+                }
+    return episodes_meta
 
 
 def broker_order_attribution(order):
@@ -144,7 +178,9 @@ def summarize_window(rows, horizon):
     }
 
 
-def build_report(fills, trades, rows, start, end):
+def build_report(fills, trades, rows, start, end, episodes_meta=None):
+    if episodes_meta is None:
+        episodes_meta = {}
     winners = [row for row in rows if row["realized_pl"] >= 0]
     losers = [row for row in rows if row["realized_pl"] < 0]
     episodes = defaultdict(list)
@@ -189,6 +225,15 @@ def build_report(fills, trades, rows, start, end):
                 "exit_events": len(events),
                 "realized_pl": round(sum(event["realized_pl"] for event in events), 2),
                 "exit_reasons": sorted(set(event.get("exit_reason") or "unknown" for event in events)),
+                "holding_hours": (
+                    (episodes_meta.get(episode_id) or {}).get("holding_hours")
+                    if (episodes_meta.get(episode_id) or {}).get("holding_hours") is not None
+                    else round((max(event["exit_time"] for event in events) - min(event["entry_time"] for event in events)).total_seconds() / 3600, 2)
+                ),
+                "mfe_percent": (episodes_meta.get(episode_id) or {}).get("mfe_percent"),
+                "mae_percent": (episodes_meta.get(episode_id) or {}).get("mae_percent"),
+                "mfe_r": (episodes_meta.get(episode_id) or {}).get("mfe_r"),
+                "mae_r": (episodes_meta.get(episode_id) or {}).get("mae_r"),
             }
             for episode_id, events in episodes.items()
         ],
@@ -209,7 +254,8 @@ def main():
     fills = enrich_fills(client.fills(args.start, args.end), load_exit_attribution(args.watchers), client)
     trades = pair_completed_trades(fills, symbols)
     rows = recovery_metrics(client, trades, args.end)
-    report = build_report(fills, trades, rows, args.start, args.end)
+    episodes_meta = load_episode_attribution(args.watchers)
+    report = build_report(fills, trades, rows, args.start, args.end, episodes_meta=episodes_meta)
     output = Path(args.output) if args.output else ROOT / "runtime" / "reports" / f"exit_ledger_baseline_{datetime.date.today().isoformat()}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")

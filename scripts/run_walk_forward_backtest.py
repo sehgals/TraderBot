@@ -19,6 +19,9 @@ from scripts.run_risk_control_backtest import (
     position_health_config,
     simulate_portfolio,
 )
+from traderbot.core_strategy_engine.entry_models.filters import (
+    PROFILE_LIQUIDITY_DEFAULTS,
+)
 from traderbot.backtester.baseline import (
     attribution_by_dimensions,
     combine_forward_return_reports,
@@ -114,7 +117,9 @@ def walk_forward_windows(start, end, train_days=90, test_days=30, purge_days=1):
     return windows
 
 
-def prepare_filter_configs(configs, has_quotes=False, has_calendar=False):
+def prepare_filter_configs(
+    configs, has_quotes=False, has_calendar=False, liquidity_scale=1.0
+):
     prepared = copy.deepcopy(configs)
     coverage = {}
     for config in prepared.values():
@@ -122,6 +127,21 @@ def prepare_filter_configs(configs, has_quotes=False, has_calendar=False):
         for name in ("liquidity", "gap"):
             settings.setdefault(name, {})["enabled"] = True
             coverage[name] = "tested_from_5Min_bars"
+        if liquidity_scale != 1.0:
+            liquidity = settings["liquidity"]
+            if liquidity_scale <= 0:
+                liquidity["enabled"] = False
+                coverage["liquidity"] = "disabled_for_experiment"
+            else:
+                base = liquidity.get(
+                    "minimum_intraday_dollar_volume",
+                    liquidity.get(
+                        "minimum_average_dollar_volume",
+                        PROFILE_LIQUIDITY_DEFAULTS.get(config.get("risk_profile"), 250_000),
+                    ),
+                )
+                liquidity["minimum_intraday_dollar_volume"] = float(base) * liquidity_scale
+                coverage["liquidity"] = f"tested_from_5Min_bars_scale_{liquidity_scale}"
         settings.setdefault("spread", {})["enabled"] = bool(has_quotes)
         coverage["spread"] = (
             "tested_from_point_in_time_quotes"
@@ -226,8 +246,20 @@ def main():
     parser.add_argument("--historical-quotes")
     parser.add_argument("--event-calendar")
     parser.add_argument("--estimated-slippage-bps", type=float, default=5.0)
+    parser.add_argument(
+        "--starting-equity",
+        type=float,
+        default=ACCOUNT_EQUITY,
+        help=f"Starting equity for portfolio simulation (default: {ACCOUNT_EQUITY})",
+    )
     parser.add_argument("--apply-regime-exposure-bands", action="store_true")
     parser.add_argument("--only-entry-model")
+    parser.add_argument(
+        "--liquidity-scale",
+        type=float,
+        default=1.0,
+        help="Multiply the liquidity minimum; 0 disables the gate (experiments).",
+    )
     parser.add_argument(
         "--calibrate-entry-weights",
         action="store_true",
@@ -261,6 +293,7 @@ def main():
         configs,
         has_quotes=quote_payload is not None,
         has_calendar=event_calendar is not None,
+        liquidity_scale=args.liquidity_scale,
     )
     context = HistoricalFilterContext(quote_payload, event_calendar)
 
@@ -353,7 +386,7 @@ def main():
                     configs_with_score_weights(configs, weights),
                     training_symbols,
                     training_market,
-                    starting_equity=ACCOUNT_EQUITY,
+                    starting_equity=args.starting_equity,
                     health_bars_by_symbol=training_health,
                     regime_bars_by_symbol=training_regime,
                     entry_filter_context_at=context.at,
@@ -382,7 +415,7 @@ def main():
             window_configs,
             sliced_symbols,
             sliced_market,
-            starting_equity=ACCOUNT_EQUITY,
+            starting_equity=args.starting_equity,
             health_bars_by_symbol=sliced_health,
             regime_bars_by_symbol=sliced_regime,
             entry_filter_context_at=context.at,
@@ -476,6 +509,7 @@ def main():
             "walk_forward_parameters": {
                 "start": iso_utc(start),
                 "end": iso_utc(end),
+                "starting_equity": args.starting_equity,
                 "train_days": args.train_days,
                 "test_days": args.test_days,
                 "purge_days": args.purge_days,

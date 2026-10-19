@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -74,6 +75,18 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("ReactDOM", response.text)
         self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_csp_allows_external_assets_and_rejects_inline_content(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        policy = response.headers["content-security-policy"]
+        self.assertIn("script-src-elem 'self'", policy)
+        self.assertIn("script-src-attr 'none'", policy)
+        self.assertIn("style-src-elem 'self'", policy)
+        self.assertIn("style-src-attr 'none'", policy)
+        self.assertNotIn("'unsafe-inline'", policy)
+        self.assertNotRegex(response.text, r"<script(?![^>]+\bsrc=)[^>]*>")
+        self.assertNotRegex(response.text, r"\s(?:on\w+|style)\s*=")
 
 
 if __name__ == "__main__":
