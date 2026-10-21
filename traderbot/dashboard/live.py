@@ -255,4 +255,6 @@ class LiveStore:
         data["generated_at"] = now.isoformat()
         data["operations"] = self.operations.snapshot(p["symbol"] for p in data["positions"])
         data["feed_comparisons"] = feed_quality_snapshot(self.root)
+        maint_path = self.root / "runtime/state/maintenance_window.json"
+        data["maintenance"] = read_object(maint_path) if maint_path.exists() else None
         return data

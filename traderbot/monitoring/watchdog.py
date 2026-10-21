@@ -11,6 +11,7 @@ LOG_PATH = LOG_DIR / "watcher_monitor.log"
 ALERT_PATH = LOG_DIR / "watcher_monitor_alerts.jsonl"
 RESTART_REQUEST_PATH = PROJECT_ROOT / "runtime" / "state" / "supervisor_restart_request.json"
 DASHBOARD_RESTART_REQUEST_PATH = PROJECT_ROOT / "runtime" / "state" / "dashboard_restart_request.json"
+MAINTENANCE_WINDOW_PATH = PROJECT_ROOT / "runtime" / "state" / "maintenance_window.json"
 WATCHER_SUPERVISOR_TASK = "TraderBot_Watcher_Supervisor"
 PYTHONW_EXE = (
     Path(r"C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python")
@@ -155,6 +156,54 @@ def consume_dashboard_restart_request():
     return True
 
 
+def check_maintenance_window():
+    """Check if TraderBot is in an active maintenance/shutdown window."""
+    if not MAINTENANCE_WINDOW_PATH.exists():
+        return False
+    try:
+        data = json.loads(MAINTENANCE_WINDOW_PATH.read_text(encoding="utf-8"))
+        if not data.get("active", False):
+            return False
+
+        # If auto_resume is enabled and resume_at has passed, expire the window
+        resume_at = data.get("resume_at")
+        auto_resume = data.get("auto_resume", False)
+        if auto_resume and resume_at:
+            try:
+                resume_dt = datetime.datetime.fromisoformat(resume_at)
+                now_dt = datetime.datetime.now(resume_dt.tzinfo or datetime.timezone.utc)
+                if now_dt >= resume_dt:
+                    MAINTENANCE_WINDOW_PATH.unlink(missing_ok=True)
+                    write_monitor_log(f"Maintenance window expired at {resume_at}. Resuming operations.")
+                    return False
+            except Exception as dt_err:
+                write_monitor_log(f"Error parsing resume_at '{resume_at}': {dt_err}")
+
+        # Maintenance is active. Ensure supervisor process is stopped.
+        supervisor_pids = get_supervisor_process_ids()
+        if supervisor_pids:
+            for pid in supervisor_pids:
+                subprocess.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-Command",
+                        f"Stop-Process -Id {pid} -Force",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=NO_WINDOW,
+                )
+            write_monitor_log(f"Maintenance active; terminated supervisor PID(s): {supervisor_pids}.")
+        else:
+            write_monitor_log("Maintenance active; supervisor remains stopped.")
+        return True
+    except Exception as exc:
+        write_monitor_log(f"Error checking maintenance window: {exc}")
+        return False
+
+
 def start_supervisor():
     if not PYTHONW_EXE.exists():
         raise FileNotFoundError(f"Python executable not found: {PYTHONW_EXE}")
@@ -200,6 +249,12 @@ def main():
         consume_dashboard_restart_request()
     except Exception as exc:
         write_monitor_log(f"Failed to consume dashboard restart request: {exc}")
+
+    try:
+        if check_maintenance_window():
+            return 0
+    except Exception as exc:
+        write_monitor_log(f"Failed during maintenance window check: {exc}")
 
     try:
         if consume_restart_request():

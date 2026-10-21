@@ -52,6 +52,18 @@ PORTFOLIO_ALLOCATION_STATE = RUNTIME_STATE_DIR / "portfolio_allocation_state.jso
 PORTFOLIO_ALLOCATION_LOG = RUNTIME_LOG_DIR / "portfolio_allocations.jsonl"
 TASTYTRADE_COLLECTION_LOG = RUNTIME_LOG_DIR / "tastytrade_collection.jsonl"
 PROMOTED_WATCHERS_STATE = RUNTIME_STATE_DIR / "promoted_watchers.json"
+MAINTENANCE_WINDOW_STATE = RUNTIME_STATE_DIR / "maintenance_window.json"
+
+
+def is_maintenance_active(project_root):
+    path = project_root / MAINTENANCE_WINDOW_STATE
+    if not path.exists():
+        return False
+    try:
+        data = load_json(path, {})
+        return bool(data.get("active", False))
+    except Exception:
+        return False
 
 
 def utc_now():
@@ -935,6 +947,16 @@ def main():
         concurrent.futures.ThreadPoolExecutor(max_workers=1) as collector_executor,
     ):
         while not stop_requested:
+            if is_maintenance_active(project_root):
+                print(
+                    json.dumps({
+                        "timestamp": iso_now(),
+                        "status": "supervisor_stopping_for_maintenance",
+                        "message": "Maintenance shutdown active. Halting supervisor loop.",
+                    }, sort_keys=True),
+                    flush=True,
+                )
+                break
             if tastytrade_future is not None and tastytrade_future.done():
                 record_tastytrade_collection(project_root, tastytrade_future)
                 tastytrade_future = None

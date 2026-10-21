@@ -642,6 +642,10 @@ function App() {
     pill(live?(streaming?'Updates connected':'Reconnecting updates'):'Saved snapshot',live&&!streaming?'amber':'neutral'),
     live && h('button',{type:'button',className:'btn-add-stock',onClick:()=>setShowAddStock(true)},'+ Add stock'),
     h('button',{onClick:refresh,disabled:loading},loading?'Loading...':live?'Refresh view':'Refresh report'))),
+   data.maintenance?.active && h('div',{className:'banner-amber',role:'alert'},
+    h('b',null,'⚠️ TraderBot Maintenance Shutdown Active: '),
+    `Trading bot supervisor and watcher evaluations are halted (paused at ${stamp(data.maintenance.paused_at)}). Existing broker stop-loss orders remain active on Alpaca. Resumption: manual.`
+   ),
   h('div',{className:'notice',role:'status'},error?'Refresh failed. Showing the previously loaded snapshot.':live?`Broker refresh every ${data.refresh_interval_seconds>=60?Math.round(data.refresh_interval_seconds/60)+' minutes':(data.refresh_interval_seconds||20)+' seconds'} | Last account update: ${stamp(data.connection.account.as_of)} | ${data.market.is_open===true?'Market open':data.market.is_open===false?'Market closed':'Market status unavailable'}`:data.warning||`Report date: ${data.report_date} | File saved: ${stamp(data.report_as_of)} | Values are not live.`),
   live && h('section',{className:'panel'},h('h2',null,'Data status'),...Object.entries(data.connection).filter(([key])=>key!=='calendar').map(([key,status])=>h('div',{className:'status-row',key},human(key),pill(status.stale?'Stale / unavailable':'Current',status.stale?'amber':'green'),stamp(status.as_of))),!streaming&&h('p',{className:'amber-text',role:'status'},'Update connection interrupted. Values may be outdated; reconnecting automatically.')),
   h('div',{className:'metrics'},...[
