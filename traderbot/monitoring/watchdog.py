@@ -10,6 +10,7 @@ LOG_DIR = PROJECT_ROOT / "runtime" / "logs"
 LOG_PATH = LOG_DIR / "watcher_monitor.log"
 ALERT_PATH = LOG_DIR / "watcher_monitor_alerts.jsonl"
 RESTART_REQUEST_PATH = PROJECT_ROOT / "runtime" / "state" / "supervisor_restart_request.json"
+DASHBOARD_RESTART_REQUEST_PATH = PROJECT_ROOT / "runtime" / "state" / "dashboard_restart_request.json"
 WATCHER_SUPERVISOR_TASK = "TraderBot_Watcher_Supervisor"
 PYTHONW_EXE = (
     Path(r"C:\Users\Admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python")
@@ -134,6 +135,26 @@ def consume_restart_request():
     return True
 
 
+def consume_dashboard_restart_request():
+    if not DASHBOARD_RESTART_REQUEST_PATH.exists():
+        return False
+    DASHBOARD_RESTART_REQUEST_PATH.unlink(missing_ok=True)
+    subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "Stop-ScheduledTask -TaskName 'TraderBot_Dashboard' -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Start-ScheduledTask -TaskName 'TraderBot_Dashboard' -ErrorAction SilentlyContinue",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=NO_WINDOW,
+    )
+    write_monitor_log("Consumed dashboard restart request and restarted TraderBot_Dashboard task.")
+    return True
+
+
 def start_supervisor():
     if not PYTHONW_EXE.exists():
         raise FileNotFoundError(f"Python executable not found: {PYTHONW_EXE}")
@@ -174,6 +195,11 @@ def start_supervisor():
 
 def main():
     os.chdir(PROJECT_ROOT)
+
+    try:
+        consume_dashboard_restart_request()
+    except Exception as exc:
+        write_monitor_log(f"Failed to consume dashboard restart request: {exc}")
 
     try:
         if consume_restart_request():

@@ -153,7 +153,7 @@ class Operations:
                 issues.append({"source": symbol + " state", "message": state_issue})
             plan = state.get("dynamic_entry_plan")
             if enabled and symbol not in held and isinstance(plan, dict) and plan:
-                blockers = plan.get("hard_blockers") or plan.get("decision_reasons") or []
+                blockers = plan.get("hard_blockers") or plan.get("decision_reasons") or plan.get("blockers") or []
                 threshold = number(plan.get("minimum_setup_score")) or 80
                 score = number(plan.get("setup_score"))
                 eligibility = state.get("flat_entry_eligibility") or {}

@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -72,6 +73,15 @@ def main():
                 pages[0].get_by_text("Updates connected", exact=True).wait_for(timeout=15000)
                 assert broker.calls == 8, broker.calls
                 page = pages[0]
+                page.get_by_role("tab", name=re.compile("Watchers")).click()
+                page.get_by_role("heading", name="Watcher operations", exact=True).wait_for()
+                page.get_by_role("tab", name=re.compile("Candidates")).click()
+                page.get_by_role("heading", name="Entry candidates", exact=True).wait_for()
+                page.get_by_role("tab", name=re.compile("Orders")).click()
+                page.get_by_role("heading", name="Recent orders", exact=True).wait_for()
+                page.get_by_role("tab", name=re.compile("Positions")).click()
+                page.get_by_role("heading", name="Positions & health", exact=True).wait_for()
+                page.get_by_role("tab", name=re.compile("All tables")).click()
                 page.get_by_role("heading", name="Watcher operations", exact=True).wait_for()
                 page.get_by_label("Filter operations by symbol").fill("NO_MATCH")
                 page.get_by_text("No candidate assessments match this filter.", exact=True).wait_for()
@@ -80,8 +90,7 @@ def main():
                 page.get_by_label("Show watchers needing attention").check()
                 page.get_by_text("No watchers match, or watcher configuration is unavailable.", exact=True).wait_for()
                 page.get_by_label("Show watchers needing attention").uncheck()
-                page.get_by_text("Blockers", exact=True).click()
-                page.get_by_text("market ok", exact=True).wait_for()
+                page.get_by_text("Requirement not met: market ok").wait_for()
                 page.set_viewport_size({"width": 390, "height": 844})
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
                 pages[0].screenshot(path=str(ROOT / "runtime/dashboard-live-test.png"), full_page=True)

@@ -108,7 +108,7 @@ def main():
                 page.get_by_role('button', name='Refresh report').click()
                 expect(page.get_by_text('Stale / unavailable', exact=True)).to_have_count(4)
                 expect(page.get_by_text('$12,345.00', exact=True)).to_be_visible()
-                expect(page.get_by_text('Stale / missing assessment', exact=True)).to_have_count(2)
+                expect(page.get_by_text('Assessment overdue', exact=True)).to_have_count(2)
                 page.screenshot(path=str(ROOT / 'runtime/dashboard-release-stale.png'), full_page=True)
                 page.unroute('**/api/snapshot')
                 page.route('**/api/snapshot', lambda route: route.abort())

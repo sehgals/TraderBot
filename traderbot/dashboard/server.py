@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,7 +36,8 @@ def number(value):
 
 class SnapshotStore:
     def __init__(self, root=ROOT):
-        self.directory = Path(root) / "runtime/reports/daily"
+        self.root = Path(root)
+        self.directory = self.root / "runtime/reports/daily"
 
     def snapshot(self):
         data = {"account": {}, "positions": [], "source": "Saved report",
@@ -107,6 +108,78 @@ def create_app(store=None):
     @app.get("/api/snapshot")
     def snapshot():
         return store.snapshot()
+
+    @app.get("/api/universe/archetypes")
+    def universe_archetypes():
+        from traderbot.universe.onboarding import get_available_archetypes
+        root = getattr(store, "root", ROOT)
+        return get_available_archetypes(root)
+
+    @app.get("/api/universe/inspect")
+    def universe_inspect(symbol: str = ""):
+        from traderbot.universe.onboarding import inspect_stock
+        root = getattr(store, "root", ROOT)
+        if not symbol:
+            return JSONResponse(status_code=400, content={"error": "Missing symbol parameter.", "ready": False})
+        try:
+            return inspect_stock(symbol, project_root=root)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc), "symbol": symbol, "ready": False})
+
+    @app.post("/api/universe/add")
+    async def universe_add(request: Request):
+        from traderbot.universe.onboarding import add_stock_to_universe
+        root = getattr(store, "root", ROOT)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON body."})
+        symbol = body.get("symbol", "")
+        archetype = body.get("archetype", "default")
+        group = body.get("group", "candidate")
+        skip_validation = bool(body.get("skip_validation", False))
+        dry_run = bool(body.get("dry_run", False))
+        try:
+            result = add_stock_to_universe(
+                symbol=symbol,
+                archetype=archetype,
+                group=group,
+                project_root=root,
+                skip_validation=skip_validation,
+                dry_run=dry_run,
+            )
+            if hasattr(store, "operations") and hasattr(store.operations, "refresh"):
+                try:
+                    store.operations.refresh()
+                except Exception:
+                    pass
+            status_code = 200 if result.get("success") else 400
+            return JSONResponse(status_code=status_code, content=result)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"success": False, "error": str(exc)})
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Failed to add stock: {exc}"})
+
+    @app.post("/api/universe/remove")
+    async def universe_remove(request: Request):
+        from traderbot.universe.onboarding import remove_stock_from_universe
+        root = getattr(store, "root", ROOT)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON body."})
+        symbol = body.get("symbol", "")
+        try:
+            result = remove_stock_from_universe(symbol=symbol, project_root=root)
+            if hasattr(store, "operations") and hasattr(store.operations, "refresh"):
+                try:
+                    store.operations.refresh()
+                except Exception:
+                    pass
+            status_code = 200 if result.get("success") else 400
+            return JSONResponse(status_code=status_code, content=result)
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
     if hasattr(store, "start"):
         @app.get("/api/events")
